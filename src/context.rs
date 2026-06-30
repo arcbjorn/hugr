@@ -1,5 +1,7 @@
 use crate::code::CodeSymbol;
 use crate::store::{Memory, SessionFact};
+use crate::testmap::TestCandidate;
+use crate::worktree::WorktreeState;
 use std::fmt::Write;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7,8 +9,10 @@ pub struct ContextPack {
     pub task: String,
     pub relevant_files: Vec<ContextFile>,
     pub important_symbols: Vec<ContextSymbol>,
+    pub affected_tests: Vec<ContextTest>,
     pub relevant_memories: Vec<ContextMemory>,
     pub recent_sessions: Vec<ContextSessionFact>,
+    pub branch_state: Option<ContextBranchState>,
     pub suggested_path: Vec<String>,
     pub citations: Vec<Citation>,
 }
@@ -26,7 +30,15 @@ pub struct ContextSymbol {
     pub name: String,
     pub kind: String,
     pub line_start: i64,
+    pub line_end: Option<i64>,
     pub signature: String,
+    pub citation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextTest {
+    pub path: String,
+    pub reason: String,
     pub citation_id: String,
 }
 
@@ -49,6 +61,24 @@ pub struct ContextSessionFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextBranchState {
+    pub root_path: Option<String>,
+    pub branch: Option<String>,
+    pub upstream: Option<String>,
+    pub ahead: i64,
+    pub behind: i64,
+    pub changed_files: Vec<ContextChangedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextChangedFile {
+    pub path: String,
+    pub original_path: Option<String>,
+    pub staged_status: Option<String>,
+    pub unstaged_status: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Citation {
     pub id: String,
     pub source_type: String,
@@ -68,15 +98,25 @@ impl ContextPack {
         memories: Vec<Memory>,
         sessions: Vec<SessionFact>,
     ) -> Self {
-        Self::with_sessions_and_symbols(task, files, memories, sessions, Vec::new())
+        Self::with_sessions_symbols_tests_and_branch(
+            task,
+            files,
+            memories,
+            sessions,
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
     }
 
-    pub(crate) fn with_sessions_and_symbols(
+    pub(crate) fn with_sessions_symbols_tests_and_branch(
         task: &str,
         files: Vec<String>,
         memories: Vec<Memory>,
         sessions: Vec<SessionFact>,
         symbols: Vec<CodeSymbol>,
+        tests: Vec<TestCandidate>,
+        branch_state: Option<WorktreeState>,
     ) -> Self {
         let relevant_files = files
             .into_iter()
@@ -97,7 +137,16 @@ impl ContextPack {
                 name: symbol.name,
                 kind: symbol.kind,
                 line_start: symbol.line_start,
+                line_end: symbol.line_end,
                 signature: symbol.signature,
+            })
+            .collect::<Vec<_>>();
+        let affected_tests = tests
+            .into_iter()
+            .map(|test| ContextTest {
+                citation_id: format!("test:{}", test.path),
+                path: test.path,
+                reason: test.reason,
             })
             .collect::<Vec<_>>();
         let relevant_memories = memories
@@ -120,6 +169,25 @@ impl ContextPack {
                 created_at_ms: fact.created_at_ms,
             })
             .collect::<Vec<_>>();
+        let branch_state = branch_state
+            .filter(|state| state.inside_worktree)
+            .map(|state| ContextBranchState {
+                root_path: state.root_path,
+                branch: state.branch,
+                upstream: state.upstream,
+                ahead: state.ahead,
+                behind: state.behind,
+                changed_files: state
+                    .changed_files
+                    .into_iter()
+                    .map(|file| ContextChangedFile {
+                        path: file.path,
+                        original_path: file.original_path,
+                        staged_status: file.staged_status,
+                        unstaged_status: file.unstaged_status,
+                    })
+                    .collect(),
+            });
         let mut citations = relevant_files
             .iter()
             .map(|file| Citation {
@@ -136,6 +204,11 @@ impl ContextPack {
                 symbol.kind, symbol.name, symbol.path, symbol.line_start
             ),
         }));
+        citations.extend(affected_tests.iter().map(|test| Citation {
+            id: test.citation_id.clone(),
+            source_type: "test".to_string(),
+            label: test.path.clone(),
+        }));
         citations.extend(relevant_memories.iter().map(|memory| Citation {
             id: memory.citation_id.clone(),
             source_type: "memory".to_string(),
@@ -151,8 +224,10 @@ impl ContextPack {
             task: task.to_string(),
             relevant_files,
             important_symbols,
+            affected_tests,
             relevant_memories,
             recent_sessions,
+            branch_state,
             suggested_path: vec![
                 "Inspect the relevant files and symbols.".to_string(),
                 "Check whether any memories are stale before relying on them.".to_string(),
@@ -188,8 +263,25 @@ impl ContextPack {
             for symbol in &self.important_symbols {
                 let _ = writeln!(
                     rendered,
-                    "- {} {} at {}:{} [{}]",
-                    symbol.kind, symbol.name, symbol.path, symbol.line_start, symbol.citation_id
+                    "- {} {} at {} [{}]",
+                    symbol.kind,
+                    symbol.name,
+                    symbol_location(symbol),
+                    symbol.citation_id
+                );
+            }
+        }
+        rendered.push('\n');
+
+        rendered.push_str("## Affected Tests\n");
+        if self.affected_tests.is_empty() {
+            rendered.push_str("No likely tests mapped yet.\n");
+        } else {
+            for test in &self.affected_tests {
+                let _ = writeln!(
+                    rendered,
+                    "- {} ({}) [{}]",
+                    test.path, test.reason, test.citation_id
                 );
             }
         }
@@ -220,6 +312,28 @@ impl ContextPack {
                     fact.session_id, fact.kind, fact.detail
                 );
             }
+        }
+        rendered.push('\n');
+
+        rendered.push_str("## Branch State\n");
+        if let Some(branch) = &self.branch_state {
+            let branch_name = branch.branch.as_deref().unwrap_or("unknown");
+            let upstream = branch.upstream.as_deref().unwrap_or("none");
+            let _ = writeln!(
+                rendered,
+                "- branch: {branch_name}\n- upstream: {upstream}\n- ahead: {}\n- behind: {}",
+                branch.ahead, branch.behind
+            );
+            if branch.changed_files.is_empty() {
+                rendered.push_str("- changes: clean\n");
+            } else {
+                rendered.push_str("- changes:\n");
+                for file in &branch.changed_files {
+                    let _ = writeln!(rendered, "  - {} [{}]", file.path, change_label(file));
+                }
+            }
+        } else {
+            rendered.push_str("No git worktree detected.\n");
         }
         rendered.push('\n');
 
@@ -272,14 +386,30 @@ impl ContextPack {
             }
             let _ = write!(
                 rendered,
-                "{{\"path\":{},\"language\":{},\"name\":{},\"kind\":{},\"line_start\":{},\"signature\":{},\"citation_id\":{}}}",
+                "{{\"path\":{},\"language\":{},\"name\":{},\"kind\":{},\"line_start\":{},\"line_end\":{},\"signature\":{},\"citation_id\":{}}}",
                 json_string(&symbol.path),
                 json_option_string(symbol.language.as_deref()),
                 json_string(&symbol.name),
                 json_string(&symbol.kind),
                 symbol.line_start,
+                json_optional_i64(symbol.line_end),
                 json_string(&symbol.signature),
                 json_string(&symbol.citation_id)
+            );
+        }
+        rendered.push_str("],");
+
+        rendered.push_str("\"affected_tests\":[");
+        for (index, test) in self.affected_tests.iter().enumerate() {
+            if index > 0 {
+                rendered.push(',');
+            }
+            let _ = write!(
+                rendered,
+                "{{\"path\":{},\"reason\":{},\"citation_id\":{}}}",
+                json_string(&test.path),
+                json_string(&test.reason),
+                json_string(&test.citation_id)
             );
         }
         rendered.push_str("],");
@@ -317,6 +447,36 @@ impl ContextPack {
             );
         }
         rendered.push_str("],");
+
+        rendered.push_str("\"branch_state\":");
+        if let Some(branch) = &self.branch_state {
+            rendered.push('{');
+            let _ = write!(
+                rendered,
+                "\"root_path\":{},\"branch\":{},\"upstream\":{},\"ahead\":{},\"behind\":{},\"changed_files\":[",
+                json_option_string(branch.root_path.as_deref()),
+                json_option_string(branch.branch.as_deref()),
+                json_option_string(branch.upstream.as_deref()),
+                branch.ahead,
+                branch.behind
+            );
+            for (index, file) in branch.changed_files.iter().enumerate() {
+                if index > 0 {
+                    rendered.push(',');
+                }
+                let _ = write!(
+                    rendered,
+                    "{{\"path\":{},\"original_path\":{},\"staged_status\":{},\"unstaged_status\":{}}}",
+                    json_string(&file.path),
+                    json_option_string(file.original_path.as_deref()),
+                    json_option_string(file.staged_status.as_deref()),
+                    json_option_string(file.unstaged_status.as_deref())
+                );
+            }
+            rendered.push_str("]},");
+        } else {
+            rendered.push_str("null,");
+        }
 
         rendered.push_str("\"suggested_path\":[");
         for (index, step) in self.suggested_path.iter().enumerate() {
@@ -369,11 +529,38 @@ fn json_option_string(value: Option<&str>) -> String {
     value.map(json_string).unwrap_or_else(|| "null".to_string())
 }
 
+fn json_optional_i64(value: Option<i64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn symbol_location(symbol: &ContextSymbol) -> String {
+    match symbol.line_end {
+        Some(line_end) if line_end > symbol.line_start => {
+            format!("{}:{}-{}", symbol.path, symbol.line_start, line_end)
+        }
+        _ => format!("{}:{}", symbol.path, symbol.line_start),
+    }
+}
+
+fn change_label(file: &ContextChangedFile) -> String {
+    match (&file.staged_status, &file.unstaged_status) {
+        (Some(staged), Some(unstaged)) if staged == unstaged => staged.clone(),
+        (Some(staged), Some(unstaged)) => format!("staged {staged}, unstaged {unstaged}"),
+        (Some(staged), None) => format!("staged {staged}"),
+        (None, Some(unstaged)) => format!("unstaged {unstaged}"),
+        (None, None) => "changed".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ContextPack, json_string};
     use crate::code::CodeSymbol;
     use crate::store::Memory;
+    use crate::testmap::TestCandidate;
+    use crate::worktree::{ChangedFile, WorktreeState};
 
     #[test]
     fn markdown_includes_citations_for_files_and_memories() {
@@ -398,7 +585,7 @@ mod tests {
 
     #[test]
     fn markdown_and_json_include_symbols() {
-        let pack = ContextPack::with_sessions_and_symbols(
+        let pack = ContextPack::with_sessions_symbols_tests_and_branch(
             "add plugin hooks",
             vec!["src/plugin_hooks.rs".to_string()],
             Vec::new(),
@@ -409,17 +596,25 @@ mod tests {
                 name: "PluginHooks".to_string(),
                 kind: "struct".to_string(),
                 line_start: 3,
-                line_end: None,
+                line_end: Some(8),
                 signature: "pub struct PluginHooks".to_string(),
             }],
+            vec![TestCandidate {
+                path: "tests/plugin_hooks.rs".to_string(),
+                reason: "repository tests directory match".to_string(),
+            }],
+            None,
         );
 
         let markdown = pack.render_markdown();
         let json = pack.render_json();
 
-        assert!(markdown.contains("- struct PluginHooks at src/plugin_hooks.rs:3"));
+        assert!(markdown.contains("- struct PluginHooks at src/plugin_hooks.rs:3-8"));
         assert!(json.contains("\"important_symbols\""));
         assert!(json.contains("\"name\":\"PluginHooks\""));
+        assert!(json.contains("\"line_end\":8"));
+        assert!(markdown.contains("- tests/plugin_hooks.rs"));
+        assert!(json.contains("\"affected_tests\""));
     }
 
     #[test]
@@ -429,5 +624,41 @@ mod tests {
 
         assert!(json.contains("\"task\":\"quote \\\"and\\\" newline\\n\""));
         assert_eq!(json_string("tab\tbackslash\\"), "\"tab\\tbackslash\\\\\"");
+    }
+
+    #[test]
+    fn markdown_and_json_include_branch_state() {
+        let pack = ContextPack::with_sessions_symbols_tests_and_branch(
+            "add plugin hooks",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(WorktreeState {
+                inside_worktree: true,
+                root_path: Some("/repo".to_string()),
+                branch: Some("feature".to_string()),
+                upstream: Some("origin/feature".to_string()),
+                ahead: 2,
+                behind: 1,
+                changed_files: vec![ChangedFile {
+                    path: "src/lib.rs".to_string(),
+                    original_path: None,
+                    staged_status: None,
+                    unstaged_status: Some("modified".to_string()),
+                }],
+            }),
+        );
+
+        let markdown = pack.render_markdown();
+        let json = pack.render_json();
+
+        assert!(markdown.contains("## Branch State"));
+        assert!(markdown.contains("- branch: feature"));
+        assert!(markdown.contains("src/lib.rs [unstaged modified]"));
+        assert!(json.contains("\"branch_state\""));
+        assert!(json.contains("\"ahead\":2"));
+        assert!(json.contains("\"unstaged_status\":\"modified\""));
     }
 }
