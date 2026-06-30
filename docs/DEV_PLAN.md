@@ -33,13 +33,13 @@ Implemented:
 - `discovered_files` table populated by `hugr context`
 - durable session tables and CLI workflow
 - recent session facts in context packs
+- stdio MCP server with core Hugr tools
 - initial vision, storage, and technical blueprint docs
 
 Not implemented yet:
 
 - real embedding provider integration
 - code indexing
-- MCP server
 - git/worktree awareness
 - symbol graph
 - cloud or hybrid sync
@@ -335,7 +335,7 @@ Recommended next commits:
 6. Done: `feat(project): add project registry`
 7. Done: `feat(index): add file discovery`
 8. Done: `feat(session): record agent sessions`
-9. `feat(mcp): expose core tools`
+9. Done: `feat(mcp): expose core tools`
 10. `feat(code): index symbols`
 
 Each commit should leave the CLI usable.
@@ -353,6 +353,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add the MCP server.
+Add code intelligence.
 
-That is the right next step because Hugr now has durable memory, recall, files, projects, and sessions. MCP can expose the high-level context, remember, recall, project, and session operations to agents.
+That is the right next step because agents can now reach Hugr through the CLI and MCP. Code indexing can begin feeding files, symbols, and impact data into future context packs.
