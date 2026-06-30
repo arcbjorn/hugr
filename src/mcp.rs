@@ -3,6 +3,7 @@ use crate::discovery;
 use crate::impact;
 use crate::indexer;
 use crate::store::{Memory, Project, Session, SessionEvent, Store};
+use crate::worktree;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
@@ -121,7 +122,17 @@ async fn tool_context(arguments: &Value) -> Result<Value, String> {
         .into_iter()
         .map(|candidate| candidate.path)
         .collect::<Vec<_>>();
-    let pack = ContextPack::with_sessions_and_symbols(&task, files, memories, sessions, symbols);
+    let affected_tests = store.likely_tests_for_files(&files, 5).await?;
+    let branch_state = worktree::inspect(Path::new("."));
+    let pack = ContextPack::with_sessions_symbols_tests_and_branch(
+        &task,
+        files,
+        memories,
+        sessions,
+        symbols,
+        affected_tests,
+        Some(branch_state),
+    );
     let structured = context_pack_json(&pack);
 
     Ok(tool_result(pack.render_markdown(), structured))
