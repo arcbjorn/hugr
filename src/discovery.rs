@@ -67,6 +67,27 @@ pub(crate) fn discover_candidate_files(
     Ok(rank_files(root, task, files, limit))
 }
 
+pub(crate) fn discover_project_files(
+    root: &Path,
+    limit: usize,
+) -> Result<Vec<FileCandidate>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let files = GitFileFinder
+        .find_files(root)
+        .or_else(|_| WalkingFileFinder.find_files(root))?;
+
+    let mut candidates = files
+        .into_iter()
+        .filter_map(|path| file_candidate(root, &path, 0))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    candidates.truncate(limit);
+    Ok(candidates)
+}
+
 fn rank_files(root: &Path, task: &str, files: Vec<PathBuf>, limit: usize) -> Vec<FileCandidate> {
     let terms = query_terms(task);
     if terms.is_empty() {
@@ -119,6 +140,12 @@ fn candidate_for(root: &Path, path: &Path, terms: &[String]) -> Option<FileCandi
         return None;
     }
 
+    file_candidate(root, path, score)
+}
+
+fn file_candidate(root: &Path, path: &Path, score: usize) -> Option<FileCandidate> {
+    let display = normalized_relative_path(path);
+    let language = language_for(path).map(str::to_string);
     let size_bytes = fs::metadata(root.join(path))
         .ok()
         .map(|metadata| metadata.len());
