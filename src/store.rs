@@ -1,6 +1,7 @@
 use crate::embedding::{DeterministicEmbeddingProvider, EmbeddingProvider};
 use crate::migrations;
 use libsql::{Builder, Connection, params};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -70,14 +71,14 @@ impl Store {
         let embedding = DeterministicEmbeddingProvider::default().embed(&memory.text)?;
         let embedding_dimensions =
             i64::try_from(embedding.dimensions()).map_err(|error| error.to_string())?;
-        let embedding_blob = embedding.to_f32_blob();
+        let embedding_vector = embedding.to_vector_literal();
         conn.execute(
-            "INSERT INTO memory_embeddings (memory_id, model, dimensions, embedding) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO memory_embeddings (memory_id, model, dimensions, embedding) VALUES (?1, ?2, ?3, vector(?4))",
             params![
                 memory.id.clone(),
                 embedding.model,
                 embedding_dimensions,
-                embedding_blob
+                embedding_vector
             ],
         )
         .await
@@ -241,7 +242,56 @@ impl Store {
 struct RankedMemory {
     memory: Memory,
     term_score: usize,
-    fts_rank: f64,
+    fts_rank: Option<f64>,
+    vector_distance: Option<f64>,
+}
+
+impl RankedMemory {
+    fn merge(&mut self, other: Self) {
+        self.term_score = self.term_score.max(other.term_score);
+        self.fts_rank = match (self.fts_rank, other.fts_rank) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left @ Some(_), None) => left,
+            (None, right) => right,
+        };
+        self.vector_distance = match (self.vector_distance, other.vector_distance) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left @ Some(_), None) => left,
+            (None, right) => right,
+        };
+    }
+
+    fn ranking_score(&self) -> f64 {
+        let text_score = self.term_score as f64 * 10.0;
+        let fts_score = self
+            .fts_rank
+            .map(|rank| 1.0 / (1.0 + rank.abs()))
+            .unwrap_or(0.0);
+        let vector_score = self
+            .vector_distance
+            .map(|distance| 1.0 / (1.0 + distance.max(0.0)))
+            .unwrap_or(0.0);
+
+        text_score + fts_score + vector_score
+    }
+}
+
+fn merge_recall_candidates(
+    fts_matches: Vec<RankedMemory>,
+    vector_matches: Vec<RankedMemory>,
+) -> Vec<RankedMemory> {
+    let mut merged = HashMap::<String, RankedMemory>::new();
+
+    for matched in fts_matches.into_iter().chain(vector_matches) {
+        match merged.get_mut(&matched.memory.id) {
+            Some(existing) => existing.merge(matched),
+            None => {
+                merged.insert(matched.memory.id.clone(), matched);
+            }
+        }
+    }
+
+    merged.into_values().collect()
 }
 
 fn recall_score(memory: &Memory, terms: &[String], query: &str) -> usize {
