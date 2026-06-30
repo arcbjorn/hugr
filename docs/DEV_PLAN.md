@@ -24,12 +24,13 @@ Implemented:
 - JSON output for `hugr recall --json` and `hugr context --json`
 - deterministic local embedding provider for tests and offline development
 - synchronous embedding persistence on `hugr remember`
+- `vector_top_k` recall over stored deterministic embeddings
+- combined FTS and vector recall ranking
 - initial vision, storage, and technical blueprint docs
 
 Not implemented yet:
 
 - real embedding provider integration
-- `vector_top_k` semantic recall
 - durable sessions
 - project registry
 - code indexing
@@ -326,7 +327,7 @@ Recommended next commits:
 2. Done: `feat(recall): query memory fts`
 3. Done: `feat(context): return structured context packs`
 4. Done: `feat(memory): add embedding provider trait`
-5. `feat(vector): add vector recall`
+5. Done: `feat(vector): add vector recall`
 6. `feat(project): add project registry`
 7. `feat(index): add file discovery`
 8. `feat(session): record agent sessions`
@@ -348,6 +349,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add vector recall over stored deterministic embeddings.
+Add the project registry.
 
-That is the right next step because memories now persist embeddings, so semantic recall can be added and tested without requiring any external embedding service.
+That is the right next step because memory retrieval now has durable storage, FTS, embeddings, and vector recall. Project metadata gives future context packs a stable root, branch, and remote identity before file indexing and sessions expand the context surface.
