@@ -334,7 +334,9 @@ impl Store {
                 name: row.get::<String>(2).map_err(|error| error.to_string())?,
                 kind: row.get::<String>(3).map_err(|error| error.to_string())?,
                 line_start: row.get::<i64>(4).map_err(|error| error.to_string())?,
-                line_end: row.get::<Option<i64>>(5).map_err(|error| error.to_string())?,
+                line_end: row
+                    .get::<Option<i64>>(5)
+                    .map_err(|error| error.to_string())?,
                 signature: row.get::<String>(6).map_err(|error| error.to_string())?,
             };
             let score = code_symbol_score(&symbol, &terms, query);
