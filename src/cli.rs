@@ -2,17 +2,38 @@
 pub enum Command {
     Init,
     Status,
-    Remember { text: String },
-    Recall { query: String, format: OutputFormat },
-    Context { task: String, format: OutputFormat },
+    Remember {
+        text: String,
+    },
+    Recall {
+        query: String,
+        format: OutputFormat,
+    },
+    Context {
+        task: String,
+        format: OutputFormat,
+    },
     Index,
+    Impact {
+        target: String,
+        format: OutputFormat,
+    },
     ProjectStatus,
-    SessionStart { task: String },
-    SessionEvent { kind: String, detail: String },
-    SessionEnd { summary: Option<String> },
+    SessionStart {
+        task: String,
+    },
+    SessionEvent {
+        kind: String,
+        detail: String,
+    },
+    SessionEnd {
+        summary: Option<String>,
+    },
     Mcp,
     Improve,
-    Forget { query: Option<String> },
+    Forget {
+        query: Option<String>,
+    },
     Doctor,
     Help,
 }
@@ -50,6 +71,13 @@ impl Command {
                 })
             }
             "index" => Ok(Self::Index),
+            "impact" => {
+                let text = required_text_output(args, "impact")?;
+                Ok(Self::Impact {
+                    target: text.value,
+                    format: text.format,
+                })
+            }
             "project" => parse_project_command(args),
             "session" => parse_session_command(args),
             "mcp" => Ok(Self::Mcp),
@@ -148,7 +176,7 @@ fn optional_text_from(args: &[String], start: usize) -> Option<String> {
 }
 
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr project status\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr mcp\n  hugr improve\n  hugr forget [query]\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr impact [--json] <file-or-symbol>\n  hugr project status\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr mcp\n  hugr improve\n  hugr forget [query]\n  hugr doctor\n"
 }
 
 #[cfg(test)]
@@ -200,6 +228,23 @@ mod tests {
     fn parses_index_command() {
         let args = vec!["hugr".into(), "index".into()];
         assert_eq!(Command::parse(&args), Ok(Command::Index));
+    }
+
+    #[test]
+    fn parses_impact_command() {
+        let args = vec![
+            "hugr".into(),
+            "impact".into(),
+            "--json".into(),
+            "PluginHooks".into(),
+        ];
+        assert_eq!(
+            Command::parse(&args),
+            Ok(Command::Impact {
+                target: "PluginHooks".into(),
+                format: OutputFormat::Json
+            })
+        );
     }
 
     #[test]
