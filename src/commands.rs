@@ -1,6 +1,7 @@
 use crate::cli::{Command, OutputFormat, help_text};
 use crate::context::{ContextPack, json_string};
 use crate::discovery;
+use crate::indexer;
 use crate::mcp;
 use crate::store::{Memory, Store};
 use std::fmt::Write;
@@ -13,6 +14,7 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::Remember { text } => remember(&text).await,
         Command::Recall { query, format } => recall(&query, format).await,
         Command::Context { task, format } => context(&task, format).await,
+        Command::Index => index().await,
         Command::ProjectStatus => project_status().await,
         Command::SessionStart { task } => session_start(&task).await,
         Command::SessionEvent { kind, detail } => session_event(&kind, &detail).await,
@@ -85,16 +87,7 @@ async fn recall(query: &str, format: OutputFormat) -> Result<(), String> {
 }
 
 async fn context(task: &str, format: OutputFormat) -> Result<(), String> {
-    let store = Store::open_current();
-    let memories = store.recall(task, 5).await?;
-    let sessions = store.recent_session_facts(task, 5).await?;
-    let file_candidates = discovery::discover_candidate_files(Path::new("."), task, 12)?;
-    store.record_discovered_files(&file_candidates).await?;
-    let files = file_candidates
-        .into_iter()
-        .map(|candidate| candidate.path)
-        .collect::<Vec<_>>();
-    let pack = ContextPack::with_sessions(task, files, memories, sessions);
+    let pack = compile_context_pack(task).await?;
 
     if format == OutputFormat::Json {
         println!("{}", pack.render_json());
@@ -102,6 +95,30 @@ async fn context(task: &str, format: OutputFormat) -> Result<(), String> {
         print!("{}", pack.render_markdown());
     }
 
+    Ok(())
+}
+
+pub(crate) async fn compile_context_pack(task: &str) -> Result<ContextPack, String> {
+    let store = Store::open_current();
+    let memories = store.recall(task, 5).await?;
+    let sessions = store.recent_session_facts(task, 5).await?;
+    let file_candidates = discovery::discover_candidate_files(Path::new("."), task, 12)?;
+    indexer::index_candidates(&store, Path::new("."), &file_candidates).await?;
+    let symbols = store.recall_symbols(task, 8).await?;
+    let files = file_candidates
+        .into_iter()
+        .map(|candidate| candidate.path)
+        .collect::<Vec<_>>();
+    Ok(ContextPack::with_sessions_and_symbols(
+        task, files, memories, sessions, symbols,
+    ))
+}
+
+async fn index() -> Result<(), String> {
+    let summary = indexer::index_project(5000).await?;
+
+    println!("indexed {} files", summary.file_count);
+    println!("indexed {} symbols", summary.symbol_count);
     Ok(())
 }
 
