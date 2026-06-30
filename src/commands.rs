@@ -5,6 +5,7 @@ use crate::impact as impact_analysis;
 use crate::indexer;
 use crate::mcp;
 use crate::store::{Memory, Store};
+use crate::worktree;
 use std::fmt::Write;
 use std::path::Path;
 
@@ -111,8 +112,16 @@ pub(crate) async fn compile_context_pack(task: &str) -> Result<ContextPack, Stri
         .into_iter()
         .map(|candidate| candidate.path)
         .collect::<Vec<_>>();
-    Ok(ContextPack::with_sessions_and_symbols(
-        task, files, memories, sessions, symbols,
+    let affected_tests = store.likely_tests_for_files(&files, 5).await?;
+    let branch_state = worktree::inspect(Path::new("."));
+    Ok(ContextPack::with_sessions_symbols_tests_and_branch(
+        task,
+        files,
+        memories,
+        sessions,
+        symbols,
+        affected_tests,
+        Some(branch_state),
     ))
 }
 
