@@ -1,6 +1,7 @@
 use crate::cli::{Command, OutputFormat, help_text};
 use crate::context::{ContextPack, json_string};
 use crate::discovery;
+use crate::impact as impact_analysis;
 use crate::indexer;
 use crate::mcp;
 use crate::store::{Memory, Store};
@@ -15,6 +16,7 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::Recall { query, format } => recall(&query, format).await,
         Command::Context { task, format } => context(&task, format).await,
         Command::Index => index().await,
+        Command::Impact { target, format } => impact(&target, format).await,
         Command::ProjectStatus => project_status().await,
         Command::SessionStart { task } => session_start(&task).await,
         Command::SessionEvent { kind, detail } => session_event(&kind, &detail).await,
@@ -119,6 +121,20 @@ async fn index() -> Result<(), String> {
 
     println!("indexed {} files", summary.file_count);
     println!("indexed {} symbols", summary.symbol_count);
+    Ok(())
+}
+
+async fn impact(target: &str, format: OutputFormat) -> Result<(), String> {
+    indexer::index_project(5000).await?;
+    let store = Store::open_current();
+    let report = impact_analysis::analyze(&store, target, 50).await?;
+
+    if format == OutputFormat::Json {
+        println!("{}", report.render_json());
+    } else {
+        print!("{}", report.render_markdown());
+    }
+
     Ok(())
 }
 
