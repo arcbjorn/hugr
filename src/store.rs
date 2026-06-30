@@ -1,8 +1,9 @@
+use crate::code::CodeSymbol;
 use crate::discovery::FileCandidate;
 use crate::embedding::{DeterministicEmbeddingProvider, EmbeddingProvider};
 use crate::migrations;
 use libsql::{Builder, Connection, params};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -227,6 +228,130 @@ impl Store {
         }
 
         Ok(())
+    }
+
+    pub async fn record_code_symbols(
+        &self,
+        files: &[FileCandidate],
+        symbols: &[CodeSymbol],
+    ) -> Result<(), String> {
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        self.init().await?;
+        let conn = self.connect().await?;
+        let now = now_ms()?;
+        let mut paths = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<HashSet<_>>();
+
+        for path in paths.drain() {
+            conn.execute(
+                "
+                DELETE FROM code_symbols
+                WHERE project_id = ?1 AND path = ?2
+                ",
+                params![LOCAL_PROJECT_ID, path],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+
+        for symbol in symbols {
+            conn.execute(
+                "
+                INSERT INTO code_symbols (
+                    project_id,
+                    path,
+                    name,
+                    kind,
+                    language,
+                    line_start,
+                    line_end,
+                    signature,
+                    indexed_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ",
+                params![
+                    LOCAL_PROJECT_ID,
+                    symbol.path.clone(),
+                    symbol.name.clone(),
+                    symbol.kind.clone(),
+                    symbol.language.clone(),
+                    symbol.line_start,
+                    symbol.line_end,
+                    symbol.signature.clone(),
+                    now
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn recall_symbols(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<CodeSymbol>, String> {
+        if limit == 0 || !self.exists() {
+            return Ok(Vec::new());
+        }
+
+        let terms = query_terms(query);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let mut rows = conn
+            .query(
+                "
+                SELECT path, language, name, kind, line_start, line_end, signature
+                FROM code_symbols
+                WHERE project_id = ?1
+                ORDER BY indexed_at_ms DESC, path ASC, line_start ASC
+                LIMIT 2000
+                ",
+                params![LOCAL_PROJECT_ID],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut matches = Vec::new();
+
+        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+            let symbol = CodeSymbol {
+                path: row.get::<String>(0).map_err(|error| error.to_string())?,
+                language: row
+                    .get::<Option<String>>(1)
+                    .map_err(|error| error.to_string())?,
+                name: row.get::<String>(2).map_err(|error| error.to_string())?,
+                kind: row.get::<String>(3).map_err(|error| error.to_string())?,
+                line_start: row.get::<i64>(4).map_err(|error| error.to_string())?,
+                line_end: row.get::<Option<i64>>(5).map_err(|error| error.to_string())?,
+                signature: row.get::<String>(6).map_err(|error| error.to_string())?,
+            };
+            let score = code_symbol_score(&symbol, &terms, query);
+            if score > 0 {
+                matches.push((score, symbol));
+            }
+        }
+
+        matches.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.path.cmp(&right.1.path))
+                .then_with(|| left.1.line_start.cmp(&right.1.line_start))
+        });
+        matches.truncate(limit);
+        Ok(matches.into_iter().map(|(_, symbol)| symbol).collect())
     }
 
     pub async fn start_session(&self, task: &str) -> Result<Session, String> {
@@ -750,6 +875,40 @@ fn session_fact_score(fact: &SessionFact, terms: &[String]) -> usize {
         .count()
 }
 
+fn code_symbol_score(symbol: &CodeSymbol, terms: &[String], query: &str) -> usize {
+    let name = symbol.name.to_lowercase();
+    let path = symbol.path.to_lowercase();
+    let kind = symbol.kind.to_lowercase();
+    let signature = symbol.signature.to_lowercase();
+    let query = query.to_lowercase();
+    let exact_bonus = if name == query || signature.contains(&query) {
+        12
+    } else {
+        0
+    };
+
+    exact_bonus
+        + terms
+            .iter()
+            .map(|term| {
+                let mut score = 0;
+                if name.contains(term) {
+                    score += 5;
+                }
+                if kind == *term {
+                    score += 3;
+                }
+                if path.contains(term) {
+                    score += 2;
+                }
+                if signature.contains(term) {
+                    score += 1;
+                }
+                score
+            })
+            .sum::<usize>()
+}
+
 struct RankedMemory {
     memory: Memory,
     term_score: usize,
@@ -844,6 +1003,7 @@ fn now_ms() -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::{Memory, Store, fts_query, query_terms, recall_score};
+    use crate::code::CodeSymbol;
     use crate::discovery::FileCandidate;
     use crate::embedding::{DEFAULT_EMBEDDING_DIMENSIONS, DETERMINISTIC_MODEL};
     use libsql::{Connection, params};
@@ -906,6 +1066,8 @@ mod tests {
         assert!(object_exists(&conn, "table", "discovered_files").await);
         assert!(object_exists(&conn, "table", "sessions").await);
         assert!(object_exists(&conn, "table", "session_events").await);
+        assert!(object_exists(&conn, "table", "code_symbols").await);
+        assert!(object_exists(&conn, "index", "code_symbols_project_name_idx").await);
         assert!(object_exists(&conn, "index", "memory_embeddings_vector_idx").await);
 
         let mut rows = conn
@@ -926,7 +1088,8 @@ mod tests {
                 (1, "initial_schema".to_string()),
                 (2, "project_registry".to_string()),
                 (3, "file_discovery".to_string()),
-                (4, "sessions".to_string())
+                (4, "sessions".to_string()),
+                (5, "code_symbols".to_string())
             ]
         );
     }
@@ -1056,6 +1219,43 @@ mod tests {
         assert_eq!(row.get::<String>(2).unwrap(), "rust");
         assert_eq!(row.get::<i64>(3).unwrap(), 42);
         assert!(rows.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn records_and_recalls_code_symbols() {
+        let test = TestStore::new("code_symbols");
+        let file = FileCandidate {
+            path: "src/plugin_hooks.rs".to_string(),
+            score: 0,
+            language: Some("rust".to_string()),
+            size_bytes: Some(120),
+        };
+        let symbol = CodeSymbol {
+            path: file.path.clone(),
+            language: file.language.clone(),
+            name: "PluginHooks".to_string(),
+            kind: "struct".to_string(),
+            line_start: 3,
+            line_end: None,
+            signature: "pub struct PluginHooks".to_string(),
+        };
+
+        test.store
+            .record_code_symbols(std::slice::from_ref(&file), std::slice::from_ref(&symbol))
+            .await
+            .unwrap();
+        let matches = test.store.recall_symbols("plugin hooks", 5).await.unwrap();
+
+        assert_eq!(matches, vec![symbol]);
+
+        test.store.record_code_symbols(&[file], &[]).await.unwrap();
+        assert!(
+            test.store
+                .recall_symbols("plugin hooks", 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
