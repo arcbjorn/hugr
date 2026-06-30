@@ -5,6 +5,7 @@ pub enum Command {
     Remember { text: String },
     Recall { query: String, format: OutputFormat },
     Context { task: String, format: OutputFormat },
+    ProjectStatus,
     Improve,
     Forget { query: Option<String> },
     Doctor,
@@ -43,6 +44,7 @@ impl Command {
                     format: text.format,
                 })
             }
+            "project" => parse_project_command(args),
             "improve" => Ok(Self::Improve),
             "forget" => Ok(Self::Forget {
                 query: optional_text(args),
@@ -51,6 +53,14 @@ impl Command {
             "help" | "--help" | "-h" => Ok(Self::Help),
             unknown => Err(format!("unknown command '{unknown}'")),
         }
+    }
+}
+
+fn parse_project_command(args: &[String]) -> Result<Command, String> {
+    match args.get(2).map(String::as_str) {
+        Some("status") => Ok(Command::ProjectStatus),
+        Some(unknown) => Err(format!("unknown project command '{unknown}'")),
+        None => Err("hugr project requires a subcommand".to_string()),
     }
 }
 
@@ -93,7 +103,7 @@ fn optional_text(args: &[String]) -> Option<String> {
 }
 
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr improve\n  hugr forget [query]\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr project status\n  hugr improve\n  hugr forget [query]\n  hugr doctor\n"
 }
 
 #[cfg(test)]
@@ -133,6 +143,12 @@ mod tests {
                 format: OutputFormat::Json
             })
         );
+    }
+
+    #[test]
+    fn parses_project_status() {
+        let args = vec!["hugr".into(), "project".into(), "status".into()];
+        assert_eq!(Command::parse(&args), Ok(Command::ProjectStatus));
     }
 
     #[test]
