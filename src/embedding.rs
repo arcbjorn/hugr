@@ -19,6 +19,17 @@ impl Embedding {
         }
         blob
     }
+
+    pub fn to_vector_literal(&self) -> String {
+        format!(
+            "[{}]",
+            self.vector
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
 }
 
 pub(crate) trait EmbeddingProvider {
@@ -142,5 +153,16 @@ mod tests {
         let embedding = provider.embed("plugin hooks").unwrap();
 
         assert_eq!(embedding.to_f32_blob().len(), 8 * 4);
+    }
+
+    #[test]
+    fn embeddings_encode_as_vector_literals() {
+        let provider = DeterministicEmbeddingProvider::new(4).unwrap();
+        let embedding = provider.embed("plugin hooks").unwrap();
+        let literal = embedding.to_vector_literal();
+
+        assert!(literal.starts_with('['));
+        assert!(literal.ends_with(']'));
+        assert_eq!(literal.matches(',').count(), 3);
     }
 }
