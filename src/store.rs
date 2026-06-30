@@ -236,7 +236,7 @@ impl Store {
         let session = Session {
             id: format!("ses_{started_at_ms}"),
             task: task.trim().to_string(),
-            branch: current_branch().ok(),
+            branch: current_branch().unwrap_or(None),
             started_at_ms,
             ended_at_ms: None,
             final_summary: None,
@@ -733,7 +733,9 @@ async fn session_by_id(conn: &Connection, session_id: &str) -> Result<Option<Ses
             .get::<Option<String>>(2)
             .map_err(|error| error.to_string())?,
         started_at_ms: row.get::<i64>(3).map_err(|error| error.to_string())?,
-        ended_at_ms: row.get::<Option<i64>>(4).map_err(|error| error.to_string())?,
+        ended_at_ms: row
+            .get::<Option<i64>>(4)
+            .map_err(|error| error.to_string())?,
         final_summary: row
             .get::<Option<String>>(5)
             .map_err(|error| error.to_string())?,
@@ -902,6 +904,8 @@ mod tests {
         assert!(object_exists(&conn, "table", "memories_fts").await);
         assert!(object_exists(&conn, "table", "projects").await);
         assert!(object_exists(&conn, "table", "discovered_files").await);
+        assert!(object_exists(&conn, "table", "sessions").await);
+        assert!(object_exists(&conn, "table", "session_events").await);
         assert!(object_exists(&conn, "index", "memory_embeddings_vector_idx").await);
 
         let mut rows = conn
@@ -921,7 +925,8 @@ mod tests {
             vec![
                 (1, "initial_schema".to_string()),
                 (2, "project_registry".to_string()),
-                (3, "file_discovery".to_string())
+                (3, "file_discovery".to_string()),
+                (4, "sessions".to_string())
             ]
         );
     }
@@ -1051,6 +1056,39 @@ mod tests {
         assert_eq!(row.get::<String>(2).unwrap(), "rust");
         assert_eq!(row.get::<i64>(3).unwrap(), 42);
         assert!(rows.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn records_session_lifecycle_and_recent_facts() {
+        let test = TestStore::new("sessions");
+        let session = test.store.start_session("add plugin hooks").await.unwrap();
+        let event = test
+            .store
+            .record_session_event("test", "cargo test passed for plugin hooks")
+            .await
+            .unwrap();
+        let ended = test
+            .store
+            .end_session(Some("plugin hooks are wired"))
+            .await
+            .unwrap();
+
+        assert_eq!(event.session_id, session.id);
+        assert_eq!(ended.id, session.id);
+        assert!(ended.ended_at_ms.is_some());
+        assert_eq!(
+            ended.final_summary.as_deref(),
+            Some("plugin hooks are wired")
+        );
+
+        let facts = test
+            .store
+            .recent_session_facts("plugin hooks", 5)
+            .await
+            .unwrap();
+
+        assert!(facts.iter().any(|fact| fact.kind == "test"));
+        assert!(facts.iter().any(|fact| fact.kind == "summary"));
     }
 
     async fn object_exists(conn: &Connection, kind: &str, name: &str) -> bool {
