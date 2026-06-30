@@ -169,8 +169,8 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        self.init().await?;
         let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
         let fts_matches = self.fts_recall(&conn, &terms, query, limit).await?;
         let vector_matches = self.vector_recall(&conn, query, limit).await?;
 
