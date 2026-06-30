@@ -9,6 +9,8 @@ mod indexer;
 mod mcp;
 mod migrations;
 mod store;
+mod testmap;
+mod worktree;
 
 use cli::Command;
 
