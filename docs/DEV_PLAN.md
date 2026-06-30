@@ -31,12 +31,13 @@ Implemented:
 - dedicated file discovery layer with Git and walking adapters
 - `.gitignore`-aware fallback discovery with generated/vendor/build skips
 - `discovered_files` table populated by `hugr context`
+- durable session tables and CLI workflow
+- recent session facts in context packs
 - initial vision, storage, and technical blueprint docs
 
 Not implemented yet:
 
 - real embedding provider integration
-- durable sessions
 - code indexing
 - MCP server
 - git/worktree awareness
@@ -333,7 +334,7 @@ Recommended next commits:
 5. Done: `feat(vector): add vector recall`
 6. Done: `feat(project): add project registry`
 7. Done: `feat(index): add file discovery`
-8. `feat(session): record agent sessions`
+8. Done: `feat(session): record agent sessions`
 9. `feat(mcp): expose core tools`
 10. `feat(code): index symbols`
 
@@ -352,6 +353,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add durable sessions.
+Add the MCP server.
 
-That is the right next step because context packs now combine memories with discovered files. Session records can add prior attempts, command/test observations, edited files, and final summaries to future context packs.
+That is the right next step because Hugr now has durable memory, recall, files, projects, and sessions. MCP can expose the high-level context, remember, recall, project, and session operations to agents.
