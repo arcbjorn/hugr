@@ -242,11 +242,7 @@ fn tools() -> Vec<Value> {
             "Placeholder for future memory deletion.",
             &[("query", "string")],
         ),
-        tool_schema(
-            "hugr_index",
-            "Index project files and symbols.",
-            &[],
-        ),
+        tool_schema("hugr_index", "Index project files and symbols.", &[]),
         tool_schema(
             "hugr_impact",
             "Placeholder for future code impact analysis.",
