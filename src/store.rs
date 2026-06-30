@@ -1,8 +1,8 @@
-use crate::code::CodeSymbol;
+use crate::code::{CodeReference, CodeSymbol};
 use crate::discovery::FileCandidate;
 use crate::embedding::{DeterministicEmbeddingProvider, EmbeddingProvider};
 use crate::migrations;
-use libsql::{Builder, Connection, params};
+use libsql::{Builder, Connection, Row, params};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -230,10 +230,11 @@ impl Store {
         Ok(())
     }
 
-    pub async fn record_code_symbols(
+    pub async fn record_code_index(
         &self,
         files: &[FileCandidate],
         symbols: &[CodeSymbol],
+        references: &[CodeReference],
     ) -> Result<(), String> {
         if files.is_empty() {
             return Ok(());
@@ -251,6 +252,15 @@ impl Store {
             conn.execute(
                 "
                 DELETE FROM code_symbols
+                WHERE project_id = ?1 AND path = ?2
+                ",
+                params![LOCAL_PROJECT_ID, path],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            conn.execute(
+                "
+                DELETE FROM code_references
                 WHERE project_id = ?1 AND path = ?2
                 ",
                 params![LOCAL_PROJECT_ID, path],
@@ -291,7 +301,143 @@ impl Store {
             .map_err(|error| error.to_string())?;
         }
 
+        for reference in references {
+            conn.execute(
+                "
+                INSERT INTO code_references (
+                    project_id,
+                    path,
+                    target_path,
+                    target_name,
+                    target_kind,
+                    kind,
+                    language,
+                    line_start,
+                    excerpt,
+                    indexed_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ",
+                params![
+                    LOCAL_PROJECT_ID,
+                    reference.path.clone(),
+                    reference.target_path.clone(),
+                    reference.target_name.clone(),
+                    reference.target_kind.clone(),
+                    reference.kind.clone(),
+                    reference.language.clone(),
+                    reference.line_start,
+                    reference.excerpt.clone(),
+                    now
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+
         Ok(())
+    }
+
+    pub async fn symbols_for_target(
+        &self,
+        target: &str,
+        limit: usize,
+    ) -> Result<Vec<CodeSymbol>, String> {
+        if limit == 0 || !self.exists() {
+            return Ok(Vec::new());
+        }
+
+        let target = normalize_target(target);
+        if target.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let candidate_limit = i64::try_from(limit.max(50)).map_err(|error| error.to_string())?;
+        let mut rows = conn
+            .query(
+                "
+                SELECT path, language, name, kind, line_start, line_end, signature
+                FROM code_symbols
+                WHERE project_id = ?1
+                  AND (path = ?2 OR name = ?3)
+                ORDER BY path ASC, line_start ASC
+                LIMIT ?4
+                ",
+                params![
+                    LOCAL_PROJECT_ID,
+                    target.clone(),
+                    target.clone(),
+                    candidate_limit
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut symbols = Vec::new();
+
+        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+            symbols.push(code_symbol_from_row(&row)?);
+        }
+
+        if symbols.is_empty() {
+            return self.recall_symbols(&target, limit).await;
+        }
+
+        symbols.truncate(limit);
+        Ok(symbols)
+    }
+
+    pub async fn references_to_symbols(
+        &self,
+        symbols: &[CodeSymbol],
+        limit: usize,
+    ) -> Result<Vec<CodeReference>, String> {
+        if limit == 0 || symbols.is_empty() || !self.exists() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let mut rows = conn
+            .query(
+                "
+                SELECT
+                    path,
+                    language,
+                    target_path,
+                    target_name,
+                    target_kind,
+                    kind,
+                    line_start,
+                    excerpt
+                FROM code_references
+                WHERE project_id = ?1
+                ORDER BY path ASC, line_start ASC
+                LIMIT 5000
+                ",
+                params![LOCAL_PROJECT_ID],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let targets = symbols
+            .iter()
+            .map(|symbol| (symbol.path.as_str(), symbol.name.as_str()))
+            .collect::<HashSet<_>>();
+        let mut references = Vec::new();
+
+        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+            let reference = code_reference_from_row(&row)?;
+            if targets.contains(&(
+                reference.target_path.as_str(),
+                reference.target_name.as_str(),
+            )) {
+                references.push(reference);
+            }
+        }
+
+        references.truncate(limit);
+        Ok(references)
     }
 
     pub async fn recall_symbols(
@@ -754,6 +900,41 @@ async fn project_from_conn(conn: &Connection) -> Result<Option<Project>, String>
     }))
 }
 
+fn code_symbol_from_row(row: &Row) -> Result<CodeSymbol, String> {
+    Ok(CodeSymbol {
+        path: row.get::<String>(0).map_err(|error| error.to_string())?,
+        language: row
+            .get::<Option<String>>(1)
+            .map_err(|error| error.to_string())?,
+        name: row.get::<String>(2).map_err(|error| error.to_string())?,
+        kind: row.get::<String>(3).map_err(|error| error.to_string())?,
+        line_start: row.get::<i64>(4).map_err(|error| error.to_string())?,
+        line_end: row
+            .get::<Option<i64>>(5)
+            .map_err(|error| error.to_string())?,
+        signature: row.get::<String>(6).map_err(|error| error.to_string())?,
+    })
+}
+
+fn code_reference_from_row(row: &Row) -> Result<CodeReference, String> {
+    Ok(CodeReference {
+        path: row.get::<String>(0).map_err(|error| error.to_string())?,
+        language: row
+            .get::<Option<String>>(1)
+            .map_err(|error| error.to_string())?,
+        target_path: row.get::<String>(2).map_err(|error| error.to_string())?,
+        target_name: row.get::<String>(3).map_err(|error| error.to_string())?,
+        target_kind: row.get::<String>(4).map_err(|error| error.to_string())?,
+        kind: row.get::<String>(5).map_err(|error| error.to_string())?,
+        line_start: row.get::<i64>(6).map_err(|error| error.to_string())?,
+        excerpt: row.get::<String>(7).map_err(|error| error.to_string())?,
+    })
+}
+
+fn normalize_target(target: &str) -> String {
+    target.trim().trim_start_matches("./").replace('\\', "/")
+}
+
 fn current_project_input() -> Result<ProjectInput, String> {
     let root = env::current_dir().map_err(|error| error.to_string())?;
     let root = root.canonicalize().unwrap_or(root);
@@ -1005,7 +1186,7 @@ fn now_ms() -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::{Memory, Store, fts_query, query_terms, recall_score};
-    use crate::code::CodeSymbol;
+    use crate::code::{CodeReference, CodeSymbol};
     use crate::discovery::FileCandidate;
     use crate::embedding::{DEFAULT_EMBEDDING_DIMENSIONS, DETERMINISTIC_MODEL};
     use libsql::{Connection, params};
@@ -1069,7 +1250,9 @@ mod tests {
         assert!(object_exists(&conn, "table", "sessions").await);
         assert!(object_exists(&conn, "table", "session_events").await);
         assert!(object_exists(&conn, "table", "code_symbols").await);
+        assert!(object_exists(&conn, "table", "code_references").await);
         assert!(object_exists(&conn, "index", "code_symbols_project_name_idx").await);
+        assert!(object_exists(&conn, "index", "code_references_target_name_idx").await);
         assert!(object_exists(&conn, "index", "memory_embeddings_vector_idx").await);
 
         let mut rows = conn
@@ -1091,7 +1274,8 @@ mod tests {
                 (2, "project_registry".to_string()),
                 (3, "file_discovery".to_string()),
                 (4, "sessions".to_string()),
-                (5, "code_symbols".to_string())
+                (5, "code_symbols".to_string()),
+                (6, "code_references".to_string())
             ]
         );
     }
@@ -1243,14 +1427,21 @@ mod tests {
         };
 
         test.store
-            .record_code_symbols(std::slice::from_ref(&file), std::slice::from_ref(&symbol))
+            .record_code_index(
+                std::slice::from_ref(&file),
+                std::slice::from_ref(&symbol),
+                &[],
+            )
             .await
             .unwrap();
         let matches = test.store.recall_symbols("plugin hooks", 5).await.unwrap();
 
         assert_eq!(matches, vec![symbol]);
 
-        test.store.record_code_symbols(&[file], &[]).await.unwrap();
+        test.store
+            .record_code_index(&[file], &[], &[])
+            .await
+            .unwrap();
         assert!(
             test.store
                 .recall_symbols("plugin hooks", 5)
@@ -1258,6 +1449,63 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn records_code_references_for_impact() {
+        let test = TestStore::new("code_references");
+        let source = FileCandidate {
+            path: "src/main.rs".to_string(),
+            score: 0,
+            language: Some("rust".to_string()),
+            size_bytes: Some(80),
+        };
+        let target = FileCandidate {
+            path: "src/plugin_hooks.rs".to_string(),
+            score: 0,
+            language: Some("rust".to_string()),
+            size_bytes: Some(120),
+        };
+        let symbol = CodeSymbol {
+            path: target.path.clone(),
+            language: target.language.clone(),
+            name: "run_after_config".to_string(),
+            kind: "function".to_string(),
+            line_start: 3,
+            line_end: None,
+            signature: "pub fn run_after_config()".to_string(),
+        };
+        let reference = CodeReference {
+            path: source.path.clone(),
+            language: source.language.clone(),
+            target_path: symbol.path.clone(),
+            target_name: symbol.name.clone(),
+            target_kind: symbol.kind.clone(),
+            kind: "call".to_string(),
+            line_start: 8,
+            excerpt: "run_after_config();".to_string(),
+        };
+
+        test.store
+            .record_code_index(
+                &[source.clone(), target],
+                std::slice::from_ref(&symbol),
+                &[reference],
+            )
+            .await
+            .unwrap();
+
+        let symbols = test
+            .store
+            .symbols_for_target("run_after_config", 5)
+            .await
+            .unwrap();
+        let references = test.store.references_to_symbols(&symbols, 5).await.unwrap();
+
+        assert_eq!(symbols, vec![symbol]);
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].path, "src/main.rs");
+        assert_eq!(references[0].kind, "call");
     }
 
     #[tokio::test]
