@@ -1,6 +1,7 @@
 use crate::cli::{Command, OutputFormat, help_text};
 use crate::context::{ContextPack, json_string};
 use crate::discovery;
+use crate::mcp;
 use crate::store::{Memory, Store};
 use std::fmt::Write;
 use std::path::Path;
@@ -16,6 +17,7 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::SessionStart { task } => session_start(&task).await,
         Command::SessionEvent { kind, detail } => session_event(&kind, &detail).await,
         Command::SessionEnd { summary } => session_end(summary.as_deref()).await,
+        Command::Mcp => mcp::serve_stdio().await,
         Command::Improve => placeholder("improve", "memory consolidation is not implemented yet"),
         Command::Forget { query } => forget(query),
         Command::Doctor => doctor().await,
