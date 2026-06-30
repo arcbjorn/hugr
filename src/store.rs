@@ -2,6 +2,7 @@ use crate::code::{CodeReference, CodeSymbol};
 use crate::discovery::FileCandidate;
 use crate::embedding::{DeterministicEmbeddingProvider, EmbeddingProvider};
 use crate::migrations;
+use crate::testmap::{self, TestCandidate};
 use libsql::{Builder, Connection, Row, params};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -438,6 +439,134 @@ impl Store {
 
         references.truncate(limit);
         Ok(references)
+    }
+
+    pub async fn references_from_symbols(
+        &self,
+        symbols: &[CodeSymbol],
+        limit: usize,
+    ) -> Result<Vec<CodeReference>, String> {
+        if limit == 0 || symbols.is_empty() || !self.exists() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let mut rows = conn
+            .query(
+                "
+                SELECT
+                    path,
+                    language,
+                    target_path,
+                    target_name,
+                    target_kind,
+                    kind,
+                    line_start,
+                    excerpt
+                FROM code_references
+                WHERE project_id = ?1
+                ORDER BY path ASC, line_start ASC
+                LIMIT 5000
+                ",
+                params![LOCAL_PROJECT_ID],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut references = Vec::new();
+
+        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+            let reference = code_reference_from_row(&row)?;
+            if symbols
+                .iter()
+                .any(|symbol| reference_is_in_symbol(&reference, symbol))
+            {
+                references.push(reference);
+            }
+        }
+
+        references.truncate(limit);
+        Ok(references)
+    }
+
+    pub async fn references_from_path(
+        &self,
+        path: &str,
+        limit: usize,
+    ) -> Result<Vec<CodeReference>, String> {
+        if limit == 0 || !self.exists() {
+            return Ok(Vec::new());
+        }
+
+        let path = normalize_target(path);
+        if path.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let candidate_limit = i64::try_from(limit.max(50)).map_err(|error| error.to_string())?;
+        let mut rows = conn
+            .query(
+                "
+                SELECT
+                    path,
+                    language,
+                    target_path,
+                    target_name,
+                    target_kind,
+                    kind,
+                    line_start,
+                    excerpt
+                FROM code_references
+                WHERE project_id = ?1 AND path = ?2
+                ORDER BY line_start ASC
+                LIMIT ?3
+                ",
+                params![LOCAL_PROJECT_ID, path, candidate_limit],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut references = Vec::new();
+
+        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+            references.push(code_reference_from_row(&row)?);
+        }
+
+        references.truncate(limit);
+        Ok(references)
+    }
+
+    pub async fn likely_tests_for_files(
+        &self,
+        files: &[String],
+        limit: usize,
+    ) -> Result<Vec<TestCandidate>, String> {
+        if limit == 0 || files.is_empty() || !self.exists() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let mut rows = conn
+            .query(
+                "
+                SELECT path
+                FROM discovered_files
+                WHERE project_id = ?1
+                ORDER BY path ASC
+                ",
+                params![LOCAL_PROJECT_ID],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut known_files = Vec::new();
+
+        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+            known_files.push(row.get::<String>(0).map_err(|error| error.to_string())?);
+        }
+
+        Ok(testmap::likely_tests_for_files(files, &known_files, limit))
     }
 
     pub async fn recall_symbols(
@@ -933,6 +1062,13 @@ fn code_reference_from_row(row: &Row) -> Result<CodeReference, String> {
 
 fn normalize_target(target: &str) -> String {
     target.trim().trim_start_matches("./").replace('\\', "/")
+}
+
+fn reference_is_in_symbol(reference: &CodeReference, symbol: &CodeSymbol) -> bool {
+    let line_end = symbol.line_end.unwrap_or(symbol.line_start);
+    reference.path == symbol.path
+        && reference.line_start >= symbol.line_start
+        && reference.line_start <= line_end
 }
 
 fn current_project_input() -> Result<ProjectInput, String> {
@@ -1472,7 +1608,7 @@ mod tests {
             name: "run_after_config".to_string(),
             kind: "function".to_string(),
             line_start: 3,
-            line_end: None,
+            line_end: Some(10),
             signature: "pub fn run_after_config()".to_string(),
         };
         let reference = CodeReference {
@@ -1501,11 +1637,53 @@ mod tests {
             .await
             .unwrap();
         let references = test.store.references_to_symbols(&symbols, 5).await.unwrap();
+        let outbound = test
+            .store
+            .references_from_symbols(&symbols, 5)
+            .await
+            .unwrap();
+        let file_outbound = test
+            .store
+            .references_from_path("src/main.rs", 5)
+            .await
+            .unwrap();
 
         assert_eq!(symbols, vec![symbol]);
         assert_eq!(references.len(), 1);
         assert_eq!(references[0].path, "src/main.rs");
         assert_eq!(references[0].kind, "call");
+        assert!(outbound.is_empty());
+        assert_eq!(file_outbound.len(), 1);
+        assert_eq!(file_outbound[0].target_name, "run_after_config");
+    }
+
+    #[tokio::test]
+    async fn maps_likely_tests_from_discovered_files() {
+        let test = TestStore::new("likely_tests");
+        let files = vec![
+            FileCandidate {
+                path: "src/plugin_hooks.rs".to_string(),
+                score: 0,
+                language: Some("rust".to_string()),
+                size_bytes: Some(120),
+            },
+            FileCandidate {
+                path: "tests/plugin_hooks.rs".to_string(),
+                score: 0,
+                language: Some("rust".to_string()),
+                size_bytes: Some(90),
+            },
+        ];
+
+        test.store.record_discovered_files(&files).await.unwrap();
+        let tests = test
+            .store
+            .likely_tests_for_files(&["src/plugin_hooks.rs".to_string()], 5)
+            .await
+            .unwrap();
+
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].path, "tests/plugin_hooks.rs");
     }
 
     #[tokio::test]
