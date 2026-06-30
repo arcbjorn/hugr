@@ -1,5 +1,7 @@
-use crate::cli::{Command, help_text};
+use crate::cli::{Command, OutputFormat, help_text};
+use crate::context::{ContextPack, json_string};
 use crate::store::{Memory, Store};
+use std::fmt::Write;
 use std::fs;
 use std::path::Path;
 
@@ -8,8 +10,8 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::Init => init().await,
         Command::Status => status().await,
         Command::Remember { text } => remember(&text).await,
-        Command::Recall { query } => recall(&query).await,
-        Command::Context { task } => context(&task).await,
+        Command::Recall { query, format } => recall(&query, format).await,
+        Command::Context { task, format } => context(&task, format).await,
         Command::Improve => placeholder("improve", "memory consolidation is not implemented yet"),
         Command::Forget { query } => forget(query),
         Command::Doctor => doctor().await,
@@ -47,8 +49,13 @@ async fn remember(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn recall(query: &str) -> Result<(), String> {
+async fn recall(query: &str, format: OutputFormat) -> Result<(), String> {
     let matches = Store::open_current().recall(query, 10).await?;
+
+    if format == OutputFormat::Json {
+        println!("{}", render_recall_json(query, &matches));
+        return Ok(());
+    }
 
     if matches.is_empty() {
         println!("no memories matched '{query}'");
@@ -62,41 +69,16 @@ async fn recall(query: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn context(task: &str) -> Result<(), String> {
+async fn context(task: &str, format: OutputFormat) -> Result<(), String> {
     let store = Store::open_current();
     let memories = store.recall(task, 5).await?;
     let files = discover_candidate_files(task, 12)?;
+    let pack = ContextPack::new(task, files, memories);
 
-    println!("# Hugr Context Pack");
-    println!();
-    println!("## Task");
-    println!("{task}");
-    println!();
-    println!("## Relevant Files");
-    if files.is_empty() {
-        println!("No file candidates found yet.");
+    if format == OutputFormat::Json {
+        println!("{}", pack.render_json());
     } else {
-        for file in files {
-            println!("- {file}");
-        }
-    }
-    println!();
-    println!("## Relevant Memories");
-    print_memories_or_empty(&memories);
-    println!();
-    println!("## Suggested Path");
-    println!("1. Inspect the relevant files and symbols.");
-    println!("2. Check whether any memories are stale before relying on them.");
-    println!("3. Make the smallest change that satisfies the task.");
-    println!("4. Run the narrowest useful tests, then broaden if risk is unclear.");
-    println!();
-    println!("## Citations");
-    if memories.is_empty() {
-        println!("- No memory citations yet.");
-    } else {
-        for memory in memories {
-            println!("- {}", memory.id);
-        }
+        print!("{}", pack.render_markdown());
     }
 
     Ok(())
@@ -135,14 +117,27 @@ fn placeholder(command: &str, detail: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn print_memories_or_empty(memories: &[Memory]) {
-    if memories.is_empty() {
-        println!("No matching memories yet.");
-    } else {
-        for memory in memories {
-            println!("- {} [{}]: {}", memory.id, memory.kind, memory.text);
+fn render_recall_json(query: &str, memories: &[Memory]) -> String {
+    let mut rendered = String::new();
+
+    rendered.push('{');
+    let _ = write!(rendered, "\"query\":{},\"memories\":[", json_string(query));
+    for (index, memory) in memories.iter().enumerate() {
+        if index > 0 {
+            rendered.push(',');
         }
+        let _ = write!(
+            rendered,
+            "{{\"id\":{},\"created_at_ms\":{},\"kind\":{},\"text\":{}}}",
+            json_string(&memory.id),
+            memory.created_at_ms,
+            json_string(&memory.kind),
+            json_string(&memory.text)
+        );
     }
+    rendered.push_str("]}");
+
+    rendered
 }
 
 fn discover_candidate_files(task: &str, limit: usize) -> Result<Vec<String>, String> {
@@ -200,4 +195,27 @@ fn should_skip(name: &str) -> bool {
         name,
         ".git" | ".hugr" | ".agent-out" | ".worktrees" | "target" | "node_modules"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_recall_json;
+    use crate::store::Memory;
+
+    #[test]
+    fn recall_json_includes_query_and_memories() {
+        let json = render_recall_json(
+            "plugin hooks",
+            &[Memory {
+                id: "mem_1".to_string(),
+                created_at_ms: 7,
+                kind: "fact".to_string(),
+                text: "plugin hooks run after configuration is loaded".to_string(),
+            }],
+        );
+
+        assert!(json.contains("\"query\":\"plugin hooks\""));
+        assert!(json.contains("\"id\":\"mem_1\""));
+        assert!(json.contains("\"created_at_ms\":7"));
+    }
 }
