@@ -1,8 +1,8 @@
 use crate::cli::{Command, OutputFormat, help_text};
 use crate::context::{ContextPack, json_string};
+use crate::discovery;
 use crate::store::{Memory, Store};
 use std::fmt::Write;
-use std::fs;
 use std::path::Path;
 
 pub async fn execute(command: Command) -> Result<(), String> {
@@ -82,7 +82,12 @@ async fn recall(query: &str, format: OutputFormat) -> Result<(), String> {
 async fn context(task: &str, format: OutputFormat) -> Result<(), String> {
     let store = Store::open_current();
     let memories = store.recall(task, 5).await?;
-    let files = discover_candidate_files(task, 12)?;
+    let file_candidates = discovery::discover_candidate_files(Path::new("."), task, 12)?;
+    store.record_discovered_files(&file_candidates).await?;
+    let files = file_candidates
+        .into_iter()
+        .map(|candidate| candidate.path)
+        .collect::<Vec<_>>();
     let pack = ContextPack::new(task, files, memories);
 
     if format == OutputFormat::Json {
@@ -168,63 +173,6 @@ fn render_recall_json(query: &str, memories: &[Memory]) -> String {
     rendered.push_str("]}");
 
     rendered
-}
-
-fn discover_candidate_files(task: &str, limit: usize) -> Result<Vec<String>, String> {
-    let terms = task
-        .split(|char: char| !char.is_alphanumeric() && char != '_' && char != '-')
-        .filter(|term| term.len() > 2)
-        .map(|term| term.to_lowercase())
-        .collect::<Vec<_>>();
-
-    let mut scored = Vec::new();
-    visit_files(Path::new("."), &terms, &mut scored)?;
-    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-    scored.truncate(limit);
-    Ok(scored.into_iter().map(|(_, path)| path).collect())
-}
-
-fn visit_files(
-    path: &Path,
-    terms: &[String],
-    scored: &mut Vec<(usize, String)>,
-) -> Result<(), String> {
-    let entries = fs::read_dir(path).map_err(|error| error.to_string())?;
-    for entry in entries {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        if should_skip(&name) {
-            continue;
-        }
-
-        if path.is_dir() {
-            visit_files(&path, terms, scored)?;
-        } else if path.is_file() {
-            let display = path
-                .strip_prefix(".")
-                .unwrap_or(&path)
-                .display()
-                .to_string();
-            let normalized = display.to_lowercase();
-            let score = terms
-                .iter()
-                .filter(|term| normalized.contains(term.as_str()))
-                .count();
-            if score > 0 || scored.len() < 20 {
-                scored.push((score, display));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn should_skip(name: &str) -> bool {
-    matches!(
-        name,
-        ".git" | ".hugr" | ".agent-out" | ".worktrees" | "target" | "node_modules"
-    )
 }
 
 #[cfg(test)]
