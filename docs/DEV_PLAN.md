@@ -39,12 +39,12 @@ Implemented:
 - best-effort direct reference/call/import extraction stored in `code_references`
 - important symbol citations in context packs
 - `hugr impact <file-or-symbol>` for direct indexed impact reports
+- local branch, upstream, ahead/behind, and worktree changes in context packs
 - initial vision, storage, and technical blueprint docs
 
 Not implemented yet:
 
 - real embedding provider integration
-- git/worktree awareness
 - tree-sitter-backed parsing
 - richer symbol graph edges
 - cloud or hybrid sync
@@ -288,6 +288,10 @@ Implemented first slice:
 - `hugr_context` and `hugr context` include important symbols when available.
 - `code_references` table for direct references, calls, and imports.
 - `hugr impact` and `hugr_impact` report matched symbols, direct references, and affected files.
+- Symbol ranges are stored and surfaced in context and impact JSON.
+- Impact reports include inbound references and outbound references from matched symbol or file scope.
+- Likely test files are mapped from discovered project paths and surfaced in context and impact output.
+- Context packs include local branch, upstream, ahead/behind counts, and worktree changes.
 
 Open questions:
 
@@ -352,7 +356,9 @@ Recommended next commits:
 9. Done: `feat(mcp): expose core tools`
 10. Done: `feat(code): index symbols`
 11. Done: `feat(impact): trace symbol impact`
-12. `feat(graph): enrich code relationships`
+12. Done: `feat(graph): enrich code relationships`
+13. Done: `feat(testmap): suggest affected tests`
+14. In progress: `feat(git): add worktree context`
 
 Each commit should leave the CLI usable.
 
@@ -369,6 +375,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Enrich code relationships.
+Add real embedding provider integration.
 
-That is the right next step because Hugr can now report direct indexed impact. The next useful layer is improving relationship quality with better parsers, module import resolution, call neighborhoods, and test mapping.
+That is the right next step because Hugr now reports local code, test, and worktree context. The next useful layer is replacing deterministic offline embeddings with an optional real provider while keeping local development deterministic.
