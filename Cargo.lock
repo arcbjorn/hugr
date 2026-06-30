@@ -622,6 +622,7 @@ name = "hugr"
 version = "0.1.0"
 dependencies = [
  "libsql",
+ "serde_json",
  "tokio",
 ]
 
