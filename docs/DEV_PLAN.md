@@ -18,11 +18,17 @@ Implemented:
 - vector-ready `memory_embeddings` table with `F32_BLOB(1536)`
 - `memory_embeddings_vector_idx` using `libsql_vector_idx(embedding)`
 - basic full-text-ready schema
+- `schema_migrations` tracking for the initial schema
+- FTS-backed memory recall with deterministic reranking
+- structured `ContextPack` generation and Markdown rendering
+- JSON output for `hugr recall --json` and `hugr context --json`
+- deterministic local embedding provider for tests and offline development
+- synchronous embedding persistence on `hugr remember`
 - initial vision, storage, and technical blueprint docs
 
 Not implemented yet:
 
-- embedding generation
+- real embedding provider integration
 - `vector_top_k` semantic recall
 - durable sessions
 - project registry
@@ -316,10 +322,10 @@ Open questions:
 
 Recommended next commits:
 
-1. `feat(storage): add schema migrations`
-2. `feat(recall): query memory fts`
-3. `feat(context): return structured context packs`
-4. `feat(memory): add embedding provider trait`
+1. Done: `feat(storage): add schema migrations`
+2. Done: `feat(recall): query memory fts`
+3. Done: `feat(context): return structured context packs`
+4. Done: `feat(memory): add embedding provider trait`
 5. `feat(vector): add vector recall`
 6. `feat(project): add project registry`
 7. `feat(index): add file discovery`
@@ -342,6 +348,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add real migrations and FTS-backed recall.
+Add vector recall over stored deterministic embeddings.
 
-That is the right next step because it strengthens the foundation without requiring embeddings, MCP, or code indexing yet. Once recall is database-backed and tested, embeddings and context packs can build on it cleanly.
+That is the right next step because memories now persist embeddings, so semantic recall can be added and tested without requiring any external embedding service.
