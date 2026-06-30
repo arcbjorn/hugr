@@ -67,12 +67,7 @@ pub(crate) fn discover_candidate_files(
     Ok(rank_files(root, task, files, limit))
 }
 
-fn rank_files(
-    root: &Path,
-    task: &str,
-    files: Vec<PathBuf>,
-    limit: usize,
-) -> Vec<FileCandidate> {
+fn rank_files(root: &Path, task: &str, files: Vec<PathBuf>, limit: usize) -> Vec<FileCandidate> {
     let terms = query_terms(task);
     if terms.is_empty() {
         return Vec::new();
@@ -124,7 +119,9 @@ fn candidate_for(root: &Path, path: &Path, terms: &[String]) -> Option<FileCandi
         return None;
     }
 
-    let size_bytes = fs::metadata(root.join(path)).ok().map(|metadata| metadata.len());
+    let size_bytes = fs::metadata(root.join(path))
+        .ok()
+        .map(|metadata| metadata.len());
     Some(FileCandidate {
         path: display,
         score,
@@ -204,7 +201,10 @@ impl IgnorePattern {
         }
 
         let anchored = line.starts_with('/');
-        let value = line.trim_start_matches('/').trim_end_matches('/').to_string();
+        let value = line
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .to_string();
         if value.is_empty() {
             return None;
         }
@@ -315,8 +315,7 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
         for value_index in 1..=value.len() {
             table[pattern_index][value_index] = match pattern[pattern_index - 1] {
                 b'*' => {
-                    table[pattern_index - 1][value_index]
-                        || table[pattern_index][value_index - 1]
+                    table[pattern_index - 1][value_index] || table[pattern_index][value_index - 1]
                 }
                 b'?' => table[pattern_index - 1][value_index - 1],
                 char => char == value[value_index - 1] && table[pattern_index - 1][value_index - 1],
@@ -396,6 +395,9 @@ mod tests {
         let candidates = discover_candidate_files(project.root(), "add plugin hooks", 5).unwrap();
 
         assert_eq!(candidates.first().unwrap().path, "src/plugin_hooks.rs");
-        assert_eq!(candidates.first().unwrap().language.as_deref(), Some("rust"));
+        assert_eq!(
+            candidates.first().unwrap().language.as_deref(),
+            Some("rust")
+        );
     }
 }
