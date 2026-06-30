@@ -1,5 +1,6 @@
 use crate::context::ContextPack;
 use crate::discovery;
+use crate::impact;
 use crate::indexer;
 use crate::store::{Memory, Project, Session, SessionEvent, Store};
 use serde_json::{Value, json};
@@ -102,9 +103,8 @@ async fn handle_tool_call(params: Value) -> Result<Value, String> {
         "hugr_session_event" => tool_session_event(&arguments).await,
         "hugr_session_end" => tool_session_end(&arguments).await,
         "hugr_index" => tool_index(&arguments).await,
-        "hugr_forget" | "hugr_impact" => {
-            Ok(tool_error_result(&format!("{name} is not implemented yet")))
-        }
+        "hugr_impact" => tool_impact(&arguments).await,
+        "hugr_forget" => Ok(tool_error_result(&format!("{name} is not implemented yet"))),
         unknown => Err(format!("unknown tool '{unknown}'")),
     }
 }
@@ -200,6 +200,17 @@ async fn tool_index(arguments: &Value) -> Result<Value, String> {
     ))
 }
 
+async fn tool_impact(arguments: &Value) -> Result<Value, String> {
+    let target = required_string(arguments, "target")?;
+    let limit = optional_bounded_usize(arguments, "limit", 50, 500)?;
+    indexer::index_project(5000).await?;
+    let store = Store::open_current();
+    let report = impact::analyze(&store, &target, limit).await?;
+    let structured = serde_json::from_str(&report.render_json()).unwrap_or_else(|_| json!({}));
+
+    Ok(tool_result(report.render_markdown(), structured))
+}
+
 fn tools() -> Vec<Value> {
     vec![
         tool_schema(
@@ -245,7 +256,7 @@ fn tools() -> Vec<Value> {
         tool_schema("hugr_index", "Index project files and symbols.", &[]),
         tool_schema(
             "hugr_impact",
-            "Placeholder for future code impact analysis.",
+            "Trace direct indexed references for a file or symbol.",
             &[("target", "string")],
         ),
     ]
@@ -272,6 +283,17 @@ fn tool_schema(name: &str, description: &str, properties: &[(&str, &str)]) -> Va
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 50
+            }),
+        );
+    }
+
+    if name == "hugr_impact" {
+        props.insert(
+            "limit".to_string(),
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500
             }),
         );
     }
