@@ -1,4 +1,5 @@
 use libsql::{Builder, Connection, params};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -6,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const HUGR_DIR: &str = ".hugr";
 const HUGR_DB: &str = "hugr.db";
 const EMBEDDING_DIMENSIONS: i64 = 1536;
+const INITIAL_SCHEMA_VERSION: i64 = 1;
+const INITIAL_SCHEMA_NAME: &str = "initial_schema";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Memory {
@@ -24,6 +27,11 @@ impl Store {
         Self {
             root: PathBuf::from(HUGR_DIR),
         }
+    }
+
+    #[cfg(test)]
+    fn open_at(root: PathBuf) -> Self {
+        Self { root }
     }
 
     pub async fn init(&self) -> Result<(), String> {
@@ -92,11 +100,89 @@ impl Store {
     }
 
     pub async fn recall(&self, query: &str, limit: usize) -> Result<Vec<Memory>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
         let terms = query_terms(query);
         if terms.is_empty() {
             return Ok(Vec::new());
         }
 
+        if !self.exists() {
+            return Ok(Vec::new());
+        }
+
+        self.init().await?;
+        let conn = self.connect().await?;
+        let mut matches = self.fts_recall(&conn, &terms, query, limit).await?;
+
+        if matches.is_empty() {
+            return self.recall_from_memory_scan(query, &terms, limit).await;
+        }
+
+        matches.sort_by(|left, right| {
+            right
+                .term_score
+                .cmp(&left.term_score)
+                .then_with(|| left.fts_rank.total_cmp(&right.fts_rank))
+                .then_with(|| right.memory.created_at_ms.cmp(&left.memory.created_at_ms))
+        });
+        matches.truncate(limit);
+        Ok(matches.into_iter().map(|matched| matched.memory).collect())
+    }
+
+    async fn fts_recall(
+        &self,
+        conn: &Connection,
+        terms: &[String],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<RankedMemory>, String> {
+        let search_query = fts_query(terms);
+        let candidate_limit = i64::try_from(limit.max(50)).map_err(|error| error.to_string())?;
+        let mut rows = conn
+            .query(
+                "
+                SELECT m.id, m.created_at_ms, m.kind, m.text, bm25(memories_fts) AS fts_rank
+                FROM memories_fts
+                JOIN memories AS m ON m.rowid = memories_fts.rowid
+                WHERE memories_fts MATCH ?1
+                ORDER BY fts_rank, m.created_at_ms DESC
+                LIMIT ?2
+                ",
+                params![search_query, candidate_limit],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut matches = Vec::new();
+
+        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+            let memory = Memory {
+                id: row.get::<String>(0).map_err(|error| error.to_string())?,
+                created_at_ms: row.get::<i64>(1).map_err(|error| error.to_string())?,
+                kind: row.get::<String>(2).map_err(|error| error.to_string())?,
+                text: row.get::<String>(3).map_err(|error| error.to_string())?,
+            };
+            let term_score = recall_score(&memory, terms, query);
+            if term_score > 0 {
+                matches.push(RankedMemory {
+                    memory,
+                    term_score,
+                    fts_rank: row.get::<f64>(4).map_err(|error| error.to_string())?,
+                });
+            }
+        }
+
+        Ok(matches)
+    }
+
+    async fn recall_from_memory_scan(
+        &self,
+        query: &str,
+        terms: &[String],
+        limit: usize,
+    ) -> Result<Vec<Memory>, String> {
         let mut matches = self
             .memories()
             .await?
@@ -130,15 +216,66 @@ impl Store {
             .build()
             .await
             .map_err(|error| error.to_string())?;
-        db.connect().map_err(|error| error.to_string())
+        let conn = db.connect().map_err(|error| error.to_string())?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(conn)
     }
 }
 
-async fn migrate(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch(&format!(
-        "
-        PRAGMA foreign_keys = ON;
+struct RankedMemory {
+    memory: Memory,
+    term_score: usize,
+    fts_rank: f64,
+}
 
+async fn migrate(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at_ms INTEGER NOT NULL
+        );
+        ",
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+
+    let applied = applied_migrations(conn).await?;
+    if !applied.contains(&INITIAL_SCHEMA_VERSION) {
+        conn.execute_batch(&initial_schema_sql())
+            .await
+            .map_err(|error| error.to_string())?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![INITIAL_SCHEMA_VERSION, INITIAL_SCHEMA_NAME, now_ms()?],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+async fn applied_migrations(conn: &Connection) -> Result<HashSet<i64>, String> {
+    let mut rows = conn
+        .query("SELECT version FROM schema_migrations", ())
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut applied = HashSet::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        applied.insert(row.get::<i64>(0).map_err(|error| error.to_string())?);
+    }
+
+    Ok(applied)
+}
+
+fn initial_schema_sql() -> String {
+    format!(
+        "
         CREATE TABLE IF NOT EXISTS memories (
             id TEXT PRIMARY KEY,
             created_at_ms INTEGER NOT NULL,
@@ -209,12 +346,10 @@ async fn migrate(conn: &Connection) -> Result<(), String> {
             INSERT INTO memories_fts(rowid, id, kind, text)
             VALUES (new.rowid, new.id, new.kind, new.text);
         END;
-        "
-    ))
-    .await
-    .map_err(|error| error.to_string())?;
 
-    Ok(())
+        INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
+        "
+    )
 }
 
 fn recall_score(memory: &Memory, terms: &[String], query: &str) -> usize {
@@ -226,6 +361,14 @@ fn recall_score(memory: &Memory, terms: &[String], query: &str) -> usize {
             .iter()
             .filter(|term| text.contains(term.as_str()))
             .count()
+}
+
+fn fts_query(terms: &[String]) -> String {
+    terms
+        .iter()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ")
 }
 
 fn query_terms(query: &str) -> Vec<String> {
@@ -246,7 +389,35 @@ fn now_ms() -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Memory, query_terms, recall_score};
+    use super::{Memory, Store, fts_query, query_terms, recall_score};
+    use libsql::{Connection, params};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestStore {
+        store: Store,
+        workspace: PathBuf,
+    }
+
+    impl TestStore {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos();
+            let workspace = std::env::temp_dir().join(format!("hugr_{name}_{unique}"));
+            let store = Store::open_at(workspace.join(".hugr"));
+
+            Self { store, workspace }
+        }
+    }
+
+    impl Drop for TestStore {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.workspace);
+        }
+    }
 
     #[test]
     fn recall_scores_query_terms() {
@@ -258,5 +429,78 @@ mod tests {
         };
         let terms = query_terms("add plugin hooks");
         assert!(recall_score(&memory, &terms, "add plugin hooks") > 0);
+    }
+
+    #[test]
+    fn fts_query_ors_quoted_terms() {
+        let terms = query_terms("add plugin hooks");
+        assert_eq!(fts_query(&terms), "\"add\" OR \"plugin\" OR \"hooks\"");
+    }
+
+    #[tokio::test]
+    async fn init_records_initial_schema_migration() {
+        let test = TestStore::new("migration");
+        test.store.init().await.unwrap();
+
+        let conn = test.store.connect().await.unwrap();
+        assert!(object_exists(&conn, "table", "memories").await);
+        assert!(object_exists(&conn, "table", "schema_migrations").await);
+        assert!(object_exists(&conn, "table", "memories_fts").await);
+        assert!(object_exists(&conn, "index", "memory_embeddings_vector_idx").await);
+
+        let mut rows = conn
+            .query(
+                "SELECT version, name FROM schema_migrations ORDER BY version",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+
+        assert_eq!(row.get::<i64>(0).unwrap(), 1);
+        assert_eq!(row.get::<String>(1).unwrap(), "initial_schema");
+        assert!(rows.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn recall_reads_from_fts() {
+        let test = TestStore::new("recall");
+        let memory = test
+            .store
+            .remember("plugin hooks run after configuration is loaded")
+            .await
+            .unwrap();
+
+        let matches = test.store.recall("add plugin hooks", 5).await.unwrap();
+
+        assert_eq!(matches.first(), Some(&memory));
+        assert_eq!(fts_row_count(&test.store, "add plugin hooks").await, 1);
+    }
+
+    async fn object_exists(conn: &Connection, kind: &str, name: &str) -> bool {
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2 LIMIT 1",
+                params![kind, name],
+            )
+            .await
+            .unwrap();
+
+        rows.next().await.unwrap().is_some()
+    }
+
+    async fn fts_row_count(store: &Store, query: &str) -> usize {
+        let conn = store.connect().await.unwrap();
+        let terms = query_terms(query);
+        let mut rows = conn
+            .query(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH ?1",
+                params![fts_query(&terms)],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+
+        row.get::<i64>(0).unwrap() as usize
     }
 }
