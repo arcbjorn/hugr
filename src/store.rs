@@ -1,3 +1,4 @@
+use crate::discovery::FileCandidate;
 use crate::embedding::{DeterministicEmbeddingProvider, EmbeddingProvider};
 use crate::migrations;
 use libsql::{Builder, Connection, params};
@@ -153,6 +154,52 @@ impl Store {
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
         project_from_conn(&conn).await
+    }
+
+    pub async fn record_discovered_files(&self, files: &[FileCandidate]) -> Result<(), String> {
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        self.init().await?;
+        let conn = self.connect().await?;
+        let now = now_ms()?;
+
+        for file in files {
+            let size_bytes = file
+                .size_bytes
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            conn.execute(
+                "
+                INSERT INTO discovered_files (
+                    project_id,
+                    path,
+                    language,
+                    size_bytes,
+                    discovered_at_ms,
+                    updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                ON CONFLICT(project_id, path) DO UPDATE SET
+                    language = excluded.language,
+                    size_bytes = excluded.size_bytes,
+                    updated_at_ms = excluded.updated_at_ms
+                ",
+                params![
+                    LOCAL_PROJECT_ID,
+                    file.path.clone(),
+                    file.language.clone(),
+                    size_bytes,
+                    now
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+
+        Ok(())
     }
 
     pub async fn recall(&self, query: &str, limit: usize) -> Result<Vec<Memory>, String> {
@@ -546,6 +593,7 @@ fn now_ms() -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::{Memory, Store, fts_query, query_terms, recall_score};
+    use crate::discovery::FileCandidate;
     use crate::embedding::{DEFAULT_EMBEDDING_DIMENSIONS, DETERMINISTIC_MODEL};
     use libsql::{Connection, params};
     use std::fs;
@@ -604,6 +652,7 @@ mod tests {
         assert!(object_exists(&conn, "table", "schema_migrations").await);
         assert!(object_exists(&conn, "table", "memories_fts").await);
         assert!(object_exists(&conn, "table", "projects").await);
+        assert!(object_exists(&conn, "table", "discovered_files").await);
         assert!(object_exists(&conn, "index", "memory_embeddings_vector_idx").await);
 
         let mut rows = conn
@@ -613,18 +662,19 @@ mod tests {
             )
             .await
             .unwrap();
-        let initial = rows.next().await.unwrap().unwrap();
-        let initial_version = initial.get::<i64>(0).unwrap();
-        let initial_name = initial.get::<String>(1).unwrap();
-        let project = rows.next().await.unwrap().unwrap();
-        let project_version = project.get::<i64>(0).unwrap();
-        let project_name = project.get::<String>(1).unwrap();
+        let mut migrations = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            migrations.push((row.get::<i64>(0).unwrap(), row.get::<String>(1).unwrap()));
+        }
 
-        assert_eq!(initial_version, 1);
-        assert_eq!(initial_name, "initial_schema");
-        assert_eq!(project_version, 2);
-        assert_eq!(project_name, "project_registry");
-        assert!(rows.next().await.unwrap().is_none());
+        assert_eq!(
+            migrations,
+            vec![
+                (1, "initial_schema".to_string()),
+                (2, "project_registry".to_string()),
+                (3, "file_discovery".to_string())
+            ]
+        );
     }
 
     #[tokio::test]
@@ -715,6 +765,42 @@ mod tests {
             row.get::<i64>(2).unwrap(),
             (DEFAULT_EMBEDDING_DIMENSIONS * 4) as i64
         );
+        assert!(rows.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn records_discovered_files() {
+        let test = TestStore::new("discovered_files");
+        let file = FileCandidate {
+            path: "src/plugin_hooks.rs".to_string(),
+            score: 12,
+            language: Some("rust".to_string()),
+            size_bytes: Some(42),
+        };
+
+        test.store
+            .record_discovered_files(std::slice::from_ref(&file))
+            .await
+            .unwrap();
+
+        let conn = test.store.connect().await.unwrap();
+        let mut rows = conn
+            .query(
+                "
+                SELECT project_id, path, language, size_bytes
+                FROM discovered_files
+                WHERE path = ?1
+                ",
+                params![file.path],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+
+        assert_eq!(row.get::<String>(0).unwrap(), "project_local");
+        assert_eq!(row.get::<String>(1).unwrap(), "src/plugin_hooks.rs");
+        assert_eq!(row.get::<String>(2).unwrap(), "rust");
+        assert_eq!(row.get::<i64>(3).unwrap(), 42);
         assert!(rows.next().await.unwrap().is_none());
     }
 
