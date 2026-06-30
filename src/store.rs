@@ -2,12 +2,15 @@ use crate::embedding::{DeterministicEmbeddingProvider, EmbeddingProvider};
 use crate::migrations;
 use libsql::{Builder, Connection, params};
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HUGR_DIR: &str = ".hugr";
 const HUGR_DB: &str = "hugr.db";
+const LOCAL_PROJECT_ID: &str = "project_local";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Memory {
@@ -19,6 +22,25 @@ pub struct Memory {
 
 pub struct Store {
     root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    pub root_path: String,
+    pub git_remote: Option<String>,
+    pub default_branch: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+struct ProjectInput {
+    id: String,
+    name: String,
+    root_path: String,
+    git_remote: Option<String>,
+    default_branch: Option<String>,
 }
 
 impl Store {
@@ -38,6 +60,8 @@ impl Store {
         fs::create_dir_all(self.root.join("sessions")).map_err(|error| error.to_string())?;
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
+        let project = current_project_input()?;
+        upsert_project(&conn, project).await?;
         Ok(())
     }
 
@@ -112,6 +136,22 @@ impl Store {
         }
 
         Ok(memories)
+    }
+
+    pub async fn sync_current_project(&self) -> Result<Project, String> {
+        self.init().await?;
+        self.project()
+            .await?
+            .ok_or_else(|| "project registry is empty after initialization".to_string())
+    }
+
+    pub async fn project(&self) -> Result<Option<Project>, String> {
+        if !self.exists() {
+            return Ok(None);
+        }
+
+        let conn = self.connect().await?;
+        project_from_conn(&conn).await
     }
 
     pub async fn recall(&self, query: &str, limit: usize) -> Result<Vec<Memory>, String> {
@@ -285,6 +325,125 @@ impl Store {
             .map_err(|error| error.to_string())?;
         Ok(conn)
     }
+}
+
+async fn upsert_project(conn: &Connection, project: ProjectInput) -> Result<(), String> {
+    let now = now_ms()?;
+
+    conn.execute(
+        "
+        INSERT INTO projects (
+            id,
+            name,
+            root_path,
+            git_remote,
+            default_branch,
+            created_at_ms,
+            updated_at_ms
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            root_path = excluded.root_path,
+            git_remote = excluded.git_remote,
+            default_branch = excluded.default_branch,
+            updated_at_ms = excluded.updated_at_ms
+        ",
+        params![
+            project.id,
+            project.name,
+            project.root_path,
+            project.git_remote,
+            project.default_branch,
+            now
+        ],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
+async fn project_from_conn(conn: &Connection) -> Result<Option<Project>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT id, name, root_path, git_remote, default_branch, created_at_ms, updated_at_ms
+            FROM projects
+            WHERE id = ?1
+            LIMIT 1
+            ",
+            params![LOCAL_PROJECT_ID],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+
+    Ok(Some(Project {
+        id: row.get::<String>(0).map_err(|error| error.to_string())?,
+        name: row.get::<String>(1).map_err(|error| error.to_string())?,
+        root_path: row.get::<String>(2).map_err(|error| error.to_string())?,
+        git_remote: row
+            .get::<Option<String>>(3)
+            .map_err(|error| error.to_string())?,
+        default_branch: row
+            .get::<Option<String>>(4)
+            .map_err(|error| error.to_string())?,
+        created_at_ms: row.get::<i64>(5).map_err(|error| error.to_string())?,
+        updated_at_ms: row.get::<i64>(6).map_err(|error| error.to_string())?,
+    }))
+}
+
+fn current_project_input() -> Result<ProjectInput, String> {
+    let root = env::current_dir().map_err(|error| error.to_string())?;
+    let root = root.canonicalize().unwrap_or(root);
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("project")
+        .to_string();
+
+    Ok(ProjectInput {
+        id: LOCAL_PROJECT_ID.to_string(),
+        name,
+        root_path: root.display().to_string(),
+        git_remote: git_output(&root, &["config", "--get", "remote.origin.url"]),
+        default_branch: detect_default_branch(&root),
+    })
+}
+
+fn detect_default_branch(root: &Path) -> Option<String> {
+    git_output(
+        root,
+        &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .map(|branch| {
+        branch
+            .strip_prefix("origin/")
+            .unwrap_or(branch.as_str())
+            .to_string()
+    })
+    .or_else(|| git_output(root, &["branch", "--show-current"]))
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Option<String> {
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
 }
 
 struct RankedMemory {
