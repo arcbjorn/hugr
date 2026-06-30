@@ -1,8 +1,11 @@
+mod code;
 mod cli;
 mod commands;
 mod context;
 mod discovery;
 mod embedding;
+mod indexer;
+mod mcp;
 mod migrations;
 mod store;
 
