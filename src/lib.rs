@@ -1,5 +1,5 @@
-mod code;
 mod cli;
+mod code;
 mod commands;
 mod context;
 mod discovery;
