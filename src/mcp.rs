@@ -1,5 +1,6 @@
 use crate::context::ContextPack;
 use crate::discovery;
+use crate::indexer;
 use crate::store::{Memory, Project, Session, SessionEvent, Store};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
@@ -100,7 +101,8 @@ async fn handle_tool_call(params: Value) -> Result<Value, String> {
         "hugr_session_start" => tool_session_start(&arguments).await,
         "hugr_session_event" => tool_session_event(&arguments).await,
         "hugr_session_end" => tool_session_end(&arguments).await,
-        "hugr_forget" | "hugr_index" | "hugr_impact" => {
+        "hugr_index" => tool_index(&arguments).await,
+        "hugr_forget" | "hugr_impact" => {
             Ok(tool_error_result(&format!("{name} is not implemented yet")))
         }
         unknown => Err(format!("unknown tool '{unknown}'")),
@@ -113,12 +115,13 @@ async fn tool_context(arguments: &Value) -> Result<Value, String> {
     let memories = store.recall(&task, 5).await?;
     let sessions = store.recent_session_facts(&task, 5).await?;
     let file_candidates = discovery::discover_candidate_files(Path::new("."), &task, 12)?;
-    store.record_discovered_files(&file_candidates).await?;
+    indexer::index_candidates(&store, Path::new("."), &file_candidates).await?;
+    let symbols = store.recall_symbols(&task, 8).await?;
     let files = file_candidates
         .into_iter()
         .map(|candidate| candidate.path)
         .collect::<Vec<_>>();
-    let pack = ContextPack::with_sessions(&task, files, memories, sessions);
+    let pack = ContextPack::with_sessions_and_symbols(&task, files, memories, sessions, symbols);
     let structured = context_pack_json(&pack);
 
     Ok(tool_result(pack.render_markdown(), structured))
@@ -182,6 +185,21 @@ async fn tool_session_end(arguments: &Value) -> Result<Value, String> {
     ))
 }
 
+async fn tool_index(arguments: &Value) -> Result<Value, String> {
+    let limit = optional_bounded_usize(arguments, "limit", 5000, 50000)?;
+    let summary = indexer::index_project(limit).await?;
+    Ok(tool_result(
+        format!(
+            "indexed {} files and {} symbols",
+            summary.file_count, summary.symbol_count
+        ),
+        json!({
+            "files": summary.file_count,
+            "symbols": summary.symbol_count
+        }),
+    ))
+}
+
 fn tools() -> Vec<Value> {
     vec![
         tool_schema(
@@ -226,7 +244,7 @@ fn tools() -> Vec<Value> {
         ),
         tool_schema(
             "hugr_index",
-            "Placeholder for future explicit indexing.",
+            "Index project files and symbols.",
             &[],
         ),
         tool_schema(
@@ -262,6 +280,17 @@ fn tool_schema(name: &str, description: &str, properties: &[(&str, &str)]) -> Va
         );
     }
 
+    if name == "hugr_index" {
+        props.insert(
+            "limit".to_string(),
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50000
+            }),
+        );
+    }
+
     if name == "hugr_session_end" {
         props.insert(
             "summary".to_string(),
@@ -293,14 +322,23 @@ fn required_string(arguments: &Value, key: &str) -> Result<String, String> {
 }
 
 fn optional_limit(arguments: &Value, default: usize) -> Result<usize, String> {
-    let Some(value) = arguments.get("limit") else {
+    optional_bounded_usize(arguments, "limit", default, 50)
+}
+
+fn optional_bounded_usize(
+    arguments: &Value,
+    key: &str,
+    default: usize,
+    maximum: usize,
+) -> Result<usize, String> {
+    let Some(value) = arguments.get(key) else {
         return Ok(default);
     };
     let Some(limit) = value.as_u64() else {
-        return Err("limit must be an integer".to_string());
+        return Err(format!("{key} must be an integer"));
     };
     usize::try_from(limit)
-        .map(|limit| limit.clamp(1, 50))
+        .map(|limit| limit.clamp(1, maximum))
         .map_err(|error| error.to_string())
 }
 
