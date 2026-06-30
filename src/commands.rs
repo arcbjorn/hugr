@@ -13,6 +13,9 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::Recall { query, format } => recall(&query, format).await,
         Command::Context { task, format } => context(&task, format).await,
         Command::ProjectStatus => project_status().await,
+        Command::SessionStart { task } => session_start(&task).await,
+        Command::SessionEvent { kind, detail } => session_event(&kind, &detail).await,
+        Command::SessionEnd { summary } => session_end(summary.as_deref()).await,
         Command::Improve => placeholder("improve", "memory consolidation is not implemented yet"),
         Command::Forget { query } => forget(query),
         Command::Doctor => doctor().await,
@@ -82,13 +85,14 @@ async fn recall(query: &str, format: OutputFormat) -> Result<(), String> {
 async fn context(task: &str, format: OutputFormat) -> Result<(), String> {
     let store = Store::open_current();
     let memories = store.recall(task, 5).await?;
+    let sessions = store.recent_session_facts(task, 5).await?;
     let file_candidates = discovery::discover_candidate_files(Path::new("."), task, 12)?;
     store.record_discovered_files(&file_candidates).await?;
     let files = file_candidates
         .into_iter()
         .map(|candidate| candidate.path)
         .collect::<Vec<_>>();
-    let pack = ContextPack::new(task, files, memories);
+    let pack = ContextPack::with_sessions(task, files, memories, sessions);
 
     if format == OutputFormat::Json {
         println!("{}", pack.render_json());
@@ -116,6 +120,40 @@ async fn project_status() -> Result<(), String> {
     );
     println!("  created_at_ms: {}", project.created_at_ms);
     println!("  updated_at_ms: {}", project.updated_at_ms);
+    Ok(())
+}
+
+async fn session_start(task: &str) -> Result<(), String> {
+    let session = Store::open_current().start_session(task).await?;
+
+    println!("started session {}", session.id);
+    println!("  task: {}", session.task);
+    println!(
+        "  branch: {}",
+        session.branch.as_deref().unwrap_or("unknown")
+    );
+    Ok(())
+}
+
+async fn session_event(kind: &str, detail: &str) -> Result<(), String> {
+    let event = Store::open_current()
+        .record_session_event(kind, detail)
+        .await?;
+
+    println!("recorded event {}", event.id);
+    println!("  session: {}", event.session_id);
+    println!("  kind: {}", event.kind);
+    println!("  detail: {}", event.detail);
+    Ok(())
+}
+
+async fn session_end(summary: Option<&str>) -> Result<(), String> {
+    let session = Store::open_current().end_session(summary).await?;
+
+    println!("ended session {}", session.id);
+    if let Some(summary) = session.final_summary {
+        println!("  summary: {summary}");
+    }
     Ok(())
 }
 
