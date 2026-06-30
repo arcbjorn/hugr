@@ -28,6 +28,9 @@ pub(crate) async fn index_candidates(
 ) -> Result<Vec<CodeSymbol>, String> {
     store.record_discovered_files(files).await?;
     let symbols = code::index_files(root, files)?;
-    store.record_code_symbols(files, &symbols).await?;
+    let references = code::extract_references(root, files, &symbols)?;
+    store
+        .record_code_index(files, &symbols, &references)
+        .await?;
     Ok(symbols)
 }
