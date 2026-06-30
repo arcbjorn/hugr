@@ -1,3 +1,4 @@
+use crate::code::CodeSymbol;
 use crate::store::{Memory, SessionFact};
 use std::fmt::Write;
 
@@ -5,6 +6,7 @@ use std::fmt::Write;
 pub struct ContextPack {
     pub task: String,
     pub relevant_files: Vec<ContextFile>,
+    pub important_symbols: Vec<ContextSymbol>,
     pub relevant_memories: Vec<ContextMemory>,
     pub recent_sessions: Vec<ContextSessionFact>,
     pub suggested_path: Vec<String>,
@@ -14,6 +16,17 @@ pub struct ContextPack {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextFile {
     pub path: String,
+    pub citation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextSymbol {
+    pub path: String,
+    pub language: Option<String>,
+    pub name: String,
+    pub kind: String,
+    pub line_start: i64,
+    pub signature: String,
     pub citation_id: String,
 }
 
@@ -54,11 +67,36 @@ impl ContextPack {
         memories: Vec<Memory>,
         sessions: Vec<SessionFact>,
     ) -> Self {
+        Self::with_sessions_and_symbols(task, files, memories, sessions, Vec::new())
+    }
+
+    pub(crate) fn with_sessions_and_symbols(
+        task: &str,
+        files: Vec<String>,
+        memories: Vec<Memory>,
+        sessions: Vec<SessionFact>,
+        symbols: Vec<CodeSymbol>,
+    ) -> Self {
         let relevant_files = files
             .into_iter()
             .map(|path| ContextFile {
                 citation_id: format!("file:{path}"),
                 path,
+            })
+            .collect::<Vec<_>>();
+        let important_symbols = symbols
+            .into_iter()
+            .map(|symbol| ContextSymbol {
+                citation_id: format!(
+                    "symbol:{}:{}:{}",
+                    symbol.path, symbol.line_start, symbol.name
+                ),
+                path: symbol.path,
+                language: symbol.language,
+                name: symbol.name,
+                kind: symbol.kind,
+                line_start: symbol.line_start,
+                signature: symbol.signature,
             })
             .collect::<Vec<_>>();
         let relevant_memories = memories
@@ -89,6 +127,11 @@ impl ContextPack {
                 label: file.path.clone(),
             })
             .collect::<Vec<_>>();
+        citations.extend(important_symbols.iter().map(|symbol| Citation {
+            id: symbol.citation_id.clone(),
+            source_type: "symbol".to_string(),
+            label: format!("{} {} at {}:{}", symbol.kind, symbol.name, symbol.path, symbol.line_start),
+        }));
         citations.extend(relevant_memories.iter().map(|memory| Citation {
             id: memory.citation_id.clone(),
             source_type: "memory".to_string(),
@@ -103,6 +146,7 @@ impl ContextPack {
         Self {
             task: task.to_string(),
             relevant_files,
+            important_symbols,
             relevant_memories,
             recent_sessions,
             suggested_path: vec![
@@ -129,6 +173,24 @@ impl ContextPack {
         } else {
             for file in &self.relevant_files {
                 let _ = writeln!(rendered, "- {} [{}]", file.path, file.citation_id);
+            }
+        }
+        rendered.push('\n');
+
+        rendered.push_str("## Important Symbols\n");
+        if self.important_symbols.is_empty() {
+            rendered.push_str("No matching symbols indexed yet.\n");
+        } else {
+            for symbol in &self.important_symbols {
+                let _ = writeln!(
+                    rendered,
+                    "- {} {} at {}:{} [{}]",
+                    symbol.kind,
+                    symbol.name,
+                    symbol.path,
+                    symbol.line_start,
+                    symbol.citation_id
+                );
             }
         }
         rendered.push('\n');
@@ -199,6 +261,25 @@ impl ContextPack {
                 "{{\"path\":{},\"citation_id\":{}}}",
                 json_string(&file.path),
                 json_string(&file.citation_id)
+            );
+        }
+        rendered.push_str("],");
+
+        rendered.push_str("\"important_symbols\":[");
+        for (index, symbol) in self.important_symbols.iter().enumerate() {
+            if index > 0 {
+                rendered.push(',');
+            }
+            let _ = write!(
+                rendered,
+                "{{\"path\":{},\"language\":{},\"name\":{},\"kind\":{},\"line_start\":{},\"signature\":{},\"citation_id\":{}}}",
+                json_string(&symbol.path),
+                json_option_string(symbol.language.as_deref()),
+                json_string(&symbol.name),
+                json_string(&symbol.kind),
+                symbol.line_start,
+                json_string(&symbol.signature),
+                json_string(&symbol.citation_id)
             );
         }
         rendered.push_str("],");
@@ -284,9 +365,14 @@ pub(crate) fn json_string(value: &str) -> String {
     escaped
 }
 
+fn json_option_string(value: Option<&str>) -> String {
+    value.map(json_string).unwrap_or_else(|| "null".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ContextPack, json_string};
+    use crate::code::CodeSymbol;
     use crate::store::Memory;
 
     #[test]
@@ -308,6 +394,32 @@ mod tests {
         assert!(
             markdown.contains("- mem_1 [memory]: plugin hooks run after configuration is loaded")
         );
+    }
+
+    #[test]
+    fn markdown_and_json_include_symbols() {
+        let pack = ContextPack::with_sessions_and_symbols(
+            "add plugin hooks",
+            vec!["src/plugin_hooks.rs".to_string()],
+            Vec::new(),
+            Vec::new(),
+            vec![CodeSymbol {
+                path: "src/plugin_hooks.rs".to_string(),
+                language: Some("rust".to_string()),
+                name: "PluginHooks".to_string(),
+                kind: "struct".to_string(),
+                line_start: 3,
+                line_end: None,
+                signature: "pub struct PluginHooks".to_string(),
+            }],
+        );
+
+        let markdown = pack.render_markdown();
+        let json = pack.render_json();
+
+        assert!(markdown.contains("- struct PluginHooks at src/plugin_hooks.rs:3"));
+        assert!(json.contains("\"important_symbols\""));
+        assert!(json.contains("\"name\":\"PluginHooks\""));
     }
 
     #[test]
