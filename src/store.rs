@@ -598,6 +598,7 @@ mod tests {
         assert!(object_exists(&conn, "table", "memories").await);
         assert!(object_exists(&conn, "table", "schema_migrations").await);
         assert!(object_exists(&conn, "table", "memories_fts").await);
+        assert!(object_exists(&conn, "table", "projects").await);
         assert!(object_exists(&conn, "index", "memory_embeddings_vector_idx").await);
 
         let mut rows = conn
@@ -607,11 +608,30 @@ mod tests {
             )
             .await
             .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
+        let initial = rows.next().await.unwrap().unwrap();
+        let project = rows.next().await.unwrap().unwrap();
 
-        assert_eq!(row.get::<i64>(0).unwrap(), 1);
-        assert_eq!(row.get::<String>(1).unwrap(), "initial_schema");
+        assert_eq!(initial.get::<i64>(0).unwrap(), 1);
+        assert_eq!(initial.get::<String>(1).unwrap(), "initial_schema");
+        assert_eq!(project.get::<i64>(0).unwrap(), 2);
+        assert_eq!(project.get::<String>(1).unwrap(), "project_registry");
         assert!(rows.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn init_records_current_project() {
+        let test = TestStore::new("project");
+        test.store.init().await.unwrap();
+
+        let project = test.store.project().await.unwrap().unwrap();
+        let current_dir = std::env::current_dir().unwrap();
+        let current_dir = current_dir.canonicalize().unwrap_or(current_dir);
+
+        assert_eq!(project.id, "project_local");
+        assert_eq!(project.root_path, current_dir.display().to_string());
+        assert!(!project.name.is_empty());
+        assert!(project.created_at_ms > 0);
+        assert!(project.updated_at_ms >= project.created_at_ms);
     }
 
     #[tokio::test]
