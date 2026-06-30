@@ -1,4 +1,4 @@
-use crate::store::Memory;
+use crate::store::{Memory, SessionFact};
 use std::fmt::Write;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6,6 +6,7 @@ pub struct ContextPack {
     pub task: String,
     pub relevant_files: Vec<ContextFile>,
     pub relevant_memories: Vec<ContextMemory>,
+    pub recent_sessions: Vec<ContextSessionFact>,
     pub suggested_path: Vec<String>,
     pub citations: Vec<Citation>,
 }
@@ -26,6 +27,15 @@ pub struct ContextMemory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextSessionFact {
+    pub session_id: String,
+    pub kind: String,
+    pub detail: String,
+    pub created_at_ms: i64,
+    pub citation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Citation {
     pub id: String,
     pub source_type: String,
@@ -33,7 +43,17 @@ pub struct Citation {
 }
 
 impl ContextPack {
+    #[cfg(test)]
     pub fn new(task: &str, files: Vec<String>, memories: Vec<Memory>) -> Self {
+        Self::with_sessions(task, files, memories, Vec::new())
+    }
+
+    pub fn with_sessions(
+        task: &str,
+        files: Vec<String>,
+        memories: Vec<Memory>,
+        sessions: Vec<SessionFact>,
+    ) -> Self {
         let relevant_files = files
             .into_iter()
             .map(|path| ContextFile {
@@ -51,6 +71,16 @@ impl ContextPack {
                 text: memory.text,
             })
             .collect::<Vec<_>>();
+        let recent_sessions = sessions
+            .into_iter()
+            .map(|fact| ContextSessionFact {
+                citation_id: format!("session:{}", fact.session_id),
+                session_id: fact.session_id,
+                kind: fact.kind,
+                detail: fact.detail,
+                created_at_ms: fact.created_at_ms,
+            })
+            .collect::<Vec<_>>();
         let mut citations = relevant_files
             .iter()
             .map(|file| Citation {
@@ -64,11 +94,17 @@ impl ContextPack {
             source_type: "memory".to_string(),
             label: memory.text.clone(),
         }));
+        citations.extend(recent_sessions.iter().map(|fact| Citation {
+            id: fact.citation_id.clone(),
+            source_type: "session".to_string(),
+            label: fact.detail.clone(),
+        }));
 
         Self {
             task: task.to_string(),
             relevant_files,
             relevant_memories,
+            recent_sessions,
             suggested_path: vec![
                 "Inspect the relevant files and symbols.".to_string(),
                 "Check whether any memories are stale before relying on them.".to_string(),
@@ -106,6 +142,20 @@ impl ContextPack {
                     rendered,
                     "- {} [{}]: {}",
                     memory.id, memory.kind, memory.text
+                );
+            }
+        }
+        rendered.push('\n');
+
+        rendered.push_str("## Recent Sessions\n");
+        if self.recent_sessions.is_empty() {
+            rendered.push_str("No matching session facts yet.\n");
+        } else {
+            for fact in &self.recent_sessions {
+                let _ = writeln!(
+                    rendered,
+                    "- {} [{}]: {}",
+                    fact.session_id, fact.kind, fact.detail
                 );
             }
         }
@@ -166,6 +216,23 @@ impl ContextPack {
                 json_string(&memory.kind),
                 json_string(&memory.text),
                 json_string(&memory.citation_id)
+            );
+        }
+        rendered.push_str("],");
+
+        rendered.push_str("\"recent_sessions\":[");
+        for (index, fact) in self.recent_sessions.iter().enumerate() {
+            if index > 0 {
+                rendered.push(',');
+            }
+            let _ = write!(
+                rendered,
+                "{{\"session_id\":{},\"kind\":{},\"detail\":{},\"created_at_ms\":{},\"citation_id\":{}}}",
+                json_string(&fact.session_id),
+                json_string(&fact.kind),
+                json_string(&fact.detail),
+                fact.created_at_ms,
+                json_string(&fact.citation_id)
             );
         }
         rendered.push_str("],");
