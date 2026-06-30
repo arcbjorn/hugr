@@ -1,5 +1,8 @@
 mod cli;
 mod commands;
+mod context;
+mod embedding;
+mod migrations;
 mod store;
 
 use cli::Command;
