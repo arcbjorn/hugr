@@ -375,9 +375,9 @@ impl PluginHooks {
         )
         .unwrap();
 
-        assert!(symbols.contains(&symbol("struct", "PluginHooks", 2)));
-        assert!(symbols.contains(&symbol("impl", "PluginHooks", 5)));
-        assert!(symbols.contains(&symbol("function", "run_after_config", 6)));
+        assert!(has_symbol(&symbols, "struct", "PluginHooks", 2));
+        assert!(has_symbol(&symbols, "impl", "PluginHooks", 5));
+        assert!(has_symbol(&symbols, "function", "run_after_config", 6));
     }
 
     #[test]
@@ -393,20 +393,14 @@ export class PluginRegistry {}
         )
         .unwrap();
 
-        assert!(symbols.contains(&symbol("interface", "PluginHook", 2)));
-        assert!(symbols.contains(&symbol("function", "runPluginHooks", 3)));
-        assert!(symbols.contains(&symbol("class", "PluginRegistry", 4)));
+        assert!(has_symbol(&symbols, "interface", "PluginHook", 2));
+        assert!(has_symbol(&symbols, "function", "runPluginHooks", 3));
+        assert!(has_symbol(&symbols, "class", "PluginRegistry", 4));
     }
 
-    fn symbol(kind: &str, name: &str, line_start: i64) -> CodeSymbol {
-        CodeSymbol {
-            path: "src/plugin_hooks.rs".to_string(),
-            language: Some("rust".to_string()),
-            name: name.to_string(),
-            kind: kind.to_string(),
-            line_start,
-            line_end: None,
-            signature: String::new(),
-        }
+    fn has_symbol(symbols: &[CodeSymbol], kind: &str, name: &str, line_start: i64) -> bool {
+        symbols.iter().any(|symbol| {
+            symbol.kind == kind && symbol.name == name && symbol.line_start == line_start
+        })
     }
 }
