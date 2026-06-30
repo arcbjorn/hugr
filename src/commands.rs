@@ -12,6 +12,7 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::Remember { text } => remember(&text).await,
         Command::Recall { query, format } => recall(&query, format).await,
         Command::Context { task, format } => context(&task, format).await,
+        Command::ProjectStatus => project_status().await,
         Command::Improve => placeholder("improve", "memory consolidation is not implemented yet"),
         Command::Forget { query } => forget(query),
         Command::Doctor => doctor().await,
@@ -32,6 +33,11 @@ async fn init() -> Result<(), String> {
 async fn status() -> Result<(), String> {
     let store = Store::open_current();
     let memories = store.memories().await?;
+    let project = if store.exists() {
+        store.project().await?
+    } else {
+        None
+    };
 
     println!("Hugr status");
     println!(
@@ -40,6 +46,10 @@ async fn status() -> Result<(), String> {
     );
     println!("  root: {}", store.root().display());
     println!("  memories: {}", memories.len());
+    if let Some(project) = project {
+        println!("  project: {}", project.name);
+        println!("  project_root: {}", project.root_path);
+    }
     Ok(())
 }
 
@@ -81,6 +91,26 @@ async fn context(task: &str, format: OutputFormat) -> Result<(), String> {
         print!("{}", pack.render_markdown());
     }
 
+    Ok(())
+}
+
+async fn project_status() -> Result<(), String> {
+    let project = Store::open_current().sync_current_project().await?;
+
+    println!("Hugr project");
+    println!("  id: {}", project.id);
+    println!("  name: {}", project.name);
+    println!("  root: {}", project.root_path);
+    println!(
+        "  git_remote: {}",
+        project.git_remote.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "  default_branch: {}",
+        project.default_branch.as_deref().unwrap_or("unknown")
+    );
+    println!("  created_at_ms: {}", project.created_at_ms);
+    println!("  updated_at_ms: {}", project.updated_at_ms);
     Ok(())
 }
 
