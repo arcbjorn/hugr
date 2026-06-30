@@ -61,6 +61,7 @@ impl ContextPack {
         Self::with_sessions(task, files, memories, Vec::new())
     }
 
+    #[cfg(test)]
     pub fn with_sessions(
         task: &str,
         files: Vec<String>,
@@ -130,7 +131,10 @@ impl ContextPack {
         citations.extend(important_symbols.iter().map(|symbol| Citation {
             id: symbol.citation_id.clone(),
             source_type: "symbol".to_string(),
-            label: format!("{} {} at {}:{}", symbol.kind, symbol.name, symbol.path, symbol.line_start),
+            label: format!(
+                "{} {} at {}:{}",
+                symbol.kind, symbol.name, symbol.path, symbol.line_start
+            ),
         }));
         citations.extend(relevant_memories.iter().map(|memory| Citation {
             id: memory.citation_id.clone(),
@@ -185,11 +189,7 @@ impl ContextPack {
                 let _ = writeln!(
                     rendered,
                     "- {} {} at {}:{} [{}]",
-                    symbol.kind,
-                    symbol.name,
-                    symbol.path,
-                    symbol.line_start,
-                    symbol.citation_id
+                    symbol.kind, symbol.name, symbol.path, symbol.line_start, symbol.citation_id
                 );
             }
         }
