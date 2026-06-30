@@ -13,6 +13,8 @@ const SESSIONS_VERSION: i64 = 4;
 const SESSIONS_NAME: &str = "sessions";
 const CODE_SYMBOLS_VERSION: i64 = 5;
 const CODE_SYMBOLS_NAME: &str = "code_symbols";
+const CODE_REFERENCES_VERSION: i64 = 6;
+const CODE_REFERENCES_NAME: &str = "code_references";
 
 pub async fn migrate(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
@@ -83,6 +85,18 @@ pub async fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![CODE_SYMBOLS_VERSION, CODE_SYMBOLS_NAME, now_ms()?],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    if !applied.contains(&CODE_REFERENCES_VERSION) {
+        conn.execute_batch(code_references_sql())
+            .await
+            .map_err(|error| error.to_string())?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![CODE_REFERENCES_VERSION, CODE_REFERENCES_NAME, now_ms()?],
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -266,6 +280,40 @@ fn code_symbols_sql() -> &'static str {
 
     CREATE INDEX IF NOT EXISTS code_symbols_project_path_idx
     ON code_symbols(project_id, path, line_start);
+    "
+}
+
+fn code_references_sql() -> &'static str {
+    "
+    CREATE TABLE IF NOT EXISTS code_references (
+        project_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        target_path TEXT NOT NULL,
+        target_name TEXT NOT NULL,
+        target_kind TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        language TEXT,
+        line_start INTEGER NOT NULL,
+        excerpt TEXT NOT NULL,
+        indexed_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (
+            project_id,
+            path,
+            target_path,
+            target_name,
+            line_start,
+            kind
+        )
+    );
+
+    CREATE INDEX IF NOT EXISTS code_references_target_name_idx
+    ON code_references(project_id, target_name, target_path);
+
+    CREATE INDEX IF NOT EXISTS code_references_target_path_idx
+    ON code_references(project_id, target_path);
+
+    CREATE INDEX IF NOT EXISTS code_references_path_idx
+    ON code_references(project_id, path, line_start);
     "
 }
 
