@@ -28,6 +28,9 @@ Implemented:
 - combined FTS and vector recall ranking
 - single-project registry with root/name/git metadata
 - `hugr project status`
+- dedicated file discovery layer with Git and walking adapters
+- `.gitignore`-aware fallback discovery with generated/vendor/build skips
+- `discovered_files` table populated by `hugr context`
 - initial vision, storage, and technical blueprint docs
 
 Not implemented yet:
@@ -36,7 +39,6 @@ Not implemented yet:
 - durable sessions
 - code indexing
 - MCP server
-- file discovery integration
 - git/worktree awareness
 - symbol graph
 - cloud or hybrid sync
@@ -330,7 +332,7 @@ Recommended next commits:
 4. Done: `feat(memory): add embedding provider trait`
 5. Done: `feat(vector): add vector recall`
 6. Done: `feat(project): add project registry`
-7. `feat(index): add file discovery`
+7. Done: `feat(index): add file discovery`
 8. `feat(session): record agent sessions`
 9. `feat(mcp): expose core tools`
 10. `feat(code): index symbols`
@@ -350,6 +352,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add the dedicated file discovery layer.
+Add durable sessions.
 
-That is the right next step because project metadata now gives Hugr a stable root. The temporary recursive scanner in `hugr context` should be replaced with a reusable discovery layer that respects ignore rules and can later persist discovered files.
+That is the right next step because context packs now combine memories with discovered files. Session records can add prior attempts, command/test observations, edited files, and final summaries to future context packs.
