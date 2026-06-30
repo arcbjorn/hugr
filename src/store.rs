@@ -420,7 +420,12 @@ fn current_project_input() -> Result<ProjectInput, String> {
 fn detect_default_branch(root: &Path) -> Option<String> {
     git_output(
         root,
-        &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
     )
     .map(|branch| {
         branch
@@ -609,12 +614,16 @@ mod tests {
             .await
             .unwrap();
         let initial = rows.next().await.unwrap().unwrap();
+        let initial_version = initial.get::<i64>(0).unwrap();
+        let initial_name = initial.get::<String>(1).unwrap();
         let project = rows.next().await.unwrap().unwrap();
+        let project_version = project.get::<i64>(0).unwrap();
+        let project_name = project.get::<String>(1).unwrap();
 
-        assert_eq!(initial.get::<i64>(0).unwrap(), 1);
-        assert_eq!(initial.get::<String>(1).unwrap(), "initial_schema");
-        assert_eq!(project.get::<i64>(0).unwrap(), 2);
-        assert_eq!(project.get::<String>(1).unwrap(), "project_registry");
+        assert_eq!(initial_version, 1);
+        assert_eq!(initial_name, "initial_schema");
+        assert_eq!(project_version, 2);
+        assert_eq!(project_name, "project_registry");
         assert!(rows.next().await.unwrap().is_none());
     }
 
