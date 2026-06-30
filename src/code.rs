@@ -17,6 +17,18 @@ pub(crate) struct CodeSymbol {
     pub signature: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodeReference {
+    pub path: String,
+    pub language: Option<String>,
+    pub target_path: String,
+    pub target_name: String,
+    pub target_kind: String,
+    pub kind: String,
+    pub line_start: i64,
+    pub excerpt: String,
+}
+
 pub(crate) fn index_files(root: &Path, files: &[FileCandidate]) -> Result<Vec<CodeSymbol>, String> {
     let mut symbols = Vec::new();
     let mut seen = HashSet::new();
@@ -52,6 +64,78 @@ pub(crate) fn index_files(root: &Path, files: &[FileCandidate]) -> Result<Vec<Co
     }
 
     Ok(symbols)
+}
+
+pub(crate) fn extract_references(
+    root: &Path,
+    files: &[FileCandidate],
+    symbols: &[CodeSymbol],
+) -> Result<Vec<CodeReference>, String> {
+    let targets = reference_targets(symbols);
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut references = Vec::new();
+    let mut seen = HashSet::new();
+
+    for file in files {
+        if !is_symbol_language(file.language.as_deref()) {
+            continue;
+        }
+
+        let path = root.join(&file.path);
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > MAX_INDEX_BYTES {
+            continue;
+        }
+
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+
+        for (index, line) in contents.lines().enumerate() {
+            let line_number = i64::try_from(index + 1).map_err(|error| error.to_string())?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() || is_comment_line(trimmed) {
+                continue;
+            }
+
+            for target in &targets {
+                if is_declaration_line(&targets, &file.path, line_number, &target.name) {
+                    continue;
+                }
+                if !contains_identifier(trimmed, &target.name) {
+                    continue;
+                }
+
+                let kind = reference_kind(trimmed, target);
+                let key = (
+                    file.path.clone(),
+                    target.path.clone(),
+                    target.name.clone(),
+                    line_number,
+                    kind.clone(),
+                );
+                if seen.insert(key) {
+                    references.push(CodeReference {
+                        path: file.path.clone(),
+                        language: file.language.clone(),
+                        target_path: target.path.clone(),
+                        target_name: target.name.clone(),
+                        target_kind: target.kind.clone(),
+                        kind,
+                        line_start: line_number,
+                        excerpt: clean_signature(trimmed),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(references)
 }
 
 fn extract_symbols(
@@ -349,9 +433,88 @@ fn clean_signature(line: &str) -> String {
     signature
 }
 
+fn reference_targets(symbols: &[CodeSymbol]) -> Vec<CodeSymbol> {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+
+    for symbol in symbols {
+        if symbol.name.chars().count() < 3 {
+            continue;
+        }
+        let key = (
+            symbol.path.clone(),
+            symbol.kind.clone(),
+            symbol.name.clone(),
+            symbol.line_start,
+        );
+        if seen.insert(key) {
+            targets.push(symbol.clone());
+        }
+    }
+
+    targets
+}
+
+fn reference_kind(line: &str, target: &CodeSymbol) -> String {
+    if is_import_line(line) {
+        "import".to_string()
+    } else if target.kind == "function" && contains_call(line, &target.name) {
+        "call".to_string()
+    } else {
+        "reference".to_string()
+    }
+}
+
+fn is_declaration_line(
+    symbols: &[CodeSymbol],
+    path: &str,
+    line_number: i64,
+    target_name: &str,
+) -> bool {
+    symbols.iter().any(|symbol| {
+        symbol.path == path && symbol.name == target_name && symbol.line_start == line_number
+    })
+}
+
+fn is_import_line(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("use ")
+        || line.starts_with("import ")
+        || line.starts_with("from ")
+        || line.starts_with("require(")
+}
+
+fn contains_call(line: &str, name: &str) -> bool {
+    line.match_indices(name).any(|(index, _)| {
+        has_identifier_boundaries(line, index, name)
+            && line[index + name.len()..]
+                .trim_start_matches(char::is_whitespace)
+                .starts_with('(')
+    })
+}
+
+fn contains_identifier(line: &str, name: &str) -> bool {
+    line.match_indices(name)
+        .any(|(index, _)| has_identifier_boundaries(line, index, name))
+}
+
+fn has_identifier_boundaries(line: &str, index: usize, name: &str) -> bool {
+    let before = line[..index].chars().next_back();
+    let after = line[index + name.len()..].chars().next();
+    !before.is_some_and(is_identifier_char) && !after.is_some_and(is_identifier_char)
+}
+
+fn is_identifier_char(char: char) -> bool {
+    char.is_alphanumeric() || char == '_' || char == '$'
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CodeSymbol, extract_symbols};
+    use super::{CodeSymbol, contains_identifier, extract_references, extract_symbols};
+    use crate::discovery::FileCandidate;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn extracts_rust_symbols() {
@@ -396,5 +559,102 @@ export class PluginRegistry {}
         symbols.iter().any(|symbol| {
             symbol.kind == kind && symbol.name == name && symbol.line_start == line_start
         })
+    }
+
+    #[test]
+    fn identifier_matching_respects_boundaries() {
+        assert!(contains_identifier(
+            "run_after_config();",
+            "run_after_config"
+        ));
+        assert!(!contains_identifier(
+            "run_after_configuration();",
+            "run_after_config"
+        ));
+    }
+
+    #[test]
+    fn extracts_references_to_indexed_symbols() {
+        let project = TempProject::new("references");
+        project.write(
+            "src/plugin_hooks.rs",
+            r#"
+pub struct PluginHooks {}
+
+pub fn run_after_config() {}
+"#,
+        );
+        project.write(
+            "src/main.rs",
+            r#"
+use crate::plugin_hooks::PluginHooks;
+
+fn main() {
+    let _hooks = PluginHooks {};
+    run_after_config();
+}
+"#,
+        );
+        let files = vec![candidate("src/main.rs"), candidate("src/plugin_hooks.rs")];
+        let symbols = extract_symbols(
+            "src/plugin_hooks.rs",
+            Some("rust"),
+            &fs::read_to_string(project.root().join("src/plugin_hooks.rs")).unwrap(),
+        )
+        .unwrap();
+
+        let references = extract_references(project.root(), &files, &symbols).unwrap();
+
+        assert!(references.iter().any(|reference| {
+            reference.path == "src/main.rs"
+                && reference.target_name == "PluginHooks"
+                && reference.kind == "import"
+        }));
+        assert!(references.iter().any(|reference| {
+            reference.path == "src/main.rs"
+                && reference.target_name == "run_after_config"
+                && reference.kind == "call"
+        }));
+    }
+
+    fn candidate(path: &str) -> FileCandidate {
+        FileCandidate {
+            path: path.to_string(),
+            score: 0,
+            language: Some("rust".to_string()),
+            size_bytes: None,
+        }
+    }
+
+    struct TempProject {
+        root: PathBuf,
+    }
+
+    impl TempProject {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("hugr_code_{name}_{unique}"));
+            fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn write(&self, path: &str, contents: &str) {
+            let path = self.root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+
+        fn root(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    impl Drop for TempProject {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 }
