@@ -5,6 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const EMBEDDING_DIMENSIONS: i64 = 1536;
 const INITIAL_SCHEMA_VERSION: i64 = 1;
 const INITIAL_SCHEMA_NAME: &str = "initial_schema";
+const PROJECT_REGISTRY_VERSION: i64 = 2;
+const PROJECT_REGISTRY_NAME: &str = "project_registry";
 
 pub async fn migrate(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
@@ -27,6 +29,18 @@ pub async fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![INITIAL_SCHEMA_VERSION, INITIAL_SCHEMA_NAME, now_ms()?],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    if !applied.contains(&PROJECT_REGISTRY_VERSION) {
+        conn.execute_batch(project_registry_sql())
+            .await
+            .map_err(|error| error.to_string())?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![PROJECT_REGISTRY_VERSION, PROJECT_REGISTRY_NAME, now_ms()?],
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -126,6 +140,23 @@ fn initial_schema_sql() -> String {
         INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
         "
     )
+}
+
+fn project_registry_sql() -> &'static str {
+    "
+    CREATE TABLE IF NOT EXISTS projects (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        root_path TEXT NOT NULL,
+        git_remote TEXT,
+        default_branch TEXT,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS projects_root_path_idx
+    ON projects(root_path);
+    "
 }
 
 fn now_ms() -> Result<i64, String> {
