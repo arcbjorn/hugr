@@ -7,6 +7,8 @@ const INITIAL_SCHEMA_VERSION: i64 = 1;
 const INITIAL_SCHEMA_NAME: &str = "initial_schema";
 const PROJECT_REGISTRY_VERSION: i64 = 2;
 const PROJECT_REGISTRY_NAME: &str = "project_registry";
+const FILE_DISCOVERY_VERSION: i64 = 3;
+const FILE_DISCOVERY_NAME: &str = "file_discovery";
 
 pub async fn migrate(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
@@ -41,6 +43,18 @@ pub async fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![PROJECT_REGISTRY_VERSION, PROJECT_REGISTRY_NAME, now_ms()?],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    if !applied.contains(&FILE_DISCOVERY_VERSION) {
+        conn.execute_batch(file_discovery_sql())
+            .await
+            .map_err(|error| error.to_string())?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![FILE_DISCOVERY_VERSION, FILE_DISCOVERY_NAME, now_ms()?],
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -156,6 +170,23 @@ fn project_registry_sql() -> &'static str {
 
     CREATE UNIQUE INDEX IF NOT EXISTS projects_root_path_idx
     ON projects(root_path);
+    "
+}
+
+fn file_discovery_sql() -> &'static str {
+    "
+    CREATE TABLE IF NOT EXISTS discovered_files (
+        project_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        language TEXT,
+        size_bytes INTEGER,
+        discovered_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (project_id, path)
+    );
+
+    CREATE INDEX IF NOT EXISTS discovered_files_project_idx
+    ON discovered_files(project_id, updated_at_ms DESC);
     "
 }
 
