@@ -34,14 +34,17 @@ Implemented:
 - durable session tables and CLI workflow
 - recent session facts in context packs
 - stdio MCP server with core Hugr tools
+- `hugr index` for explicit project indexing
+- best-effort code symbol extraction stored in `code_symbols`
+- important symbol citations in context packs
 - initial vision, storage, and technical blueprint docs
 
 Not implemented yet:
 
 - real embedding provider integration
-- code indexing
 - git/worktree awareness
-- symbol graph
+- tree-sitter-backed parsing
+- symbol graph edges and impact analysis
 - cloud or hybrid sync
 
 ## Runtime Decision
@@ -275,6 +278,13 @@ Tasks:
 - Store imports/calls/references as edges where available.
 - Add `hugr impact <file-or-symbol>`.
 
+Implemented first slice:
+
+- Best-effort dependency-free symbol extraction for common source files.
+- `code_symbols` table with path, kind, name, language, line, and signature.
+- `hugr index` to populate discovered files and symbols.
+- `hugr_context` and `hugr context` include important symbols when available.
+
 Open questions:
 
 - Which languages should be first-class first?
@@ -336,7 +346,8 @@ Recommended next commits:
 7. Done: `feat(index): add file discovery`
 8. Done: `feat(session): record agent sessions`
 9. Done: `feat(mcp): expose core tools`
-10. `feat(code): index symbols`
+10. Done: `feat(code): index symbols`
+11. `feat(impact): trace symbol impact`
 
 Each commit should leave the CLI usable.
 
@@ -353,6 +364,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add code intelligence.
+Add impact analysis.
 
-That is the right next step because agents can now reach Hugr through the CLI and MCP. Code indexing can begin feeding files, symbols, and impact data into future context packs.
+That is the right next step because Hugr can now index symbols. The next useful layer is connecting files and symbols with import/reference/call edges so agents can ask what a change is likely to affect.
