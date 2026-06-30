@@ -9,6 +9,8 @@ const PROJECT_REGISTRY_VERSION: i64 = 2;
 const PROJECT_REGISTRY_NAME: &str = "project_registry";
 const FILE_DISCOVERY_VERSION: i64 = 3;
 const FILE_DISCOVERY_NAME: &str = "file_discovery";
+const SESSIONS_VERSION: i64 = 4;
+const SESSIONS_NAME: &str = "sessions";
 
 pub async fn migrate(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
@@ -55,6 +57,18 @@ pub async fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![FILE_DISCOVERY_VERSION, FILE_DISCOVERY_NAME, now_ms()?],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    if !applied.contains(&SESSIONS_VERSION) {
+        conn.execute_batch(sessions_sql())
+            .await
+            .map_err(|error| error.to_string())?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![SESSIONS_VERSION, SESSIONS_NAME, now_ms()?],
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -187,6 +201,34 @@ fn file_discovery_sql() -> &'static str {
 
     CREATE INDEX IF NOT EXISTS discovered_files_project_idx
     ON discovered_files(project_id, updated_at_ms DESC);
+    "
+}
+
+fn sessions_sql() -> &'static str {
+    "
+    CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task TEXT NOT NULL,
+        branch TEXT,
+        started_at_ms INTEGER NOT NULL,
+        ended_at_ms INTEGER,
+        final_summary TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS sessions_active_idx
+    ON sessions(project_id, ended_at_ms, started_at_ms DESC);
+
+    CREATE TABLE IF NOT EXISTS session_events (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS session_events_session_idx
+    ON session_events(session_id, created_at_ms DESC);
     "
 }
 
