@@ -1,14 +1,12 @@
+use crate::embedding::{DeterministicEmbeddingProvider, EmbeddingProvider};
+use crate::migrations;
 use libsql::{Builder, Connection, params};
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HUGR_DIR: &str = ".hugr";
 const HUGR_DB: &str = "hugr.db";
-const EMBEDDING_DIMENSIONS: i64 = 1536;
-const INITIAL_SCHEMA_VERSION: i64 = 1;
-const INITIAL_SCHEMA_NAME: &str = "initial_schema";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Memory {
@@ -38,7 +36,7 @@ impl Store {
         fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
         fs::create_dir_all(self.root.join("sessions")).map_err(|error| error.to_string())?;
         let conn = self.connect().await?;
-        migrate(&conn).await?;
+        migrations::migrate(&conn).await?;
         Ok(())
     }
 
@@ -64,6 +62,22 @@ impl Store {
                 memory.created_at_ms,
                 memory.kind.clone(),
                 memory.text.clone()
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let embedding = DeterministicEmbeddingProvider::default().embed(&memory.text)?;
+        let embedding_dimensions =
+            i64::try_from(embedding.dimensions()).map_err(|error| error.to_string())?;
+        let embedding_blob = embedding.to_f32_blob();
+        conn.execute(
+            "INSERT INTO memory_embeddings (memory_id, model, dimensions, embedding) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                memory.id.clone(),
+                embedding.model,
+                embedding_dimensions,
+                embedding_blob
             ],
         )
         .await
@@ -230,128 +244,6 @@ struct RankedMemory {
     fts_rank: f64,
 }
 
-async fn migrate(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch(
-        "
-        CREATE TABLE IF NOT EXISTS schema_migrations (
-            version INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            applied_at_ms INTEGER NOT NULL
-        );
-        ",
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-
-    let applied = applied_migrations(conn).await?;
-    if !applied.contains(&INITIAL_SCHEMA_VERSION) {
-        conn.execute_batch(&initial_schema_sql())
-            .await
-            .map_err(|error| error.to_string())?;
-        conn.execute(
-            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
-            params![INITIAL_SCHEMA_VERSION, INITIAL_SCHEMA_NAME, now_ms()?],
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    }
-
-    Ok(())
-}
-
-async fn applied_migrations(conn: &Connection) -> Result<HashSet<i64>, String> {
-    let mut rows = conn
-        .query("SELECT version FROM schema_migrations", ())
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut applied = HashSet::new();
-
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        applied.insert(row.get::<i64>(0).map_err(|error| error.to_string())?);
-    }
-
-    Ok(applied)
-}
-
-fn initial_schema_sql() -> String {
-    format!(
-        "
-        CREATE TABLE IF NOT EXISTS memories (
-            id TEXT PRIMARY KEY,
-            created_at_ms INTEGER NOT NULL,
-            kind TEXT NOT NULL,
-            text TEXT NOT NULL,
-            confidence REAL NOT NULL DEFAULT 1.0,
-            valid_from TEXT,
-            valid_to TEXT,
-            superseded_by TEXT,
-            sensitivity TEXT NOT NULL DEFAULT 'normal',
-            structured_payload TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS memory_embeddings (
-            memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
-            model TEXT NOT NULL,
-            dimensions INTEGER NOT NULL DEFAULT {EMBEDDING_DIMENSIONS},
-            embedding F32_BLOB({EMBEDDING_DIMENSIONS})
-        );
-
-        CREATE INDEX IF NOT EXISTS memory_embeddings_vector_idx
-        ON memory_embeddings (libsql_vector_idx(embedding));
-
-        CREATE TABLE IF NOT EXISTS sources (
-            id TEXT PRIMARY KEY,
-            kind TEXT NOT NULL,
-            locator TEXT NOT NULL,
-            created_at_ms INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS entities (
-            id TEXT PRIMARY KEY,
-            kind TEXT NOT NULL,
-            name TEXT NOT NULL,
-            locator TEXT,
-            created_at_ms INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS edges (
-            id TEXT PRIMARY KEY,
-            from_id TEXT NOT NULL,
-            to_id TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            created_at_ms INTEGER NOT NULL
-        );
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-            id UNINDEXED,
-            kind,
-            text,
-            content='memories',
-            content_rowid='rowid'
-        );
-
-        CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-            INSERT INTO memories_fts(rowid, id, kind, text)
-            VALUES (new.rowid, new.id, new.kind, new.text);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-            INSERT INTO memories_fts(memories_fts, rowid, id, kind, text)
-            VALUES ('delete', old.rowid, old.id, old.kind, old.text);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-            INSERT INTO memories_fts(memories_fts, rowid, id, kind, text)
-            VALUES ('delete', old.rowid, old.id, old.kind, old.text);
-            INSERT INTO memories_fts(rowid, id, kind, text)
-            VALUES (new.rowid, new.id, new.kind, new.text);
-        END;
-
-        INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
-        "
-    )
-}
-
 fn recall_score(memory: &Memory, terms: &[String], query: &str) -> usize {
     let text = memory.text.to_lowercase();
     let query = query.to_lowercase();
@@ -390,6 +282,7 @@ fn now_ms() -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::{Memory, Store, fts_query, query_terms, recall_score};
+    use crate::embedding::{DEFAULT_EMBEDDING_DIMENSIONS, DETERMINISTIC_MODEL};
     use libsql::{Connection, params};
     use std::fs;
     use std::path::PathBuf;
@@ -475,6 +368,40 @@ mod tests {
 
         assert_eq!(matches.first(), Some(&memory));
         assert_eq!(fts_row_count(&test.store, "add plugin hooks").await, 1);
+    }
+
+    #[tokio::test]
+    async fn remember_writes_deterministic_embedding() {
+        let test = TestStore::new("embedding");
+        let memory = test
+            .store
+            .remember("plugin hooks run after configuration is loaded")
+            .await
+            .unwrap();
+        let conn = test.store.connect().await.unwrap();
+        let mut rows = conn
+            .query(
+                "
+                SELECT model, dimensions, length(embedding)
+                FROM memory_embeddings
+                WHERE memory_id = ?1
+                ",
+                params![memory.id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+
+        assert_eq!(row.get::<String>(0).unwrap(), DETERMINISTIC_MODEL);
+        assert_eq!(
+            row.get::<i64>(1).unwrap(),
+            DEFAULT_EMBEDDING_DIMENSIONS as i64
+        );
+        assert_eq!(
+            row.get::<i64>(2).unwrap(),
+            (DEFAULT_EMBEDDING_DIMENSIONS * 4) as i64
+        );
+        assert!(rows.next().await.unwrap().is_none());
     }
 
     async fn object_exists(conn: &Connection, kind: &str, name: &str) -> bool {
