@@ -1,6 +1,7 @@
 mod cli;
 mod commands;
 mod context;
+mod discovery;
 mod embedding;
 mod migrations;
 mod store;
