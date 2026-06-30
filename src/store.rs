@@ -130,17 +130,18 @@ impl Store {
 
         self.init().await?;
         let conn = self.connect().await?;
-        let mut matches = self.fts_recall(&conn, &terms, query, limit).await?;
+        let fts_matches = self.fts_recall(&conn, &terms, query, limit).await?;
+        let vector_matches = self.vector_recall(&conn, query, limit).await?;
 
-        if matches.is_empty() {
+        if fts_matches.is_empty() && vector_matches.is_empty() {
             return self.recall_from_memory_scan(query, &terms, limit).await;
         }
 
+        let mut matches = merge_recall_candidates(fts_matches, vector_matches);
         matches.sort_by(|left, right| {
             right
-                .term_score
-                .cmp(&left.term_score)
-                .then_with(|| left.fts_rank.total_cmp(&right.fts_rank))
+                .ranking_score()
+                .total_cmp(&left.ranking_score())
                 .then_with(|| right.memory.created_at_ms.cmp(&left.memory.created_at_ms))
         });
         matches.truncate(limit);
@@ -184,9 +185,52 @@ impl Store {
                 matches.push(RankedMemory {
                     memory,
                     term_score,
-                    fts_rank: row.get::<f64>(4).map_err(|error| error.to_string())?,
+                    fts_rank: Some(row.get::<f64>(4).map_err(|error| error.to_string())?),
+                    vector_distance: None,
                 });
             }
+        }
+
+        Ok(matches)
+    }
+
+    async fn vector_recall(
+        &self,
+        conn: &Connection,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<RankedMemory>, String> {
+        let embedding = DeterministicEmbeddingProvider::default().embed(query)?;
+        let query_vector = embedding.to_vector_literal();
+        let candidate_limit = i64::try_from(limit.max(50)).map_err(|error| error.to_string())?;
+        let mut rows = conn
+            .query(
+                "
+                SELECT m.id, m.created_at_ms, m.kind, m.text, v.distance
+                FROM vector_top_k('memory_embeddings_vector_idx', ?1, ?2) AS v
+                JOIN memory_embeddings AS e ON e.rowid = v.id
+                JOIN memories AS m ON m.id = e.memory_id
+                ORDER BY v.distance ASC, m.created_at_ms DESC
+                LIMIT ?2
+                ",
+                params![query_vector, candidate_limit],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut matches = Vec::new();
+
+        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+            matches.push(RankedMemory {
+                memory: Memory {
+                    id: row.get::<String>(0).map_err(|error| error.to_string())?,
+                    created_at_ms: row.get::<i64>(1).map_err(|error| error.to_string())?,
+                    kind: row.get::<String>(2).map_err(|error| error.to_string())?,
+                    text: row.get::<String>(3).map_err(|error| error.to_string())?,
+                },
+                term_score: 0,
+                fts_rank: None,
+                vector_distance: Some(row.get::<f64>(4).map_err(|error| error.to_string())?),
+            });
         }
 
         Ok(matches)
