@@ -11,6 +11,8 @@ const FILE_DISCOVERY_VERSION: i64 = 3;
 const FILE_DISCOVERY_NAME: &str = "file_discovery";
 const SESSIONS_VERSION: i64 = 4;
 const SESSIONS_NAME: &str = "sessions";
+const CODE_SYMBOLS_VERSION: i64 = 5;
+const CODE_SYMBOLS_NAME: &str = "code_symbols";
 
 pub async fn migrate(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
@@ -69,6 +71,18 @@ pub async fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![SESSIONS_VERSION, SESSIONS_NAME, now_ms()?],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    if !applied.contains(&CODE_SYMBOLS_VERSION) {
+        conn.execute_batch(code_symbols_sql())
+            .await
+            .map_err(|error| error.to_string())?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![CODE_SYMBOLS_VERSION, CODE_SYMBOLS_NAME, now_ms()?],
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -229,6 +243,29 @@ fn sessions_sql() -> &'static str {
 
     CREATE INDEX IF NOT EXISTS session_events_session_idx
     ON session_events(session_id, created_at_ms DESC);
+    "
+}
+
+fn code_symbols_sql() -> &'static str {
+    "
+    CREATE TABLE IF NOT EXISTS code_symbols (
+        project_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        name TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        language TEXT,
+        line_start INTEGER NOT NULL,
+        line_end INTEGER,
+        signature TEXT NOT NULL,
+        indexed_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (project_id, path, kind, name, line_start)
+    );
+
+    CREATE INDEX IF NOT EXISTS code_symbols_project_name_idx
+    ON code_symbols(project_id, name);
+
+    CREATE INDEX IF NOT EXISTS code_symbols_project_path_idx
+    ON code_symbols(project_id, path, line_start);
     "
 }
 
