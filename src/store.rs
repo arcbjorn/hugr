@@ -186,7 +186,7 @@ impl Store {
                     memory,
                     term_score,
                     fts_rank: Some(row.get::<f64>(4).map_err(|error| error.to_string())?),
-                    vector_distance: None,
+                    vector_rank: None,
                 });
             }
         }
@@ -206,11 +206,15 @@ impl Store {
         let mut rows = conn
             .query(
                 "
-                SELECT m.id, m.created_at_ms, m.kind, m.text, v.distance
-                FROM vector_top_k('memory_embeddings_vector_idx', ?1, ?2) AS v
-                JOIN memory_embeddings AS e ON e.rowid = v.id
+                WITH vector_matches AS (
+                    SELECT id, row_number() OVER () AS vector_rank
+                    FROM vector_top_k('memory_embeddings_vector_idx', ?1, ?2)
+                )
+                SELECT m.id, m.created_at_ms, m.kind, m.text, vector_matches.vector_rank
+                FROM vector_matches
+                JOIN memory_embeddings AS e ON e.rowid = vector_matches.id
                 JOIN memories AS m ON m.id = e.memory_id
-                ORDER BY v.distance ASC, m.created_at_ms DESC
+                ORDER BY vector_matches.vector_rank ASC, m.created_at_ms DESC
                 LIMIT ?2
                 ",
                 params![query_vector, candidate_limit],
@@ -229,7 +233,7 @@ impl Store {
                 },
                 term_score: 0,
                 fts_rank: None,
-                vector_distance: Some(row.get::<f64>(4).map_err(|error| error.to_string())?),
+                vector_rank: Some(row.get::<i64>(4).map_err(|error| error.to_string())?),
             });
         }
 
@@ -287,7 +291,7 @@ struct RankedMemory {
     memory: Memory,
     term_score: usize,
     fts_rank: Option<f64>,
-    vector_distance: Option<f64>,
+    vector_rank: Option<i64>,
 }
 
 impl RankedMemory {
@@ -298,7 +302,7 @@ impl RankedMemory {
             (left @ Some(_), None) => left,
             (None, right) => right,
         };
-        self.vector_distance = match (self.vector_distance, other.vector_distance) {
+        self.vector_rank = match (self.vector_rank, other.vector_rank) {
             (Some(left), Some(right)) => Some(left.min(right)),
             (left @ Some(_), None) => left,
             (None, right) => right,
@@ -311,13 +315,14 @@ impl RankedMemory {
             .fts_rank
             .map(|rank| 1.0 / (1.0 + rank.abs()))
             .unwrap_or(0.0);
-        let vector_score = self
-            .vector_distance
-            .map(|distance| 1.0 / (1.0 + distance.max(0.0)))
-            .unwrap_or(0.0);
+        let vector_score = self.vector_rank.map(vector_rank_score).unwrap_or(0.0);
 
         text_score + fts_score + vector_score
     }
+}
+
+fn vector_rank_score(rank: i64) -> f64 {
+    1.0 / (rank.max(1) as f64)
 }
 
 fn merge_recall_candidates(
@@ -462,6 +467,32 @@ mod tests {
 
         assert_eq!(matches.first(), Some(&memory));
         assert_eq!(fts_row_count(&test.store, "add plugin hooks").await, 1);
+    }
+
+    #[tokio::test]
+    async fn vector_recall_reads_from_vector_index() {
+        let test = TestStore::new("vector_recall");
+        let memory = test
+            .store
+            .remember("plugin hooks run after configuration is loaded")
+            .await
+            .unwrap();
+        let conn = test.store.connect().await.unwrap();
+
+        let matches = test
+            .store
+            .vector_recall(&conn, "plugin hooks", 5)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            matches.first().map(|matched| &matched.memory),
+            Some(&memory)
+        );
+        assert_eq!(
+            matches.first().and_then(|matched| matched.vector_rank),
+            Some(1)
+        );
     }
 
     #[tokio::test]
