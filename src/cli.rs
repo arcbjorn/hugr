@@ -6,6 +6,9 @@ pub enum Command {
     Recall { query: String, format: OutputFormat },
     Context { task: String, format: OutputFormat },
     ProjectStatus,
+    SessionStart { task: String },
+    SessionEvent { kind: String, detail: String },
+    SessionEnd { summary: Option<String> },
     Improve,
     Forget { query: Option<String> },
     Doctor,
@@ -45,6 +48,7 @@ impl Command {
                 })
             }
             "project" => parse_project_command(args),
+            "session" => parse_session_command(args),
             "improve" => Ok(Self::Improve),
             "forget" => Ok(Self::Forget {
                 query: optional_text(args),
@@ -64,6 +68,30 @@ fn parse_project_command(args: &[String]) -> Result<Command, String> {
     }
 }
 
+fn parse_session_command(args: &[String]) -> Result<Command, String> {
+    match args.get(2).map(String::as_str) {
+        Some("start") => Ok(Command::SessionStart {
+            task: required_text_from(args, 3, "session start")?,
+        }),
+        Some("event") => {
+            let kind = args
+                .get(3)
+                .filter(|kind| !kind.trim().is_empty())
+                .cloned()
+                .ok_or_else(|| "hugr session event requires kind".to_string())?;
+            Ok(Command::SessionEvent {
+                kind,
+                detail: required_text_from(args, 4, "session event")?,
+            })
+        }
+        Some("end") => Ok(Command::SessionEnd {
+            summary: optional_text_from(args, 3),
+        }),
+        Some(unknown) => Err(format!("unknown session command '{unknown}'")),
+        None => Err("hugr session requires a subcommand".to_string()),
+    }
+}
+
 struct TextOutput {
     value: String,
     format: OutputFormat,
@@ -71,6 +99,10 @@ struct TextOutput {
 
 fn required_text(args: &[String], command: &str) -> Result<String, String> {
     optional_text(args).ok_or_else(|| format!("hugr {command} requires text"))
+}
+
+fn required_text_from(args: &[String], start: usize, command: &str) -> Result<String, String> {
+    optional_text_from(args, start).ok_or_else(|| format!("hugr {command} requires text"))
 }
 
 fn required_text_output(args: &[String], command: &str) -> Result<TextOutput, String> {
@@ -94,7 +126,16 @@ fn required_text_output(args: &[String], command: &str) -> Result<TextOutput, St
 }
 
 fn optional_text(args: &[String]) -> Option<String> {
-    let text = args.iter().skip(2).cloned().collect::<Vec<_>>().join(" ");
+    optional_text_from(args, 2)
+}
+
+fn optional_text_from(args: &[String], start: usize) -> Option<String> {
+    let text = args
+        .iter()
+        .skip(start)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
     if text.trim().is_empty() {
         None
     } else {
@@ -103,7 +144,7 @@ fn optional_text(args: &[String]) -> Option<String> {
 }
 
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr project status\n  hugr improve\n  hugr forget [query]\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr project status\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr improve\n  hugr forget [query]\n  hugr doctor\n"
 }
 
 #[cfg(test)]
@@ -149,6 +190,42 @@ mod tests {
     fn parses_project_status() {
         let args = vec!["hugr".into(), "project".into(), "status".into()];
         assert_eq!(Command::parse(&args), Ok(Command::ProjectStatus));
+    }
+
+    #[test]
+    fn parses_session_commands() {
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "session".into(),
+                "start".into(),
+                "add".into(),
+                "hooks".into()
+            ]),
+            Ok(Command::SessionStart {
+                task: "add hooks".into()
+            })
+        );
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "session".into(),
+                "event".into(),
+                "test".into(),
+                "cargo".into(),
+                "test".into()
+            ]),
+            Ok(Command::SessionEvent {
+                kind: "test".into(),
+                detail: "cargo test".into()
+            })
+        );
+        assert_eq!(
+            Command::parse(&["hugr".into(), "session".into(), "end".into(), "done".into()]),
+            Ok(Command::SessionEnd {
+                summary: Some("done".into())
+            })
+        );
     }
 
     #[test]
