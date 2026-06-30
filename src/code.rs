@@ -144,6 +144,7 @@ fn extract_symbols(
     contents: &str,
 ) -> Result<Vec<CodeSymbol>, String> {
     let mut symbols = Vec::new();
+    let line_count = i64::try_from(contents.lines().count()).map_err(|error| error.to_string())?;
 
     for (index, line) in contents.lines().enumerate() {
         let line_number = i64::try_from(index + 1).map_err(|error| error.to_string())?;
@@ -170,12 +171,13 @@ fn extract_symbols(
                 name,
                 kind,
                 line_start: line_number,
-                line_end: None,
+                line_end: Some(line_number),
                 signature: clean_signature(trimmed),
             });
         }
     }
 
+    assign_symbol_ranges(&mut symbols, line_count);
     Ok(symbols)
 }
 
@@ -455,6 +457,17 @@ fn reference_targets(symbols: &[CodeSymbol]) -> Vec<CodeSymbol> {
     targets
 }
 
+fn assign_symbol_ranges(symbols: &mut [CodeSymbol], line_count: i64) {
+    for index in 0..symbols.len() {
+        let next_start = symbols.get(index + 1).map(|symbol| symbol.line_start);
+        let line_end = next_start
+            .map(|line| line.saturating_sub(1))
+            .unwrap_or(line_count)
+            .max(symbols[index].line_start);
+        symbols[index].line_end = Some(line_end);
+    }
+}
+
 fn reference_kind(line: &str, target: &CodeSymbol) -> String {
     if is_import_line(line) {
         "import".to_string()
@@ -535,6 +548,13 @@ impl PluginHooks {
         assert!(has_symbol(&symbols, "struct", "PluginHooks", 2));
         assert!(has_symbol(&symbols, "impl", "PluginHooks", 5));
         assert!(has_symbol(&symbols, "function", "run_after_config", 6));
+        assert_eq!(
+            symbols
+                .iter()
+                .find(|symbol| symbol.name == "run_after_config")
+                .and_then(|symbol| symbol.line_end),
+            Some(7)
+        );
     }
 
     #[test]
