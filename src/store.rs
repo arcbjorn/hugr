@@ -151,6 +151,7 @@ impl Store {
         }
 
         let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
         project_from_conn(&conn).await
     }
 
