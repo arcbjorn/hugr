@@ -17,10 +17,7 @@ pub(crate) struct CodeSymbol {
     pub signature: String,
 }
 
-pub(crate) fn index_files(
-    root: &Path,
-    files: &[FileCandidate],
-) -> Result<Vec<CodeSymbol>, String> {
+pub(crate) fn index_files(root: &Path, files: &[FileCandidate]) -> Result<Vec<CodeSymbol>, String> {
     let mut symbols = Vec::new();
     let mut seen = HashSet::new();
 
@@ -136,10 +133,7 @@ fn extract_python_symbol(line: &str) -> Option<(String, String)> {
 }
 
 fn extract_javascript_symbol(line: &str) -> Option<(String, String)> {
-    let line = strip_prefix_words(
-        line,
-        &["export", "default", "async", "declare", "abstract"],
-    );
+    let line = strip_prefix_words(line, &["export", "default", "async", "declare", "abstract"]);
 
     for (keyword, kind) in [
         ("function", "function"),
