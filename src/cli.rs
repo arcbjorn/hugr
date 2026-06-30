@@ -5,6 +5,7 @@ pub enum Command {
     Remember { text: String },
     Recall { query: String, format: OutputFormat },
     Context { task: String, format: OutputFormat },
+    Index,
     ProjectStatus,
     SessionStart { task: String },
     SessionEvent { kind: String, detail: String },
@@ -48,6 +49,7 @@ impl Command {
                     format: text.format,
                 })
             }
+            "index" => Ok(Self::Index),
             "project" => parse_project_command(args),
             "session" => parse_session_command(args),
             "mcp" => Ok(Self::Mcp),
@@ -146,7 +148,7 @@ fn optional_text_from(args: &[String], start: usize) -> Option<String> {
 }
 
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr project status\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr mcp\n  hugr improve\n  hugr forget [query]\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr project status\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr mcp\n  hugr improve\n  hugr forget [query]\n  hugr doctor\n"
 }
 
 #[cfg(test)]
@@ -192,6 +194,12 @@ mod tests {
     fn parses_project_status() {
         let args = vec!["hugr".into(), "project".into(), "status".into()];
         assert_eq!(Command::parse(&args), Ok(Command::ProjectStatus));
+    }
+
+    #[test]
+    fn parses_index_command() {
+        let args = vec!["hugr".into(), "index".into()];
+        assert_eq!(Command::parse(&args), Ok(Command::Index));
     }
 
     #[test]
