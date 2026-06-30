@@ -4,6 +4,7 @@ mod commands;
 mod context;
 mod discovery;
 mod embedding;
+mod impact;
 mod indexer;
 mod mcp;
 mod migrations;
