@@ -36,7 +36,9 @@ Implemented:
 - stdio MCP server with core Hugr tools
 - `hugr index` for explicit project indexing
 - best-effort code symbol extraction stored in `code_symbols`
+- best-effort direct reference/call/import extraction stored in `code_references`
 - important symbol citations in context packs
+- `hugr impact <file-or-symbol>` for direct indexed impact reports
 - initial vision, storage, and technical blueprint docs
 
 Not implemented yet:
@@ -44,7 +46,7 @@ Not implemented yet:
 - real embedding provider integration
 - git/worktree awareness
 - tree-sitter-backed parsing
-- symbol graph edges and impact analysis
+- richer symbol graph edges
 - cloud or hybrid sync
 
 ## Runtime Decision
@@ -284,6 +286,8 @@ Implemented first slice:
 - `code_symbols` table with path, kind, name, language, line, and signature.
 - `hugr index` to populate discovered files and symbols.
 - `hugr_context` and `hugr context` include important symbols when available.
+- `code_references` table for direct references, calls, and imports.
+- `hugr impact` and `hugr_impact` report matched symbols, direct references, and affected files.
 
 Open questions:
 
@@ -347,7 +351,8 @@ Recommended next commits:
 8. Done: `feat(session): record agent sessions`
 9. Done: `feat(mcp): expose core tools`
 10. Done: `feat(code): index symbols`
-11. `feat(impact): trace symbol impact`
+11. Done: `feat(impact): trace symbol impact`
+12. `feat(graph): enrich code relationships`
 
 Each commit should leave the CLI usable.
 
@@ -364,6 +369,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add impact analysis.
+Enrich code relationships.
 
-That is the right next step because Hugr can now index symbols. The next useful layer is connecting files and symbols with import/reference/call edges so agents can ask what a change is likely to affect.
+That is the right next step because Hugr can now report direct indexed impact. The next useful layer is improving relationship quality with better parsers, module import resolution, call neighborhoods, and test mapping.
