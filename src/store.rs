@@ -36,6 +36,33 @@ pub struct Project {
     pub updated_at_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    pub id: String,
+    pub task: String,
+    pub branch: Option<String>,
+    pub started_at_ms: i64,
+    pub ended_at_ms: Option<i64>,
+    pub final_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEvent {
+    pub id: String,
+    pub session_id: String,
+    pub kind: String,
+    pub detail: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionFact {
+    pub session_id: String,
+    pub kind: String,
+    pub detail: String,
+    pub created_at_ms: i64,
+}
+
 struct ProjectInput {
     id: String,
     name: String,
@@ -200,6 +227,161 @@ impl Store {
         }
 
         Ok(())
+    }
+
+    pub async fn start_session(&self, task: &str) -> Result<Session, String> {
+        self.init().await?;
+        let conn = self.connect().await?;
+        let started_at_ms = now_ms()?;
+        let session = Session {
+            id: format!("ses_{started_at_ms}"),
+            task: task.trim().to_string(),
+            branch: current_branch().ok(),
+            started_at_ms,
+            ended_at_ms: None,
+            final_summary: None,
+        };
+
+        conn.execute(
+            "
+            INSERT INTO sessions (id, project_id, task, branch, started_at_ms)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ",
+            params![
+                session.id.clone(),
+                LOCAL_PROJECT_ID,
+                session.task.clone(),
+                session.branch.clone(),
+                session.started_at_ms
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        Ok(session)
+    }
+
+    pub async fn record_session_event(
+        &self,
+        kind: &str,
+        detail: &str,
+    ) -> Result<SessionEvent, String> {
+        self.init().await?;
+        let conn = self.connect().await?;
+        let session_id = active_session_id(&conn).await?;
+        let created_at_ms = now_ms()?;
+        let event = SessionEvent {
+            id: format!("evt_{created_at_ms}"),
+            session_id,
+            kind: kind.trim().to_string(),
+            detail: detail.trim().to_string(),
+            created_at_ms,
+        };
+
+        conn.execute(
+            "
+            INSERT INTO session_events (id, session_id, kind, detail, created_at_ms)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ",
+            params![
+                event.id.clone(),
+                event.session_id.clone(),
+                event.kind.clone(),
+                event.detail.clone(),
+                event.created_at_ms
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        Ok(event)
+    }
+
+    pub async fn end_session(&self, summary: Option<&str>) -> Result<Session, String> {
+        self.init().await?;
+        let conn = self.connect().await?;
+        let session_id = active_session_id(&conn).await?;
+        let ended_at_ms = now_ms()?;
+        let summary = summary
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty())
+            .map(str::to_string);
+
+        conn.execute(
+            "
+            UPDATE sessions
+            SET ended_at_ms = ?1, final_summary = ?2
+            WHERE id = ?3
+            ",
+            params![ended_at_ms, summary.clone(), session_id.clone()],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        session_by_id(&conn, &session_id)
+            .await?
+            .ok_or_else(|| "ended session was not found".to_string())
+    }
+
+    pub async fn recent_session_facts(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionFact>, String> {
+        if limit == 0 || !self.exists() {
+            return Ok(Vec::new());
+        }
+
+        let terms = query_terms(query);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let mut rows = conn
+            .query(
+                "
+                SELECT s.id, 'task', s.task, s.started_at_ms
+                FROM sessions AS s
+                WHERE s.project_id = ?1
+                UNION ALL
+                SELECT s.id, e.kind, e.detail, e.created_at_ms
+                FROM session_events AS e
+                JOIN sessions AS s ON s.id = e.session_id
+                WHERE s.project_id = ?1
+                UNION ALL
+                SELECT s.id, 'summary', s.final_summary, COALESCE(s.ended_at_ms, s.started_at_ms)
+                FROM sessions AS s
+                WHERE s.project_id = ?1 AND s.final_summary IS NOT NULL
+                ORDER BY 4 DESC
+                LIMIT 100
+                ",
+                params![LOCAL_PROJECT_ID],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut facts = Vec::new();
+
+        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+            let fact = SessionFact {
+                session_id: row.get::<String>(0).map_err(|error| error.to_string())?,
+                kind: row.get::<String>(1).map_err(|error| error.to_string())?,
+                detail: row.get::<String>(2).map_err(|error| error.to_string())?,
+                created_at_ms: row.get::<i64>(3).map_err(|error| error.to_string())?,
+            };
+            if session_fact_score(&fact, &terms) > 0 {
+                facts.push(fact);
+            }
+        }
+
+        facts.sort_by(|left, right| {
+            session_fact_score(right, &terms)
+                .cmp(&session_fact_score(left, &terms))
+                .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+        });
+        facts.truncate(limit);
+        Ok(facts)
     }
 
     pub async fn recall(&self, query: &str, limit: usize) -> Result<Vec<Memory>, String> {
@@ -497,6 +679,73 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
 
     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if value.is_empty() { None } else { Some(value) }
+}
+
+fn current_branch() -> Result<Option<String>, String> {
+    let root = env::current_dir().map_err(|error| error.to_string())?;
+    Ok(git_output(&root, &["branch", "--show-current"]))
+}
+
+async fn active_session_id(conn: &Connection) -> Result<String, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT id
+            FROM sessions
+            WHERE project_id = ?1 AND ended_at_ms IS NULL
+            ORDER BY started_at_ms DESC
+            LIMIT 1
+            ",
+            params![LOCAL_PROJECT_ID],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+        return Err("no active session; run `hugr session start <task>` first".to_string());
+    };
+
+    row.get::<String>(0).map_err(|error| error.to_string())
+}
+
+async fn session_by_id(conn: &Connection, session_id: &str) -> Result<Option<Session>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT id, task, branch, started_at_ms, ended_at_ms, final_summary
+            FROM sessions
+            WHERE id = ?1
+            LIMIT 1
+            ",
+            params![session_id],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+
+    Ok(Some(Session {
+        id: row.get::<String>(0).map_err(|error| error.to_string())?,
+        task: row.get::<String>(1).map_err(|error| error.to_string())?,
+        branch: row
+            .get::<Option<String>>(2)
+            .map_err(|error| error.to_string())?,
+        started_at_ms: row.get::<i64>(3).map_err(|error| error.to_string())?,
+        ended_at_ms: row.get::<Option<i64>>(4).map_err(|error| error.to_string())?,
+        final_summary: row
+            .get::<Option<String>>(5)
+            .map_err(|error| error.to_string())?,
+    }))
+}
+
+fn session_fact_score(fact: &SessionFact, terms: &[String]) -> usize {
+    let text = format!("{} {}", fact.kind, fact.detail).to_lowercase();
+    terms
+        .iter()
+        .filter(|term| text.contains(term.as_str()))
+        .count()
 }
 
 struct RankedMemory {
