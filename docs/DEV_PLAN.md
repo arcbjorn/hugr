@@ -46,13 +46,16 @@ Implemented:
 - safe default and explicit opt-in cloud/hybrid sync class policy
 - `hugr sync status` execution-plan output for cloud/hybrid sync decisions
 - guarded `hugr sync push` dry-run and explicit execution path for safe sync classes
+- guarded `hugr sync pull` dry-run and explicit execution path for safe sync classes
+- `hugr sync history` with per-table sync counters and conflict summaries
 - initial vision, storage, and technical blueprint docs
 
 Not implemented yet:
 
 - tree-sitter-backed parsing for additional languages beyond Rust, Python, TypeScript, and Go
 - richer symbol graph edges
-- cloud or hybrid pull, reconciliation, and conflict handling
+- remote-only storage execution and the Hugr API sync backend
+- concrete memory maintenance flows behind `hugr improve` and `hugr forget`
 
 ## Runtime Decision
 
@@ -125,16 +128,17 @@ The product should avoid becoming a generic note database or a dashboard-first a
 
 ## Next Session Goal
 
-Build the first real memory retrieval layer.
+Build the first concrete memory maintenance flow.
 
 Target outcome:
 
 ```bash
 hugr remember "plugin hooks run after configuration is loaded"
-hugr context "add plugin hooks"
+hugr forget "plugin hooks"
+hugr recall "plugin hooks"
 ```
 
-The context pack should rank that memory through a real retrieval path, not only an in-memory substring scan.
+The CLI should let users inspect and retire stale or unwanted memories without editing the database directly.
 
 ## Phase 1: Make Storage Real
 
@@ -363,11 +367,14 @@ Implemented first slice:
 - `hugr sync pull [--dry-run|--execute] [--json]` counts configured sync-class tables locally by default and only reads from direct libSQL/Turso when `--execute` and hybrid remote config are explicit.
 - Sync push currently covers project metadata, memories, embeddings, source references, entity/code-symbol indexes, graph/code-reference edges, and finalized session summaries. It does not sync raw session events, shell output, secrets, private notes, or full source without future explicit data sources.
 - Sync pull reconciles the same safe table set with conservative merge rules: local memories are not clobbered, project and code-index rows update only when the remote record is newer, dependent embeddings are skipped until their memory exists, and finalized sessions only replace open or older local summaries.
+- Sync push and pull report per-table inserted, updated, skipped, and conflict counts.
+- Executed sync runs are recorded in `sync_runs`, `sync_table_runs`, and `sync_table_conflicts`.
+- `hugr sync history [--json]` renders the last recorded sync runs with table counters and grouped conflict reasons.
 
 Open questions:
 
 - Should cloud mode stay on direct remote libSQL first, or move behind a Hugr API service before broader use?
-- How much sync conflict history should be stored locally versus rendered only at command time?
+- How long should sync history be retained before pruning?
 
 ## Near-Term Implementation Order
 
@@ -397,6 +404,7 @@ Recommended next commits:
 22. Done: `feat(sync): expose sync execution plan`
 23. Done: `feat(sync): push safe sync classes`
 24. Done: `feat(sync): pull safe sync classes`
+25. Done: `feat(sync): report conflicts and history`
 
 Each commit should leave the CLI usable.
 
@@ -413,6 +421,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add sync conflict reporting and history.
+Implement memory maintenance workflows.
 
-That is the right next step because Hugr now has guarded push and pull paths for safe sync classes. The next useful layer is making skipped rows, stale remote records, and conservative merge decisions visible enough that hybrid workspaces can explain why a row did or did not converge.
+That is the right next step because `hugr improve` and `hugr forget` are still placeholders while the store already has recall, sessions, and syncable memory records. Users need a supported way to inspect, retire, and eventually consolidate stale facts without editing `.hugr/hugr.db` directly.
