@@ -5,6 +5,7 @@ use crate::indexer;
 use crate::store::{Memory, Project, Session, SessionEvent, Store};
 use crate::worktree;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
@@ -114,6 +115,20 @@ async fn tool_context(arguments: &Value) -> Result<Value, String> {
     let task = required_string(arguments, "task")?;
     let store = Store::open_current();
     let memories = store.recall(&task, 5).await?;
+    let relevant_memory_ids = memories
+        .iter()
+        .map(|memory| memory.id.clone())
+        .collect::<HashSet<_>>();
+    let stale_candidates = store
+        .memory_maintenance_report()
+        .await?
+        .stale_candidates
+        .into_iter()
+        .filter(|candidate| {
+            relevant_memory_ids.contains(&candidate.newer_memory.id)
+                || relevant_memory_ids.contains(&candidate.older_memory.id)
+        })
+        .collect::<Vec<_>>();
     let sessions = store.recent_session_facts(&task, 5).await?;
     let file_candidates = discovery::discover_candidate_files(Path::new("."), &task, 12)?;
     indexer::index_candidates(&store, Path::new("."), &file_candidates).await?;
@@ -124,7 +139,7 @@ async fn tool_context(arguments: &Value) -> Result<Value, String> {
         .collect::<Vec<_>>();
     let affected_tests = store.likely_tests_for_files(&files, 5).await?;
     let branch_state = worktree::inspect(Path::new("."));
-    let pack = ContextPack::with_sessions_symbols_tests_and_branch(
+    let pack = ContextPack::with_sessions_symbols_tests_branch_and_stale_risks(
         &task,
         files,
         memories,
@@ -132,6 +147,7 @@ async fn tool_context(arguments: &Value) -> Result<Value, String> {
         symbols,
         affected_tests,
         Some(branch_state),
+        stale_candidates,
     );
     let structured = context_pack_json(&pack);
 
