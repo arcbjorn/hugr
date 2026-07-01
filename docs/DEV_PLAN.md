@@ -52,6 +52,8 @@ Implemented:
 - `hugr improve [--json]` reports active/retired memory counts and exact duplicate active-memory groups
 - `hugr improve --execute --duplicates [--json]` retires older duplicate memories and points them at the kept fact
 - `hugr improve [--json]` reports deterministic stale candidates for active memories with opposing terms
+- `hugr improve --execute --stale [--json]` retires older stale candidates and points them at newer evidence
+- `hugr context` and `hugr_context` surface relevant unresolved stale-memory risks with citations
 - initial vision, storage, and technical blueprint docs
 
 Not implemented yet:
@@ -59,7 +61,7 @@ Not implemented yet:
 - tree-sitter-backed parsing for additional languages beyond Rust, Python, TypeScript, and Go
 - richer symbol graph edges
 - remote-only storage execution and the Hugr API sync backend
-- executable stale-candidate retirement behind `hugr improve`
+- context-pack token budgeting
 
 ## Runtime Decision
 
@@ -333,6 +335,11 @@ Tasks:
 - Add citations for every section.
 - Add Markdown and JSON renderers.
 
+Implemented first slices:
+
+- `hugr context` and `hugr_context` include unresolved stale-memory risks relevant to recalled task memories.
+- Stale-memory risks render in Markdown and JSON with newer/older memory evidence, shared terms, deterministic signal, and `stale_memory` citations.
+
 Open questions:
 
 - Should the context compiler be deterministic first, or should LLM compression be introduced early?
@@ -391,6 +398,7 @@ Tasks:
 - Surface active and retired memory counts.
 - Detect exact duplicate active-memory groups.
 - Detect likely stale or contradictory memory pairs with deterministic signals.
+- Add `hugr improve --execute --stale` for explicit stale-candidate retirement.
 - Wire `hugr_forget` through MCP.
 
 Implemented first slice:
@@ -400,6 +408,7 @@ Implemented first slice:
 - `hugr improve [--json]` renders active count, retired count, and exact duplicate active-memory groups.
 - `hugr improve --execute --duplicates [--json]` keeps the newest duplicate in each exact group, retires older duplicates, and writes `superseded_by`.
 - `hugr improve [--json]` reports stale candidates when active memories share meaningful terms but contain opposing deterministic signal terms such as `after` versus `before`.
+- `hugr improve --execute --stale [--json]` retires older stale candidates and writes `superseded_by` to the newer evidence memory.
 - `hugr_forget` now uses the same soft-retire behavior through MCP.
 - Hybrid pull can propagate remote memory retirement metadata without overwriting local memory text.
 
@@ -407,7 +416,7 @@ Open questions:
 
 - Should `hugr improve --execute` support multiple maintenance actions at once, or require one explicit action flag per run?
 - Should retired memories remain syncable forever, or be pruned after a retention window?
-- Which stale-candidate signals should be executable without a human confirmation step?
+- Which additional stale-candidate signals should be executable without a human confirmation step?
 
 ## Near-Term Implementation Order
 
@@ -441,6 +450,8 @@ Recommended next commits:
 26. Done: `feat(memory): soft forget memories`
 27. Done: `feat(memory): consolidate duplicates`
 28. Done: `feat(memory): detect stale candidates`
+29. Done: `feat(memory): retire stale candidates`
+30. Done: `feat(context): surface stale memory risks`
 
 Each commit should leave the CLI usable.
 
@@ -457,6 +468,8 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add explicit stale-candidate retirement.
+Add token budgeting to context packs.
 
-That is the right next step because Hugr can now surface likely stale or contradictory memory pairs with deterministic evidence. The next useful layer is an explicit execution path that retires the older candidate only when the signal is strong enough and the user opts in.
+That is the right next step because context packs now include files, symbols, tests, memories, session facts, branch state, and stale-memory risks. The next useful layer is a deterministic budget so large projects stay bounded and agents get the highest-signal evidence first.
+
+That is the right next step because Hugr can now detect and retire stale memory candidates through `hugr improve`. The next useful layer is making unresolved stale candidates visible in `hugr context` so agents see the risk before acting on contradictory memories.
