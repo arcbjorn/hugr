@@ -55,6 +55,7 @@ async fn status() -> Result<(), String> {
         if store.exists() { "ready" } else { "missing" }
     );
     println!("  root: {}", store.root().display());
+    println!("  storage: {}", store.storage_summary());
     println!("  memories: {}", memories.len());
     if let Some(project) = project {
         println!("  project: {}", project.name);
@@ -148,12 +149,14 @@ async fn impact(target: &str, format: OutputFormat) -> Result<(), String> {
 }
 
 async fn project_status() -> Result<(), String> {
-    let project = Store::open_current().sync_current_project().await?;
+    let store = Store::open_current();
+    let project = store.sync_current_project().await?;
 
     println!("Hugr project");
     println!("  id: {}", project.id);
     println!("  name: {}", project.name);
     println!("  root: {}", project.root_path);
+    println!("  storage: {}", store.storage_summary());
     println!(
         "  git_remote: {}",
         project.git_remote.as_deref().unwrap_or("unknown")
@@ -225,6 +228,7 @@ async fn doctor() -> Result<(), String> {
     );
     println!("  store_exists: {}", store.exists());
     println!("  store_root: {}", store.root().display());
+    println!("  storage: {}", store.storage_summary());
     println!("  memories_readable: {}", store.memories().await.is_ok());
     println!(
         "  embedding_provider: {}",
