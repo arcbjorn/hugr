@@ -4,7 +4,7 @@ use crate::discovery;
 use crate::impact as impact_analysis;
 use crate::indexer;
 use crate::mcp;
-use crate::store::{Memory, Store, SyncExecutionPlan, SyncPushResult};
+use crate::store::{Memory, Store, SyncExecutionPlan, SyncPullResult, SyncPushResult};
 use crate::worktree;
 use std::fmt::Write;
 use std::path::Path;
@@ -24,6 +24,7 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::SessionEnd { summary } => session_end(summary.as_deref()).await,
         Command::SyncStatus { format } => sync_status(format).await,
         Command::SyncPush { dry_run, format } => sync_push(dry_run, format).await,
+        Command::SyncPull { dry_run, format } => sync_pull(dry_run, format).await,
         Command::Mcp => mcp::serve_stdio().await,
         Command::Improve => placeholder("improve", "memory consolidation is not implemented yet"),
         Command::Forget { query } => forget(query),
@@ -230,6 +231,18 @@ async fn sync_push(dry_run: bool, format: OutputFormat) -> Result<(), String> {
     Ok(())
 }
 
+async fn sync_pull(dry_run: bool, format: OutputFormat) -> Result<(), String> {
+    let result = Store::open_current().sync_pull(dry_run).await?;
+
+    if format == OutputFormat::Json {
+        println!("{}", render_sync_pull_json(&result));
+    } else {
+        print!("{}", render_sync_pull_text(&result));
+    }
+
+    Ok(())
+}
+
 fn forget(query: Option<String>) -> Result<(), String> {
     match query {
         Some(query) => placeholder(
@@ -394,13 +407,63 @@ fn render_sync_push_json(result: &SyncPushResult) -> String {
     rendered
 }
 
+fn render_sync_pull_text(result: &SyncPullResult) -> String {
+    let mut rendered = format!(
+        "Hugr sync pull\n  mode: {}\n  backend: {}\n  status: {}\n",
+        if result.dry_run { "dry-run" } else { "execute" },
+        result.backend,
+        result.status
+    );
+
+    for table in &result.tables {
+        let _ = writeln!(
+            rendered,
+            "- {}.{}: {} rows ({})",
+            table.class,
+            table.table,
+            table.row_count,
+            if table.executed { "pulled" } else { "planned" }
+        );
+    }
+
+    rendered
+}
+
+fn render_sync_pull_json(result: &SyncPullResult) -> String {
+    let mut rendered = format!(
+        "{{\"dry_run\":{},\"backend\":{},\"status\":{},\"tables\":[",
+        result.dry_run,
+        json_string(&result.backend),
+        json_string(&result.status)
+    );
+
+    for (index, table) in result.tables.iter().enumerate() {
+        if index > 0 {
+            rendered.push(',');
+        }
+        let _ = write!(
+            rendered,
+            "{{\"class\":{},\"table\":{},\"row_count\":{},\"executed\":{}}}",
+            json_string(&table.class),
+            json_string(&table.table),
+            table.row_count,
+            table.executed
+        );
+    }
+
+    rendered.push_str("]}");
+    rendered
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        render_recall_json, render_sync_push_json, render_sync_push_text, render_sync_status_json,
-        render_sync_status_text,
+        render_recall_json, render_sync_pull_json, render_sync_pull_text, render_sync_push_json,
+        render_sync_push_text, render_sync_status_json, render_sync_status_text,
     };
-    use crate::store::{Memory, SyncExecutionPlan, SyncPushResult, SyncTableResult};
+    use crate::store::{
+        Memory, SyncExecutionPlan, SyncPullResult, SyncPushResult, SyncTableResult,
+    };
 
     #[test]
     fn recall_json_includes_query_and_memories() {
@@ -462,6 +525,29 @@ mod tests {
         assert!(text.contains("memories.memories: 2 rows"));
 
         let json = render_sync_push_json(&result);
+        assert!(json.contains("\"dry_run\":true"));
+        assert!(json.contains("\"row_count\":2"));
+    }
+
+    #[test]
+    fn sync_pull_renderers_include_table_counts() {
+        let result = SyncPullResult {
+            dry_run: true,
+            backend: "direct_libsql".to_string(),
+            status: "dry_run".to_string(),
+            tables: vec![SyncTableResult {
+                class: "memories".to_string(),
+                table: "memories".to_string(),
+                row_count: 2,
+                executed: false,
+            }],
+        };
+
+        let text = render_sync_pull_text(&result);
+        assert!(text.contains("mode: dry-run"));
+        assert!(text.contains("memories.memories: 2 rows"));
+
+        let json = render_sync_pull_json(&result);
         assert!(json.contains("\"dry_run\":true"));
         assert!(json.contains("\"row_count\":2"));
     }
