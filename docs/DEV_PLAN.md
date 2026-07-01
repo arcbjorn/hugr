@@ -358,14 +358,16 @@ Implemented first slice:
 - Remote mode fails closed instead of silently writing to the local database; hybrid mode keeps local storage active while remote sync remains disabled.
 - `HUGR_SYNC_CLASSES` represents safe default sync classes and explicit opt-ins for full source, raw command output, secrets, and private notes.
 - `HUGR_SYNC_BACKEND=direct_libsql|hugr_api` records the execution strategy decision, defaulting to direct libSQL/Turso.
-- `hugr sync status [--json]` renders the current sync execution plan, with remote reads and writes disabled until execution is implemented.
+- `hugr sync status [--json]` renders the current sync execution plan, with guarded remote reads and writes available for explicitly configured hybrid direct libSQL/Turso storage.
 - `hugr sync push [--dry-run|--execute] [--json]` counts configured sync-class tables locally by default and only writes to direct libSQL/Turso when `--execute` and hybrid remote config are explicit.
+- `hugr sync pull [--dry-run|--execute] [--json]` counts configured sync-class tables locally by default and only reads from direct libSQL/Turso when `--execute` and hybrid remote config are explicit.
 - Sync push currently covers project metadata, memories, embeddings, source references, entity/code-symbol indexes, graph/code-reference edges, and finalized session summaries. It does not sync raw session events, shell output, secrets, private notes, or full source without future explicit data sources.
+- Sync pull reconciles the same safe table set with conservative merge rules: local memories are not clobbered, project and code-index rows update only when the remote record is newer, dependent embeddings are skipped until their memory exists, and finalized sessions only replace open or older local summaries.
 
 Open questions:
 
-- Should cloud mode be direct remote libSQL first, or a Hugr API service first?
-- How should hybrid mode handle source-local code indexes and remote memory?
+- Should cloud mode stay on direct remote libSQL first, or move behind a Hugr API service before broader use?
+- How much sync conflict history should be stored locally versus rendered only at command time?
 
 ## Near-Term Implementation Order
 
@@ -394,6 +396,7 @@ Recommended next commits:
 21. Done: `feat(sync): define sync class policy`
 22. Done: `feat(sync): expose sync execution plan`
 23. Done: `feat(sync): push safe sync classes`
+24. Done: `feat(sync): pull safe sync classes`
 
 Each commit should leave the CLI usable.
 
@@ -410,6 +413,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Implement hybrid sync pull and reconciliation.
+Add sync conflict reporting and history.
 
-That is the right next step because Hugr now has a guarded push path for safe sync classes without syncing source contents by default. The next useful layer is pull/reconciliation semantics so hybrid workspaces can converge without clobbering local memories or indexes.
+That is the right next step because Hugr now has guarded push and pull paths for safe sync classes. The next useful layer is making skipped rows, stale remote records, and conservative merge decisions visible enough that hybrid workspaces can explain why a row did or did not converge.
