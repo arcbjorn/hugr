@@ -47,6 +47,7 @@ pub enum Command {
     Improve {
         execute: bool,
         duplicates: bool,
+        stale: bool,
         format: OutputFormat,
     },
     Forget {
@@ -106,6 +107,7 @@ impl Command {
                 Ok(Self::Improve {
                     execute: options.execute,
                     duplicates: options.duplicates,
+                    stale: options.stale,
                     format: options.format,
                 })
             }
@@ -190,6 +192,7 @@ struct SyncPushOptions {
 struct ImproveOptions {
     execute: bool,
     duplicates: bool,
+    stale: bool,
     format: OutputFormat,
 }
 
@@ -275,12 +278,14 @@ fn sync_push_options_from(args: &[String], start: usize) -> Result<SyncPushOptio
 fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions, String> {
     let mut execute = false;
     let mut duplicates = false;
+    let mut stale = false;
     let mut format = OutputFormat::Markdown;
 
     for arg in args.iter().skip(start) {
         match arg.as_str() {
             "--execute" => execute = true,
             "--duplicates" => duplicates = true,
+            "--stale" => stale = true,
             "--json" => format = OutputFormat::Json,
             unknown => return Err(format!("unknown option '{unknown}'")),
         }
@@ -289,12 +294,13 @@ fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions,
     Ok(ImproveOptions {
         execute,
         duplicates,
+        stale,
         format,
     })
 }
 
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr impact [--json] <file-or-symbol>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr mcp\n  hugr improve [--execute] [--duplicates] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr impact [--json] <file-or-symbol>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr mcp\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
 }
 
 #[cfg(test)]
@@ -504,6 +510,7 @@ mod tests {
             Ok(Command::Improve {
                 execute: false,
                 duplicates: false,
+                stale: false,
                 format: OutputFormat::Json
             })
         );
@@ -518,6 +525,22 @@ mod tests {
             Ok(Command::Improve {
                 execute: true,
                 duplicates: true,
+                stale: false,
+                format: OutputFormat::Json
+            })
+        );
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "improve".into(),
+                "--execute".into(),
+                "--stale".into(),
+                "--json".into()
+            ]),
+            Ok(Command::Improve {
+                execute: true,
+                duplicates: false,
+                stale: true,
                 format: OutputFormat::Json
             })
         );
