@@ -150,12 +150,30 @@ pub struct MemoryMaintenanceReport {
     pub active_count: usize,
     pub retired_count: usize,
     pub duplicate_groups: Vec<DuplicateMemoryGroup>,
+    pub stale_candidates: Vec<StaleMemoryCandidate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuplicateMemoryGroup {
     pub normalized_text: String,
     pub memories: Vec<Memory>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleMemoryCandidate {
+    pub reason: String,
+    pub signal: String,
+    pub shared_terms: Vec<String>,
+    pub newer_memory: Memory,
+    pub older_memory: Memory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryConsolidationResult {
+    pub executed_at: String,
+    pub duplicate_groups: Vec<DuplicateMemoryGroup>,
+    pub kept_memories: Vec<Memory>,
+    pub retired_memories: Vec<Memory>,
 }
 
 pub struct Store {
@@ -357,6 +375,7 @@ impl Store {
                 active_count: 0,
                 retired_count: 0,
                 duplicate_groups: Vec::new(),
+                stale_candidates: Vec::new(),
             });
         }
 
@@ -397,6 +416,47 @@ impl Store {
             active_count: active.len(),
             retired_count,
             duplicate_groups,
+            stale_candidates: stale_memory_candidates(&active),
+        })
+    }
+
+    pub async fn consolidate_duplicate_memories(
+        &self,
+    ) -> Result<MemoryConsolidationResult, String> {
+        self.init().await?;
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let report = self.memory_maintenance_report().await?;
+        let executed_at = now_ms()?.to_string();
+        let mut kept_memories = Vec::new();
+        let mut retired_memories = Vec::new();
+
+        for group in &report.duplicate_groups {
+            let Some((kept, retired)) = group.memories.split_first() else {
+                continue;
+            };
+            kept_memories.push(kept.clone());
+            for memory in retired {
+                conn.execute(
+                    "
+                    UPDATE memories
+                    SET valid_to = ?1,
+                        superseded_by = ?2
+                    WHERE id = ?3 AND valid_to IS NULL
+                    ",
+                    params![executed_at.clone(), kept.id.clone(), memory.id.clone()],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                retired_memories.push(memory.clone());
+            }
+        }
+
+        Ok(MemoryConsolidationResult {
+            executed_at,
+            duplicate_groups: report.duplicate_groups,
+            kept_memories,
+            retired_memories,
         })
     }
 
@@ -4123,6 +4183,126 @@ mod tests {
         assert_eq!(
             matches.first().and_then(|matched| matched.vector_rank),
             Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_retires_memories_without_deleting_rows() {
+        let test = TestStore::new("forget");
+        test.store.init().await.unwrap();
+        let conn = test.store.connect().await.unwrap();
+        insert_memory_for_sync(
+            &conn,
+            "mem_forget",
+            "plugin hooks run after configuration is loaded",
+            10,
+        )
+        .await
+        .unwrap();
+        insert_memory_for_sync(&conn, "mem_keep", "database migrations are recorded", 20)
+            .await
+            .unwrap();
+        let forgotten = Memory {
+            id: "mem_forget".to_string(),
+            created_at_ms: 10,
+            kind: "fact".to_string(),
+            text: "plugin hooks run after configuration is loaded".to_string(),
+        };
+        let kept = Memory {
+            id: "mem_keep".to_string(),
+            created_at_ms: 20,
+            kind: "fact".to_string(),
+            text: "database migrations are recorded".to_string(),
+        };
+
+        let result = test.store.forget("plugin hooks", 25).await.unwrap();
+        let active = test.store.memories().await.unwrap();
+        let recalled = test.store.recall("plugin hooks", 5).await.unwrap();
+        let report = test.store.memory_maintenance_report().await.unwrap();
+
+        assert_eq!(result.forgotten_count, 1);
+        assert_eq!(result.memories, vec![forgotten.clone()]);
+        assert_eq!(active, vec![kept]);
+        assert!(recalled.is_empty());
+        assert_eq!(report.active_count, 1);
+        assert_eq!(report.retired_count, 1);
+        assert_eq!(table_row_count(&conn, "memories").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn memory_maintenance_report_groups_duplicate_active_memories() {
+        let test = TestStore::new("improve");
+        test.store.init().await.unwrap();
+        let conn = test.store.connect().await.unwrap();
+        insert_memory_for_sync(&conn, "mem_1", "Plugin hooks are loaded", 10)
+            .await
+            .unwrap();
+        insert_memory_for_sync(&conn, "mem_2", "plugin hooks are loaded", 20)
+            .await
+            .unwrap();
+        insert_memory_for_sync(&conn, "mem_3", "database migrations are recorded", 30)
+            .await
+            .unwrap();
+
+        let report = test.store.memory_maintenance_report().await.unwrap();
+
+        assert_eq!(report.active_count, 3);
+        assert_eq!(report.retired_count, 0);
+        assert_eq!(report.duplicate_groups.len(), 1);
+        assert_eq!(
+            report.duplicate_groups[0].normalized_text,
+            "plugin hooks are loaded"
+        );
+        assert_eq!(report.duplicate_groups[0].memories.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn consolidate_duplicate_memories_retires_older_duplicates() {
+        let test = TestStore::new("improve_execute");
+        test.store.init().await.unwrap();
+        let conn = test.store.connect().await.unwrap();
+        insert_memory_for_sync(&conn, "mem_old", "Plugin hooks are loaded", 10)
+            .await
+            .unwrap();
+        insert_memory_for_sync(&conn, "mem_new", "plugin hooks are loaded", 20)
+            .await
+            .unwrap();
+        insert_memory_for_sync(&conn, "mem_keep", "database migrations are recorded", 30)
+            .await
+            .unwrap();
+
+        let result = test.store.consolidate_duplicate_memories().await.unwrap();
+        let report = test.store.memory_maintenance_report().await.unwrap();
+        let active_ids = test
+            .store
+            .memories()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|memory| memory.id)
+            .collect::<Vec<_>>();
+        let mut rows = conn
+            .query(
+                "SELECT valid_to, superseded_by FROM memories WHERE id = 'mem_old'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+
+        assert_eq!(result.kept_memories[0].id, "mem_new");
+        assert_eq!(result.retired_memories[0].id, "mem_old");
+        assert_eq!(report.active_count, 2);
+        assert_eq!(report.retired_count, 1);
+        assert!(report.duplicate_groups.is_empty());
+        assert_eq!(
+            active_ids,
+            vec!["mem_keep".to_string(), "mem_new".to_string()]
+        );
+        assert!(row.get::<Option<String>>(0).unwrap().is_some());
+        assert_eq!(
+            row.get::<Option<String>>(1).unwrap(),
+            Some("mem_new".to_string())
         );
     }
 
