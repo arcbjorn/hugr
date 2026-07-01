@@ -38,7 +38,7 @@ Implemented:
 - `hugr index` for explicit project indexing
 - best-effort code symbol extraction stored in `code_symbols`
 - best-effort direct reference/call/import extraction stored in `code_references`
-- tree-sitter-backed Rust symbol extraction with line ranges
+- tree-sitter-backed Rust and Python symbol extraction with line ranges
 - important symbol citations in context packs
 - `hugr impact <file-or-symbol>` for direct indexed impact reports
 - local branch, upstream, ahead/behind, and worktree changes in context packs
@@ -46,7 +46,7 @@ Implemented:
 
 Not implemented yet:
 
-- tree-sitter-backed parsing for non-Rust languages
+- tree-sitter-backed parsing for additional non-Rust/Python languages
 - richer symbol graph edges
 - cloud or hybrid sync
 
@@ -301,7 +301,7 @@ Implemented first slice:
 - Impact reports include inbound references and outbound references from matched symbol or file scope.
 - Likely test files are mapped from discovered project paths and surfaced in context and impact output.
 - Context packs include local branch, upstream, ahead/behind counts, and worktree changes.
-- Rust symbol extraction uses tree-sitter when parsing succeeds, with line-scanner fallback.
+- Rust and Python symbol extraction use tree-sitter when parsing succeeds, with line-scanner fallback.
 
 Open questions:
 
@@ -371,6 +371,7 @@ Recommended next commits:
 14. Done: `feat(git): add worktree context`
 15. Done: `feat(embed): add openai provider`
 16. Done: `feat(parser): use tree-sitter rust`
+17. Done: `feat(parser): use tree-sitter python`
 
 Each commit should leave the CLI usable.
 
@@ -389,4 +390,4 @@ Before ending each future session:
 
 Extend tree-sitter language coverage.
 
-That is the right next step because Hugr now uses tree-sitter for Rust while keeping the line-scanner fallback. The next useful layer is adding parser-backed extraction for TypeScript, Python, Go, or whichever language appears most often in target repos.
+That is the right next step because Hugr now uses tree-sitter for Rust and Python while keeping the line-scanner fallback. The next useful layer is adding parser-backed extraction for TypeScript, Go, or whichever language appears most often in target repos.
