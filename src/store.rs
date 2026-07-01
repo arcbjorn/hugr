@@ -83,6 +83,7 @@ pub struct SyncExecutionPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncPushResult {
+    pub run_id: Option<String>,
     pub dry_run: bool,
     pub backend: String,
     pub status: String,
@@ -91,6 +92,7 @@ pub struct SyncPushResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncPullResult {
+    pub run_id: Option<String>,
     pub dry_run: bool,
     pub backend: String,
     pub status: String,
@@ -102,7 +104,29 @@ pub struct SyncTableResult {
     pub class: String,
     pub table: String,
     pub row_count: usize,
+    pub inserted_count: usize,
+    pub updated_count: usize,
+    pub skipped_count: usize,
+    pub conflict_count: usize,
     pub executed: bool,
+    pub conflicts: Vec<SyncConflictSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncConflictSummary {
+    pub reason: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncRunHistory {
+    pub id: String,
+    pub operation: String,
+    pub backend: String,
+    pub status: String,
+    pub started_at_ms: i64,
+    pub ended_at_ms: i64,
+    pub tables: Vec<SyncTableResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +135,27 @@ pub struct Memory {
     pub created_at_ms: i64,
     pub kind: String,
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgetResult {
+    pub query: String,
+    pub forgotten_count: usize,
+    pub forgotten_at: String,
+    pub memories: Vec<Memory>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryMaintenanceReport {
+    pub active_count: usize,
+    pub retired_count: usize,
+    pub duplicate_groups: Vec<DuplicateMemoryGroup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateMemoryGroup {
+    pub normalized_text: String,
+    pub memories: Vec<Memory>,
 }
 
 pub struct Store {
@@ -245,25 +290,114 @@ impl Store {
         }
 
         let conn = self.connect().await?;
-        let mut rows = conn
-            .query(
-                "SELECT id, created_at_ms, kind, text FROM memories ORDER BY created_at_ms DESC",
-                (),
+        migrations::migrate(&conn).await?;
+        active_memories(&conn).await
+    }
+
+    pub async fn forget(&self, query: &str, limit: usize) -> Result<ForgetResult, String> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err("hugr forget requires a query".to_string());
+        }
+        let terms = query_terms(query);
+        if terms.is_empty() {
+            return Err("hugr forget requires at least one searchable term".to_string());
+        }
+
+        self.init().await?;
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let mut matches = active_memories(&conn)
+            .await?
+            .into_iter()
+            .filter_map(|memory| {
+                let score = recall_score(&memory, &terms, query);
+                (score > 0).then_some((score, memory))
+            })
+            .collect::<Vec<_>>();
+
+        matches.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.created_at_ms.cmp(&left.1.created_at_ms))
+        });
+        matches.truncate(limit.max(1));
+
+        let forgotten_at = now_ms()?.to_string();
+        let memories = matches
+            .into_iter()
+            .map(|(_, memory)| memory)
+            .collect::<Vec<_>>();
+
+        for memory in &memories {
+            conn.execute(
+                "
+                UPDATE memories
+                SET valid_to = ?1
+                WHERE id = ?2 AND valid_to IS NULL
+                ",
+                params![forgotten_at.clone(), memory.id.clone()],
             )
             .await
             .map_err(|error| error.to_string())?;
-        let mut memories = Vec::new();
+        }
 
-        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-            memories.push(Memory {
-                id: row.get::<String>(0).map_err(|error| error.to_string())?,
-                created_at_ms: row.get::<i64>(1).map_err(|error| error.to_string())?,
-                kind: row.get::<String>(2).map_err(|error| error.to_string())?,
-                text: row.get::<String>(3).map_err(|error| error.to_string())?,
+        Ok(ForgetResult {
+            query: query.to_string(),
+            forgotten_count: memories.len(),
+            forgotten_at,
+            memories,
+        })
+    }
+
+    pub async fn memory_maintenance_report(&self) -> Result<MemoryMaintenanceReport, String> {
+        if !self.exists() {
+            return Ok(MemoryMaintenanceReport {
+                active_count: 0,
+                retired_count: 0,
+                duplicate_groups: Vec::new(),
             });
         }
 
-        Ok(memories)
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let active = active_memories(&conn).await?;
+        let retired_count = table_count_where(&conn, "memories", "valid_to IS NOT NULL").await?;
+        let mut grouped = HashMap::<String, Vec<Memory>>::new();
+
+        for memory in &active {
+            grouped
+                .entry(normalized_memory_text(&memory.text))
+                .or_default()
+                .push(memory.clone());
+        }
+
+        let mut duplicate_groups = grouped
+            .into_iter()
+            .filter_map(|(normalized_text, mut memories)| {
+                (memories.len() > 1).then(|| {
+                    memories.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+                    DuplicateMemoryGroup {
+                        normalized_text,
+                        memories,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        duplicate_groups.sort_by(|left, right| {
+            right
+                .memories
+                .len()
+                .cmp(&left.memories.len())
+                .then_with(|| left.normalized_text.cmp(&right.normalized_text))
+        });
+
+        Ok(MemoryMaintenanceReport {
+            active_count: active.len(),
+            retired_count,
+            duplicate_groups,
+        })
     }
 
     pub async fn sync_current_project(&self) -> Result<Project, String> {
@@ -934,6 +1068,7 @@ impl Store {
                 FROM memories_fts
                 JOIN memories AS m ON m.rowid = memories_fts.rowid
                 WHERE memories_fts MATCH ?1
+                  AND m.valid_to IS NULL
                 ORDER BY fts_rank, m.created_at_ms DESC
                 LIMIT ?2
                 ",
@@ -984,6 +1119,7 @@ impl Store {
                 FROM vector_matches
                 JOIN memory_embeddings AS e ON e.rowid = vector_matches.id
                 JOIN memories AS m ON m.id = e.memory_id
+                WHERE m.valid_to IS NULL
                 ORDER BY vector_matches.vector_rank ASC, m.created_at_ms DESC
                 LIMIT ?2
                 ",
@@ -1067,15 +1203,53 @@ impl Store {
             .map(StorageConfig::sync_execution_plan)
     }
 
+    pub async fn sync_history(&self, limit: usize) -> Result<Vec<SyncRunHistory>, String> {
+        self.init().await?;
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let limit = i64::try_from(limit.max(1)).map_err(|error| error.to_string())?;
+        let mut rows = conn
+            .query(
+                "
+                SELECT id, operation, backend, status, started_at_ms, ended_at_ms
+                FROM sync_runs
+                ORDER BY started_at_ms DESC, id DESC
+                LIMIT ?1
+                ",
+                params![limit],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut history = Vec::new();
+
+        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+            let id = row.get::<String>(0).map_err(|error| error.to_string())?;
+            let tables = sync_run_tables(&conn, &id).await?;
+            history.push(SyncRunHistory {
+                id,
+                operation: row.get::<String>(1).map_err(|error| error.to_string())?,
+                backend: row.get::<String>(2).map_err(|error| error.to_string())?,
+                status: row.get::<String>(3).map_err(|error| error.to_string())?,
+                started_at_ms: row.get::<i64>(4).map_err(|error| error.to_string())?,
+                ended_at_ms: row.get::<i64>(5).map_err(|error| error.to_string())?,
+                tables,
+            });
+        }
+
+        Ok(history)
+    }
+
     pub async fn sync_push(&self, dry_run: bool) -> Result<SyncPushResult, String> {
         self.init().await?;
         let config = self.storage_config()?.clone();
         let local_conn = self.connect().await?;
         migrations::migrate(&local_conn).await?;
         let mut tables = self.sync_table_results(&local_conn, &config, false).await?;
+        let mut run_id = None;
 
         if !dry_run {
             self.ensure_sync_push_execution_allowed(&config)?;
+            let started_at_ms = now_ms()?;
             let remote_url = config
                 .remote_url
                 .as_ref()
@@ -1090,12 +1264,26 @@ impl Store {
                 .map_err(|error| error.to_string())?;
             let remote_conn = remote_db.connect().map_err(|error| error.to_string())?;
             migrations::migrate(&remote_conn).await?;
-            self.copy_sync_tables(&local_conn, &remote_conn, &config)
+            tables = self
+                .copy_sync_tables(&local_conn, &remote_conn, &config)
                 .await?;
-            tables = self.sync_table_results(&local_conn, &config, true).await?;
+            let ended_at_ms = now_ms()?;
+            run_id = Some(
+                self.record_sync_run(
+                    &local_conn,
+                    "push",
+                    config.backend.as_str(),
+                    "executed",
+                    started_at_ms,
+                    ended_at_ms,
+                    &tables,
+                )
+                .await?,
+            );
         }
 
         Ok(SyncPushResult {
+            run_id,
             dry_run,
             backend: config.backend.as_str().to_string(),
             status: if dry_run {
@@ -1113,9 +1301,11 @@ impl Store {
         let local_conn = self.connect().await?;
         migrations::migrate(&local_conn).await?;
         let mut tables = self.sync_table_results(&local_conn, &config, false).await?;
+        let mut run_id = None;
 
         if !dry_run {
             self.ensure_sync_execute_allowed(&config, "pull")?;
+            let started_at_ms = now_ms()?;
             let remote_url = config
                 .remote_url
                 .as_ref()
@@ -1130,12 +1320,26 @@ impl Store {
                 .map_err(|error| error.to_string())?;
             let remote_conn = remote_db.connect().map_err(|error| error.to_string())?;
             migrations::migrate(&remote_conn).await?;
-            self.copy_pull_tables(&remote_conn, &local_conn, &config)
+            tables = self
+                .copy_pull_tables(&remote_conn, &local_conn, &config)
                 .await?;
-            tables = self.sync_table_results(&local_conn, &config, true).await?;
+            let ended_at_ms = now_ms()?;
+            run_id = Some(
+                self.record_sync_run(
+                    &local_conn,
+                    "pull",
+                    config.backend.as_str(),
+                    "executed",
+                    started_at_ms,
+                    ended_at_ms,
+                    &tables,
+                )
+                .await?,
+            );
         }
 
         Ok(SyncPullResult {
+            run_id,
             dry_run,
             backend: config.backend.as_str().to_string(),
             status: if dry_run {
@@ -1218,10 +1422,8 @@ impl Store {
         let mut results = Vec::new();
         for table in sync_tables_for_config(config) {
             results.push(SyncTableResult {
-                class: table.sync_class().to_string(),
-                table: table.table_name().to_string(),
-                row_count: table_row_count(conn, table.table_name()).await?,
                 executed,
+                ..planned_sync_table_result(table, table_row_count(conn, table.table_name()).await?)
             });
         }
         Ok(results)
@@ -1232,11 +1434,12 @@ impl Store {
         local_conn: &Connection,
         remote_conn: &Connection,
         config: &StorageConfig,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<SyncTableResult>, String> {
+        let mut results = Vec::new();
         for table in sync_tables_for_config(config) {
-            copy_sync_table(local_conn, remote_conn, table).await?;
+            results.push(copy_sync_table(local_conn, remote_conn, table).await?);
         }
-        Ok(())
+        Ok(results)
     }
 
     async fn copy_pull_tables(
@@ -1244,11 +1447,85 @@ impl Store {
         remote_conn: &Connection,
         local_conn: &Connection,
         config: &StorageConfig,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<SyncTableResult>, String> {
+        let mut results = Vec::new();
         for table in sync_tables_for_config(config) {
-            copy_pull_table(remote_conn, local_conn, table).await?;
+            results.push(copy_pull_table(remote_conn, local_conn, table).await?);
         }
-        Ok(())
+        Ok(results)
+    }
+
+    async fn record_sync_run(
+        &self,
+        conn: &Connection,
+        operation: &str,
+        backend: &str,
+        status: &str,
+        started_at_ms: i64,
+        ended_at_ms: i64,
+        tables: &[SyncTableResult],
+    ) -> Result<String, String> {
+        let id = format!("sync_{operation}_{ended_at_ms}");
+        conn.execute(
+            "
+            INSERT INTO sync_runs (id, operation, backend, status, started_at_ms, ended_at_ms)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ",
+            params![
+                id.clone(),
+                operation.to_string(),
+                backend.to_string(),
+                status.to_string(),
+                started_at_ms,
+                ended_at_ms
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        for table in tables {
+            conn.execute(
+                "
+                INSERT INTO sync_table_runs (
+                    sync_run_id, class, table_name, row_count, inserted_count,
+                    updated_count, skipped_count, conflict_count, executed
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ",
+                params![
+                    id.clone(),
+                    table.class.clone(),
+                    table.table.clone(),
+                    i64::try_from(table.row_count).map_err(|error| error.to_string())?,
+                    i64::try_from(table.inserted_count).map_err(|error| error.to_string())?,
+                    i64::try_from(table.updated_count).map_err(|error| error.to_string())?,
+                    i64::try_from(table.skipped_count).map_err(|error| error.to_string())?,
+                    i64::try_from(table.conflict_count).map_err(|error| error.to_string())?,
+                    if table.executed { 1_i64 } else { 0_i64 }
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+            for conflict in &table.conflicts {
+                conn.execute(
+                    "
+                    INSERT INTO sync_table_conflicts (sync_run_id, table_name, reason, count)
+                    VALUES (?1, ?2, ?3, ?4)
+                    ",
+                    params![
+                        id.clone(),
+                        table.table.clone(),
+                        conflict.reason.clone(),
+                        i64::try_from(conflict.count).map_err(|error| error.to_string())?
+                    ],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            }
+        }
+
+        Ok(id)
     }
 }
 
@@ -1328,6 +1605,75 @@ fn push_sync_table(
     }
 }
 
+#[derive(Debug, Default)]
+struct SyncApplyStats {
+    affected_count: usize,
+    skipped_count: usize,
+    conflicts: Vec<SyncConflictSummary>,
+}
+
+impl SyncApplyStats {
+    fn record_affected(&mut self, affected: u64) -> Result<(), String> {
+        self.affected_count += usize::try_from(affected).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn record_skip(&mut self, reason: &str) {
+        self.skipped_count += 1;
+        if let Some(existing) = self
+            .conflicts
+            .iter_mut()
+            .find(|conflict| conflict.reason == reason)
+        {
+            existing.count += 1;
+        } else {
+            self.conflicts.push(SyncConflictSummary {
+                reason: reason.to_string(),
+                count: 1,
+            });
+        }
+    }
+
+    fn into_result(
+        self,
+        table: SyncTableKind,
+        row_count: usize,
+        before_count: usize,
+        after_count: usize,
+        executed: bool,
+    ) -> SyncTableResult {
+        let inserted_count = after_count.saturating_sub(before_count);
+        let updated_count = self.affected_count.saturating_sub(inserted_count);
+        let conflict_count = self.conflicts.iter().map(|conflict| conflict.count).sum();
+
+        SyncTableResult {
+            class: table.sync_class().to_string(),
+            table: table.table_name().to_string(),
+            row_count,
+            inserted_count,
+            updated_count,
+            skipped_count: self.skipped_count,
+            conflict_count,
+            executed,
+            conflicts: self.conflicts,
+        }
+    }
+}
+
+fn planned_sync_table_result(table: SyncTableKind, row_count: usize) -> SyncTableResult {
+    SyncTableResult {
+        class: table.sync_class().to_string(),
+        table: table.table_name().to_string(),
+        row_count,
+        inserted_count: 0,
+        updated_count: 0,
+        skipped_count: 0,
+        conflict_count: 0,
+        executed: false,
+        conflicts: Vec::new(),
+    }
+}
+
 async fn table_row_count(conn: &Connection, table_name: &str) -> Result<usize, String> {
     let sql = format!("SELECT COUNT(*) FROM {table_name}");
     let mut rows = conn
@@ -1339,6 +1685,134 @@ async fn table_row_count(conn: &Connection, table_name: &str) -> Result<usize, S
     };
     let count = row.get::<i64>(0).map_err(|error| error.to_string())?;
     usize::try_from(count).map_err(|error| error.to_string())
+}
+
+async fn table_count_where(
+    conn: &Connection,
+    table_name: &str,
+    predicate: &str,
+) -> Result<usize, String> {
+    let sql = format!("SELECT COUNT(*) FROM {table_name} WHERE {predicate}");
+    let mut rows = conn
+        .query(&sql, ())
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+        return Ok(0);
+    };
+    usize_from_i64(row.get::<i64>(0).map_err(|error| error.to_string())?)
+}
+
+async fn active_memories(conn: &Connection) -> Result<Vec<Memory>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT id, created_at_ms, kind, text
+            FROM memories
+            WHERE valid_to IS NULL
+            ORDER BY created_at_ms DESC
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut memories = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        memories.push(Memory {
+            id: row.get::<String>(0).map_err(|error| error.to_string())?,
+            created_at_ms: row.get::<i64>(1).map_err(|error| error.to_string())?,
+            kind: row.get::<String>(2).map_err(|error| error.to_string())?,
+            text: row.get::<String>(3).map_err(|error| error.to_string())?,
+        });
+    }
+
+    Ok(memories)
+}
+
+fn normalized_memory_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+async fn finish_sync_table_result(
+    conn: &Connection,
+    table: SyncTableKind,
+    before_count: usize,
+    stats: SyncApplyStats,
+) -> Result<SyncTableResult, String> {
+    let after_count = table_row_count(conn, table.table_name()).await?;
+    Ok(stats.into_result(table, after_count, before_count, after_count, true))
+}
+
+async fn sync_run_tables(conn: &Connection, run_id: &str) -> Result<Vec<SyncTableResult>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT
+                class, table_name, row_count, inserted_count, updated_count,
+                skipped_count, conflict_count, executed
+            FROM sync_table_runs
+            WHERE sync_run_id = ?1
+            ORDER BY rowid
+            ",
+            params![run_id.to_string()],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut tables = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        let table = row.get::<String>(1).map_err(|error| error.to_string())?;
+        tables.push(SyncTableResult {
+            class: row.get::<String>(0).map_err(|error| error.to_string())?,
+            conflicts: sync_table_conflicts(conn, run_id, &table).await?,
+            table,
+            row_count: usize_from_i64(row.get::<i64>(2).map_err(|error| error.to_string())?)?,
+            inserted_count: usize_from_i64(row.get::<i64>(3).map_err(|error| error.to_string())?)?,
+            updated_count: usize_from_i64(row.get::<i64>(4).map_err(|error| error.to_string())?)?,
+            skipped_count: usize_from_i64(row.get::<i64>(5).map_err(|error| error.to_string())?)?,
+            conflict_count: usize_from_i64(row.get::<i64>(6).map_err(|error| error.to_string())?)?,
+            executed: row.get::<i64>(7).map_err(|error| error.to_string())? != 0,
+        });
+    }
+
+    Ok(tables)
+}
+
+async fn sync_table_conflicts(
+    conn: &Connection,
+    run_id: &str,
+    table: &str,
+) -> Result<Vec<SyncConflictSummary>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT reason, count
+            FROM sync_table_conflicts
+            WHERE sync_run_id = ?1 AND table_name = ?2
+            ORDER BY reason
+            ",
+            params![run_id.to_string(), table.to_string()],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut conflicts = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        conflicts.push(SyncConflictSummary {
+            reason: row.get::<String>(0).map_err(|error| error.to_string())?,
+            count: usize_from_i64(row.get::<i64>(1).map_err(|error| error.to_string())?)?,
+        });
+    }
+
+    Ok(conflicts)
+}
+
+fn usize_from_i64(value: i64) -> Result<usize, String> {
+    usize::try_from(value).map_err(|error| error.to_string())
 }
 
 async fn memory_exists(conn: &Connection, memory_id: &str) -> Result<bool, String> {
@@ -1360,7 +1834,7 @@ async fn copy_sync_table(
     local_conn: &Connection,
     remote_conn: &Connection,
     table: SyncTableKind,
-) -> Result<(), String> {
+) -> Result<SyncTableResult, String> {
     match table {
         SyncTableKind::Projects => copy_projects(local_conn, remote_conn).await,
         SyncTableKind::Memories => copy_memories(local_conn, remote_conn).await,
@@ -1379,7 +1853,7 @@ async fn copy_pull_table(
     remote_conn: &Connection,
     local_conn: &Connection,
     table: SyncTableKind,
-) -> Result<(), String> {
+) -> Result<SyncTableResult, String> {
     match table {
         SyncTableKind::Projects => pull_projects(remote_conn, local_conn).await,
         SyncTableKind::Memories => pull_memories(remote_conn, local_conn).await,
@@ -1394,7 +1868,13 @@ async fn copy_pull_table(
     }
 }
 
-async fn copy_projects(local_conn: &Connection, remote_conn: &Connection) -> Result<(), String> {
+async fn copy_projects(
+    local_conn: &Connection,
+    remote_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Projects;
+    let before_count = table_row_count(remote_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = local_conn
         .query(
             "
@@ -1407,7 +1887,7 @@ async fn copy_projects(local_conn: &Connection, remote_conn: &Connection) -> Res
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        remote_conn
+        let affected = remote_conn
             .execute(
                 "
                 INSERT INTO projects (
@@ -1435,12 +1915,19 @@ async fn copy_projects(local_conn: &Connection, remote_conn: &Connection) -> Res
             )
             .await
             .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
     }
 
-    Ok(())
+    finish_sync_table_result(remote_conn, table, before_count, stats).await
 }
 
-async fn copy_memories(local_conn: &Connection, remote_conn: &Connection) -> Result<(), String> {
+async fn copy_memories(
+    local_conn: &Connection,
+    remote_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Memories;
+    let before_count = table_row_count(remote_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = local_conn
         .query(
             "
@@ -1455,7 +1942,7 @@ async fn copy_memories(local_conn: &Connection, remote_conn: &Connection) -> Res
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        remote_conn
+        let affected = remote_conn
             .execute(
                 "
                 INSERT INTO memories (
@@ -1493,15 +1980,19 @@ async fn copy_memories(local_conn: &Connection, remote_conn: &Connection) -> Res
             )
             .await
             .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
     }
 
-    Ok(())
+    finish_sync_table_result(remote_conn, table, before_count, stats).await
 }
 
 async fn copy_memory_embeddings(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<(), String> {
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::MemoryEmbeddings;
+    let before_count = table_row_count(remote_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = local_conn
         .query(
             "SELECT memory_id, model, dimensions, embedding FROM memory_embeddings",
@@ -1513,9 +2004,10 @@ async fn copy_memory_embeddings(
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
         let memory_id = row.get::<String>(0).map_err(|error| error.to_string())?;
         if !memory_exists(remote_conn, &memory_id).await? {
+            stats.record_skip("missing_memory");
             continue;
         }
-        remote_conn
+        let affected = remote_conn
             .execute(
                 "
                 INSERT INTO memory_embeddings (memory_id, model, dimensions, embedding)
@@ -1534,19 +2026,26 @@ async fn copy_memory_embeddings(
             )
             .await
             .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
     }
 
-    Ok(())
+    finish_sync_table_result(remote_conn, table, before_count, stats).await
 }
 
-async fn copy_sources(local_conn: &Connection, remote_conn: &Connection) -> Result<(), String> {
+async fn copy_sources(
+    local_conn: &Connection,
+    remote_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Sources;
+    let before_count = table_row_count(remote_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = local_conn
         .query("SELECT id, kind, locator, created_at_ms FROM sources", ())
         .await
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        remote_conn
+        let affected = remote_conn
             .execute(
                 "
                 INSERT INTO sources (id, kind, locator, created_at_ms)
@@ -1565,15 +2064,19 @@ async fn copy_sources(local_conn: &Connection, remote_conn: &Connection) -> Resu
             )
             .await
             .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
     }
 
-    Ok(())
+    finish_sync_table_result(remote_conn, table, before_count, stats).await
 }
 
 async fn copy_discovered_files(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<(), String> {
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::DiscoveredFiles;
+    let before_count = table_row_count(remote_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = local_conn
         .query(
             "
@@ -1586,7 +2089,7 @@ async fn copy_discovered_files(
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        remote_conn
+        let affected = remote_conn
             .execute(
                 "
                 INSERT INTO discovered_files (
@@ -1611,12 +2114,19 @@ async fn copy_discovered_files(
             )
             .await
             .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
     }
 
-    Ok(())
+    finish_sync_table_result(remote_conn, table, before_count, stats).await
 }
 
-async fn copy_entities(local_conn: &Connection, remote_conn: &Connection) -> Result<(), String> {
+async fn copy_entities(
+    local_conn: &Connection,
+    remote_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Entities;
+    let before_count = table_row_count(remote_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = local_conn
         .query(
             "SELECT id, kind, name, locator, created_at_ms FROM entities",
@@ -1626,7 +2136,7 @@ async fn copy_entities(local_conn: &Connection, remote_conn: &Connection) -> Res
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        remote_conn
+        let affected = remote_conn
             .execute(
                 "
                 INSERT INTO entities (id, kind, name, locator, created_at_ms)
@@ -1648,15 +2158,19 @@ async fn copy_entities(local_conn: &Connection, remote_conn: &Connection) -> Res
             )
             .await
             .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
     }
 
-    Ok(())
+    finish_sync_table_result(remote_conn, table, before_count, stats).await
 }
 
 async fn copy_code_symbols(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<(), String> {
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::CodeSymbols;
+    let before_count = table_row_count(remote_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = local_conn
         .query(
             "
@@ -1671,7 +2185,7 @@ async fn copy_code_symbols(
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        remote_conn
+        let affected = remote_conn
             .execute(
                 "
                 INSERT INTO code_symbols (
@@ -1701,12 +2215,19 @@ async fn copy_code_symbols(
             )
             .await
             .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
     }
 
-    Ok(())
+    finish_sync_table_result(remote_conn, table, before_count, stats).await
 }
 
-async fn copy_edges(local_conn: &Connection, remote_conn: &Connection) -> Result<(), String> {
+async fn copy_edges(
+    local_conn: &Connection,
+    remote_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Edges;
+    let before_count = table_row_count(remote_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = local_conn
         .query(
             "SELECT id, from_id, to_id, kind, created_at_ms FROM edges",
@@ -1716,7 +2237,7 @@ async fn copy_edges(local_conn: &Connection, remote_conn: &Connection) -> Result
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        remote_conn
+        let affected = remote_conn
             .execute(
                 "
                 INSERT INTO edges (id, from_id, to_id, kind, created_at_ms)
@@ -1737,15 +2258,19 @@ async fn copy_edges(local_conn: &Connection, remote_conn: &Connection) -> Result
             )
             .await
             .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
     }
 
-    Ok(())
+    finish_sync_table_result(remote_conn, table, before_count, stats).await
 }
 
 async fn copy_code_references(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<(), String> {
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::CodeReferences;
+    let before_count = table_row_count(remote_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = local_conn
         .query(
             "
@@ -1760,7 +2285,7 @@ async fn copy_code_references(
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        remote_conn
+        let affected = remote_conn
             .execute(
                 "
                 INSERT INTO code_references (
@@ -1791,12 +2316,19 @@ async fn copy_code_references(
             )
             .await
             .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
     }
 
-    Ok(())
+    finish_sync_table_result(remote_conn, table, before_count, stats).await
 }
 
-async fn copy_sessions(local_conn: &Connection, remote_conn: &Connection) -> Result<(), String> {
+async fn copy_sessions(
+    local_conn: &Connection,
+    remote_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Sessions;
+    let before_count = table_row_count(remote_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = local_conn
         .query(
             "
@@ -1810,7 +2342,7 @@ async fn copy_sessions(local_conn: &Connection, remote_conn: &Connection) -> Res
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        remote_conn
+        let affected = remote_conn
             .execute(
                 "
                 INSERT INTO sessions (
@@ -1840,12 +2372,19 @@ async fn copy_sessions(local_conn: &Connection, remote_conn: &Connection) -> Res
             )
             .await
             .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
     }
 
-    Ok(())
+    finish_sync_table_result(remote_conn, table, before_count, stats).await
 }
 
-async fn pull_projects(remote_conn: &Connection, local_conn: &Connection) -> Result<(), String> {
+async fn pull_projects(
+    remote_conn: &Connection,
+    local_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Projects;
+    let before_count = table_row_count(local_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = remote_conn
         .query(
             "
@@ -1858,7 +2397,7 @@ async fn pull_projects(remote_conn: &Connection, local_conn: &Connection) -> Res
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        local_conn
+        let affected = local_conn
             .execute(
                 "
                 INSERT INTO projects (
@@ -1887,12 +2426,23 @@ async fn pull_projects(remote_conn: &Connection, local_conn: &Connection) -> Res
             )
             .await
             .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_newer_or_equal");
+        } else {
+            stats.record_affected(affected)?;
+        }
     }
 
-    Ok(())
+    finish_sync_table_result(local_conn, table, before_count, stats).await
 }
 
-async fn pull_memories(remote_conn: &Connection, local_conn: &Connection) -> Result<(), String> {
+async fn pull_memories(
+    remote_conn: &Connection,
+    local_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Memories;
+    let before_count = table_row_count(local_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = remote_conn
         .query(
             "
@@ -1907,7 +2457,7 @@ async fn pull_memories(remote_conn: &Connection, local_conn: &Connection) -> Res
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        local_conn
+        let affected = local_conn
             .execute(
                 "
                 INSERT OR IGNORE INTO memories (
@@ -1935,15 +2485,23 @@ async fn pull_memories(remote_conn: &Connection, local_conn: &Connection) -> Res
             )
             .await
             .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_preserved");
+        } else {
+            stats.record_affected(affected)?;
+        }
     }
 
-    Ok(())
+    finish_sync_table_result(local_conn, table, before_count, stats).await
 }
 
 async fn pull_memory_embeddings(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<(), String> {
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::MemoryEmbeddings;
+    let before_count = table_row_count(local_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = remote_conn
         .query(
             "SELECT memory_id, model, dimensions, embedding FROM memory_embeddings",
@@ -1955,9 +2513,10 @@ async fn pull_memory_embeddings(
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
         let memory_id = row.get::<String>(0).map_err(|error| error.to_string())?;
         if !memory_exists(local_conn, &memory_id).await? {
+            stats.record_skip("missing_memory");
             continue;
         }
-        local_conn
+        let affected = local_conn
             .execute(
                 "
                 INSERT OR IGNORE INTO memory_embeddings (memory_id, model, dimensions, embedding)
@@ -1972,19 +2531,30 @@ async fn pull_memory_embeddings(
             )
             .await
             .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_preserved");
+        } else {
+            stats.record_affected(affected)?;
+        }
     }
 
-    Ok(())
+    finish_sync_table_result(local_conn, table, before_count, stats).await
 }
 
-async fn pull_sources(remote_conn: &Connection, local_conn: &Connection) -> Result<(), String> {
+async fn pull_sources(
+    remote_conn: &Connection,
+    local_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Sources;
+    let before_count = table_row_count(local_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = remote_conn
         .query("SELECT id, kind, locator, created_at_ms FROM sources", ())
         .await
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        local_conn
+        let affected = local_conn
             .execute(
                 "
                 INSERT OR IGNORE INTO sources (id, kind, locator, created_at_ms)
@@ -1999,15 +2569,23 @@ async fn pull_sources(remote_conn: &Connection, local_conn: &Connection) -> Resu
             )
             .await
             .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_preserved");
+        } else {
+            stats.record_affected(affected)?;
+        }
     }
 
-    Ok(())
+    finish_sync_table_result(local_conn, table, before_count, stats).await
 }
 
 async fn pull_discovered_files(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<(), String> {
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::DiscoveredFiles;
+    let before_count = table_row_count(local_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = remote_conn
         .query(
             "
@@ -2020,7 +2598,7 @@ async fn pull_discovered_files(
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        local_conn
+        let affected = local_conn
             .execute(
                 "
                 INSERT INTO discovered_files (
@@ -2046,12 +2624,23 @@ async fn pull_discovered_files(
             )
             .await
             .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_newer_or_equal");
+        } else {
+            stats.record_affected(affected)?;
+        }
     }
 
-    Ok(())
+    finish_sync_table_result(local_conn, table, before_count, stats).await
 }
 
-async fn pull_entities(remote_conn: &Connection, local_conn: &Connection) -> Result<(), String> {
+async fn pull_entities(
+    remote_conn: &Connection,
+    local_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Entities;
+    let before_count = table_row_count(local_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = remote_conn
         .query(
             "SELECT id, kind, name, locator, created_at_ms FROM entities",
@@ -2061,7 +2650,7 @@ async fn pull_entities(remote_conn: &Connection, local_conn: &Connection) -> Res
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        local_conn
+        let affected = local_conn
             .execute(
                 "
                 INSERT OR IGNORE INTO entities (id, kind, name, locator, created_at_ms)
@@ -2078,15 +2667,23 @@ async fn pull_entities(remote_conn: &Connection, local_conn: &Connection) -> Res
             )
             .await
             .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_preserved");
+        } else {
+            stats.record_affected(affected)?;
+        }
     }
 
-    Ok(())
+    finish_sync_table_result(local_conn, table, before_count, stats).await
 }
 
 async fn pull_code_symbols(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<(), String> {
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::CodeSymbols;
+    let before_count = table_row_count(local_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = remote_conn
         .query(
             "
@@ -2101,7 +2698,7 @@ async fn pull_code_symbols(
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        local_conn
+        let affected = local_conn
             .execute(
                 "
                 INSERT INTO code_symbols (
@@ -2132,12 +2729,23 @@ async fn pull_code_symbols(
             )
             .await
             .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_newer_or_equal");
+        } else {
+            stats.record_affected(affected)?;
+        }
     }
 
-    Ok(())
+    finish_sync_table_result(local_conn, table, before_count, stats).await
 }
 
-async fn pull_edges(remote_conn: &Connection, local_conn: &Connection) -> Result<(), String> {
+async fn pull_edges(
+    remote_conn: &Connection,
+    local_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Edges;
+    let before_count = table_row_count(local_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = remote_conn
         .query(
             "SELECT id, from_id, to_id, kind, created_at_ms FROM edges",
@@ -2147,7 +2755,7 @@ async fn pull_edges(remote_conn: &Connection, local_conn: &Connection) -> Result
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        local_conn
+        let affected = local_conn
             .execute(
                 "
                 INSERT OR IGNORE INTO edges (id, from_id, to_id, kind, created_at_ms)
@@ -2163,15 +2771,23 @@ async fn pull_edges(remote_conn: &Connection, local_conn: &Connection) -> Result
             )
             .await
             .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_preserved");
+        } else {
+            stats.record_affected(affected)?;
+        }
     }
 
-    Ok(())
+    finish_sync_table_result(local_conn, table, before_count, stats).await
 }
 
 async fn pull_code_references(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<(), String> {
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::CodeReferences;
+    let before_count = table_row_count(local_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = remote_conn
         .query(
             "
@@ -2186,7 +2802,7 @@ async fn pull_code_references(
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        local_conn
+        let affected = local_conn
             .execute(
                 "
                 INSERT INTO code_references (
@@ -2218,12 +2834,23 @@ async fn pull_code_references(
             )
             .await
             .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_newer_or_equal");
+        } else {
+            stats.record_affected(affected)?;
+        }
     }
 
-    Ok(())
+    finish_sync_table_result(local_conn, table, before_count, stats).await
 }
 
-async fn pull_sessions(remote_conn: &Connection, local_conn: &Connection) -> Result<(), String> {
+async fn pull_sessions(
+    remote_conn: &Connection,
+    local_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Sessions;
+    let before_count = table_row_count(local_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
     let mut rows = remote_conn
         .query(
             "
@@ -2237,7 +2864,7 @@ async fn pull_sessions(remote_conn: &Connection, local_conn: &Connection) -> Res
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        local_conn
+        let affected = local_conn
             .execute(
                 "
                 INSERT INTO sessions (
@@ -2269,9 +2896,14 @@ async fn pull_sessions(remote_conn: &Connection, local_conn: &Connection) -> Res
             )
             .await
             .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_newer_or_equal");
+        } else {
+            stats.record_affected(affected)?;
+        }
     }
 
-    Ok(())
+    finish_sync_table_result(local_conn, table, before_count, stats).await
 }
 
 impl StorageMode {
@@ -2924,7 +3556,7 @@ fn now_ms() -> Result<i64, String> {
 mod tests {
     use super::{
         LOCAL_PROJECT_ID, Memory, StorageConfig, StorageMode, Store, SyncBackend, SyncClass,
-        fts_query, query_terms, recall_score, table_row_count,
+        SyncConflictSummary, fts_query, query_terms, recall_score, table_row_count,
     };
     use crate::code::{CodeReference, CodeSymbol};
     use crate::discovery::FileCandidate;
@@ -3261,6 +3893,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_pull_reports_and_records_conflicts() {
+        let local = TestStore::new("sync_pull_history_local");
+        let remote = TestStore::new("sync_pull_history_remote");
+        local.store.init().await.unwrap();
+        remote.store.init().await.unwrap();
+        let local_conn = local.store.connect().await.unwrap();
+        let remote_conn = remote.store.connect().await.unwrap();
+
+        insert_memory_for_sync(&local_conn, "mem_shared", "local memory", 10)
+            .await
+            .unwrap();
+        insert_memory_for_sync(&remote_conn, "mem_shared", "remote memory", 20)
+            .await
+            .unwrap();
+        insert_memory_for_sync(&remote_conn, "mem_remote", "remote only", 30)
+            .await
+            .unwrap();
+
+        let config = StorageConfig {
+            mode: StorageMode::Hybrid,
+            backend: SyncBackend::DirectLibsql,
+            remote_url: Some("libsql://example.turso.io".to_string()),
+            remote_auth_token: Some("secret-token".to_string()),
+            auth_token_configured: true,
+            sync_classes: vec![SyncClass::Memories],
+        };
+
+        let tables = local
+            .store
+            .copy_pull_tables(&remote_conn, &local_conn, &config)
+            .await
+            .unwrap();
+        let memories = tables
+            .iter()
+            .find(|table| table.table == "memories")
+            .unwrap();
+
+        assert_eq!(memories.inserted_count, 1);
+        assert_eq!(memories.updated_count, 0);
+        assert_eq!(memories.skipped_count, 1);
+        assert_eq!(memories.conflict_count, 1);
+        assert_eq!(memories.conflicts[0].reason, "local_row_preserved");
+
+        let run_id = local
+            .store
+            .record_sync_run(
+                &local_conn,
+                "pull",
+                "direct_libsql",
+                "executed",
+                100,
+                200,
+                &tables,
+            )
+            .await
+            .unwrap();
+        let history = local.store.sync_history(5).await.unwrap();
+
+        assert_eq!(history[0].id, run_id);
+        assert_eq!(history[0].operation, "pull");
+        let history_memories = history[0]
+            .tables
+            .iter()
+            .find(|table| table.table == "memories")
+            .unwrap();
+        assert_eq!(history_memories.skipped_count, 1);
+        assert_eq!(
+            history_memories.conflicts,
+            vec![SyncConflictSummary {
+                reason: "local_row_preserved".to_string(),
+                count: 1,
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn sync_pull_updates_code_indexes_only_when_remote_is_newer() {
         let local = TestStore::new("sync_pull_local_code");
         let remote = TestStore::new("sync_pull_remote_code");
@@ -3322,8 +4030,12 @@ mod tests {
         assert!(object_exists(&conn, "table", "session_events").await);
         assert!(object_exists(&conn, "table", "code_symbols").await);
         assert!(object_exists(&conn, "table", "code_references").await);
+        assert!(object_exists(&conn, "table", "sync_runs").await);
+        assert!(object_exists(&conn, "table", "sync_table_runs").await);
+        assert!(object_exists(&conn, "table", "sync_table_conflicts").await);
         assert!(object_exists(&conn, "index", "code_symbols_project_name_idx").await);
         assert!(object_exists(&conn, "index", "code_references_target_name_idx").await);
+        assert!(object_exists(&conn, "index", "sync_runs_started_idx").await);
         assert!(object_exists(&conn, "index", "memory_embeddings_vector_idx").await);
 
         let mut rows = conn
@@ -3346,7 +4058,8 @@ mod tests {
                 (3, "file_discovery".to_string()),
                 (4, "sessions".to_string()),
                 (5, "code_symbols".to_string()),
-                (6, "code_references".to_string())
+                (6, "code_references".to_string()),
+                (7, "sync_history".to_string())
             ]
         );
     }
