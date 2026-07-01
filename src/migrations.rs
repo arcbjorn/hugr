@@ -15,6 +15,8 @@ const CODE_SYMBOLS_VERSION: i64 = 5;
 const CODE_SYMBOLS_NAME: &str = "code_symbols";
 const CODE_REFERENCES_VERSION: i64 = 6;
 const CODE_REFERENCES_NAME: &str = "code_references";
+const SYNC_HISTORY_VERSION: i64 = 7;
+const SYNC_HISTORY_NAME: &str = "sync_history";
 
 pub async fn migrate(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
@@ -97,6 +99,18 @@ pub async fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![CODE_REFERENCES_VERSION, CODE_REFERENCES_NAME, now_ms()?],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    if !applied.contains(&SYNC_HISTORY_VERSION) {
+        conn.execute_batch(sync_history_sql())
+            .await
+            .map_err(|error| error.to_string())?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![SYNC_HISTORY_VERSION, SYNC_HISTORY_NAME, now_ms()?],
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -314,6 +328,43 @@ fn code_references_sql() -> &'static str {
 
     CREATE INDEX IF NOT EXISTS code_references_path_idx
     ON code_references(project_id, path, line_start);
+    "
+}
+
+fn sync_history_sql() -> &'static str {
+    "
+    CREATE TABLE IF NOT EXISTS sync_runs (
+        id TEXT PRIMARY KEY,
+        operation TEXT NOT NULL,
+        backend TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at_ms INTEGER NOT NULL,
+        ended_at_ms INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS sync_runs_started_idx
+    ON sync_runs(started_at_ms DESC);
+
+    CREATE TABLE IF NOT EXISTS sync_table_runs (
+        sync_run_id TEXT NOT NULL REFERENCES sync_runs(id) ON DELETE CASCADE,
+        class TEXT NOT NULL,
+        table_name TEXT NOT NULL,
+        row_count INTEGER NOT NULL,
+        inserted_count INTEGER NOT NULL,
+        updated_count INTEGER NOT NULL,
+        skipped_count INTEGER NOT NULL,
+        conflict_count INTEGER NOT NULL,
+        executed INTEGER NOT NULL,
+        PRIMARY KEY (sync_run_id, table_name)
+    );
+
+    CREATE TABLE IF NOT EXISTS sync_table_conflicts (
+        sync_run_id TEXT NOT NULL REFERENCES sync_runs(id) ON DELETE CASCADE,
+        table_name TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        count INTEGER NOT NULL,
+        PRIMARY KEY (sync_run_id, table_name, reason)
+    );
     "
 }
 
