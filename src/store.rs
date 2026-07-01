@@ -15,6 +15,20 @@ const HUGR_DIR: &str = ".hugr";
 const HUGR_DB: &str = "hugr.db";
 const LOCAL_PROJECT_ID: &str = "project_local";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageMode {
+    Local,
+    Hybrid,
+    Remote,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StorageConfig {
+    mode: StorageMode,
+    remote_url: Option<String>,
+    auth_token_configured: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Memory {
     pub id: String,
@@ -26,6 +40,7 @@ pub struct Memory {
 pub struct Store {
     root: PathBuf,
     embedding_provider: Result<SelectedEmbeddingProvider, String>,
+    storage_config: Result<StorageConfig, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +94,7 @@ impl Store {
         Self {
             root: PathBuf::from(HUGR_DIR),
             embedding_provider: SelectedEmbeddingProvider::from_env(),
+            storage_config: StorageConfig::from_env(),
         }
     }
 
@@ -87,6 +103,7 @@ impl Store {
         Self {
             root,
             embedding_provider: Ok(SelectedEmbeddingProvider::default()),
+            storage_config: Ok(StorageConfig::local()),
         }
     }
 
@@ -962,7 +979,22 @@ impl Store {
         }
     }
 
+    pub fn storage_summary(&self) -> String {
+        match self.storage_config() {
+            Ok(config) => config.summary(),
+            Err(error) => format!("configuration error: {error}"),
+        }
+    }
+
     async fn connect(&self) -> Result<Connection, String> {
+        let storage_config = self.storage_config()?;
+        if matches!(storage_config.mode, StorageMode::Remote) {
+            return Err(
+                "HUGR_STORAGE_MODE=remote is configured but remote storage is not implemented yet"
+                    .to_string(),
+            );
+        }
+
         let db = Builder::new_local(self.db_path())
             .build()
             .await
@@ -979,6 +1011,128 @@ impl Store {
             .as_ref()
             .map_err(|error| error.clone())
     }
+
+    fn storage_config(&self) -> Result<&StorageConfig, String> {
+        self.storage_config.as_ref().map_err(|error| error.clone())
+    }
+}
+
+impl StorageMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local" => Ok(Self::Local),
+            "hybrid" => Ok(Self::Hybrid),
+            "remote" => Ok(Self::Remote),
+            unknown => Err(format!(
+                "invalid HUGR_STORAGE_MODE '{unknown}', expected local, hybrid, or remote"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Hybrid => "hybrid",
+            Self::Remote => "remote",
+        }
+    }
+
+    fn requires_remote_config(self) -> bool {
+        matches!(self, Self::Hybrid | Self::Remote)
+    }
+}
+
+impl StorageConfig {
+    fn local() -> Self {
+        Self {
+            mode: StorageMode::Local,
+            remote_url: None,
+            auth_token_configured: false,
+        }
+    }
+
+    fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    fn from_lookup<F>(lookup: F) -> Result<Self, String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let mode = lookup_first(&lookup, &["HUGR_STORAGE_MODE"])
+            .map(|value| StorageMode::parse(&value))
+            .transpose()?
+            .unwrap_or(StorageMode::Local);
+        let remote_url = lookup_first(
+            &lookup,
+            &[
+                "HUGR_REMOTE_DATABASE_URL",
+                "HUGR_LIBSQL_URL",
+                "TURSO_DATABASE_URL",
+                "LIBSQL_URL",
+            ],
+        );
+        let auth_token_configured = lookup_first(
+            &lookup,
+            &[
+                "HUGR_REMOTE_AUTH_TOKEN",
+                "HUGR_LIBSQL_AUTH_TOKEN",
+                "TURSO_AUTH_TOKEN",
+                "LIBSQL_AUTH_TOKEN",
+            ],
+        )
+        .is_some();
+
+        if mode.requires_remote_config() {
+            if remote_url.is_none() {
+                return Err(format!(
+                    "HUGR_STORAGE_MODE={} requires HUGR_REMOTE_DATABASE_URL",
+                    mode.as_str()
+                ));
+            }
+            if !auth_token_configured {
+                return Err(format!(
+                    "HUGR_STORAGE_MODE={} requires HUGR_REMOTE_AUTH_TOKEN",
+                    mode.as_str()
+                ));
+            }
+        }
+
+        Ok(Self {
+            mode,
+            remote_url,
+            auth_token_configured,
+        })
+    }
+
+    fn summary(&self) -> String {
+        let auth_status = if self.auth_token_configured {
+            "auth configured"
+        } else {
+            "auth missing"
+        };
+        match self.mode {
+            StorageMode::Local if self.remote_url.is_some() => {
+                format!("local (remote configured, inactive, {auth_status})")
+            }
+            StorageMode::Local => "local".to_string(),
+            StorageMode::Hybrid => {
+                format!("hybrid (local active, remote sync configured but disabled, {auth_status})")
+            }
+            StorageMode::Remote => format!("remote configured (not implemented, {auth_status})"),
+        }
+    }
+}
+
+fn lookup_first<F>(lookup: &F, names: &[&str]) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    names.iter().find_map(|name| {
+        lookup(name)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 async fn upsert_project(conn: &Connection, project: ProjectInput) -> Result<(), String> {
@@ -1343,7 +1497,7 @@ fn now_ms() -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Memory, Store, fts_query, query_terms, recall_score};
+    use super::{Memory, StorageConfig, StorageMode, Store, fts_query, query_terms, recall_score};
     use crate::code::{CodeReference, CodeSymbol};
     use crate::discovery::FileCandidate;
     use crate::embedding::{DEFAULT_EMBEDDING_DIMENSIONS, DETERMINISTIC_MODEL};
@@ -1376,6 +1530,15 @@ mod tests {
         }
     }
 
+    fn env_lookup<'a>(values: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
     #[test]
     fn recall_scores_query_terms() {
         let memory = Memory {
@@ -1392,6 +1555,66 @@ mod tests {
     fn fts_query_ors_quoted_terms() {
         let terms = query_terms("add plugin hooks");
         assert_eq!(fts_query(&terms), "\"add\" OR \"plugin\" OR \"hooks\"");
+    }
+
+    #[test]
+    fn storage_config_defaults_to_local() {
+        let config = StorageConfig::from_lookup(|_| None).unwrap();
+
+        assert_eq!(config.mode, StorageMode::Local);
+        assert_eq!(config.remote_url, None);
+        assert!(!config.auth_token_configured);
+        assert_eq!(config.summary(), "local");
+    }
+
+    #[test]
+    fn storage_config_reads_hybrid_remote_placeholder() {
+        let config = StorageConfig::from_lookup(env_lookup(&[
+            ("HUGR_STORAGE_MODE", "hybrid"),
+            ("HUGR_REMOTE_DATABASE_URL", "libsql://example.turso.io"),
+            ("HUGR_REMOTE_AUTH_TOKEN", "secret-token"),
+        ]))
+        .unwrap();
+
+        assert_eq!(config.mode, StorageMode::Hybrid);
+        assert_eq!(
+            config.remote_url.as_deref(),
+            Some("libsql://example.turso.io")
+        );
+        assert!(config.auth_token_configured);
+        assert_eq!(
+            config.summary(),
+            "hybrid (local active, remote sync configured but disabled, auth configured)"
+        );
+    }
+
+    #[test]
+    fn storage_config_requires_remote_credentials() {
+        let missing_url =
+            StorageConfig::from_lookup(env_lookup(&[("HUGR_STORAGE_MODE", "hybrid")])).unwrap_err();
+        assert!(missing_url.contains("requires HUGR_REMOTE_DATABASE_URL"));
+
+        let missing_token = StorageConfig::from_lookup(env_lookup(&[
+            ("HUGR_STORAGE_MODE", "hybrid"),
+            ("HUGR_REMOTE_DATABASE_URL", "libsql://example.turso.io"),
+        ]))
+        .unwrap_err();
+        assert!(missing_token.contains("requires HUGR_REMOTE_AUTH_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn remote_storage_mode_does_not_open_local_database() {
+        let mut test = TestStore::new("remote_mode");
+        test.store.storage_config = Ok(StorageConfig {
+            mode: StorageMode::Remote,
+            remote_url: Some("libsql://example.turso.io".to_string()),
+            auth_token_configured: true,
+        });
+
+        let error = test.store.init().await.unwrap_err();
+
+        assert!(error.contains("remote storage is not implemented"));
+        assert!(!test.store.db_path().exists());
     }
 
     #[tokio::test]
