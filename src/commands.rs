@@ -4,7 +4,7 @@ use crate::discovery;
 use crate::impact as impact_analysis;
 use crate::indexer;
 use crate::mcp;
-use crate::store::{Memory, Store};
+use crate::store::{Memory, Store, SyncExecutionPlan, SyncPushResult};
 use crate::worktree;
 use std::fmt::Write;
 use std::path::Path;
@@ -22,6 +22,8 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::SessionStart { task } => session_start(&task).await,
         Command::SessionEvent { kind, detail } => session_event(&kind, &detail).await,
         Command::SessionEnd { summary } => session_end(summary.as_deref()).await,
+        Command::SyncStatus { format } => sync_status(format).await,
+        Command::SyncPush { dry_run, format } => sync_push(dry_run, format).await,
         Command::Mcp => mcp::serve_stdio().await,
         Command::Improve => placeholder("improve", "memory consolidation is not implemented yet"),
         Command::Forget { query } => forget(query),
@@ -204,6 +206,30 @@ async fn session_end(summary: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+async fn sync_status(format: OutputFormat) -> Result<(), String> {
+    let plan = Store::open_current().sync_execution_plan()?;
+
+    if format == OutputFormat::Json {
+        println!("{}", render_sync_status_json(&plan));
+    } else {
+        print!("{}", render_sync_status_text(&plan));
+    }
+
+    Ok(())
+}
+
+async fn sync_push(dry_run: bool, format: OutputFormat) -> Result<(), String> {
+    let result = Store::open_current().sync_push(dry_run).await?;
+
+    if format == OutputFormat::Json {
+        println!("{}", render_sync_push_json(&result));
+    } else {
+        print!("{}", render_sync_push_text(&result));
+    }
+
+    Ok(())
+}
+
 fn forget(query: Option<String>) -> Result<(), String> {
     match query {
         Some(query) => placeholder(
@@ -265,10 +291,116 @@ fn render_recall_json(query: &str, memories: &[Memory]) -> String {
     rendered
 }
 
+fn render_sync_status_text(plan: &SyncExecutionPlan) -> String {
+    let sync_classes = if plan.sync_classes.is_empty() {
+        "none".to_string()
+    } else {
+        plan.sync_classes.join(",")
+    };
+    let explicit_opt_in_classes = if plan.explicit_opt_in_classes.is_empty() {
+        "none".to_string()
+    } else {
+        plan.explicit_opt_in_classes.join(",")
+    };
+
+    format!(
+        "Hugr sync\n  storage_mode: {}\n  backend: {}\n  status: {}\n  local_writes_enabled: {}\n  remote_configured: {}\n  remote_auth_configured: {}\n  remote_reads_enabled: {}\n  remote_writes_enabled: {}\n  sync_classes: {}\n  explicit_opt_in_classes: {}\n",
+        plan.storage_mode,
+        plan.backend,
+        plan.status,
+        plan.local_writes_enabled,
+        plan.remote_configured,
+        plan.remote_auth_configured,
+        plan.remote_reads_enabled,
+        plan.remote_writes_enabled,
+        sync_classes,
+        explicit_opt_in_classes
+    )
+}
+
+fn render_sync_status_json(plan: &SyncExecutionPlan) -> String {
+    format!(
+        "{{\"storage_mode\":{},\"backend\":{},\"status\":{},\"local_writes_enabled\":{},\"remote_configured\":{},\"remote_auth_configured\":{},\"remote_reads_enabled\":{},\"remote_writes_enabled\":{},\"sync_classes\":{},\"explicit_opt_in_classes\":{}}}",
+        json_string(&plan.storage_mode),
+        json_string(&plan.backend),
+        json_string(&plan.status),
+        plan.local_writes_enabled,
+        plan.remote_configured,
+        plan.remote_auth_configured,
+        plan.remote_reads_enabled,
+        plan.remote_writes_enabled,
+        render_string_array_json(&plan.sync_classes),
+        render_string_array_json(&plan.explicit_opt_in_classes)
+    )
+}
+
+fn render_string_array_json(values: &[String]) -> String {
+    let mut rendered = String::from("[");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            rendered.push(',');
+        }
+        rendered.push_str(&json_string(value));
+    }
+    rendered.push(']');
+    rendered
+}
+
+fn render_sync_push_text(result: &SyncPushResult) -> String {
+    let mut rendered = format!(
+        "Hugr sync push\n  mode: {}\n  backend: {}\n  status: {}\n",
+        if result.dry_run { "dry-run" } else { "execute" },
+        result.backend,
+        result.status
+    );
+
+    for table in &result.tables {
+        let _ = writeln!(
+            rendered,
+            "- {}.{}: {} rows ({})",
+            table.class,
+            table.table,
+            table.row_count,
+            if table.executed { "pushed" } else { "planned" }
+        );
+    }
+
+    rendered
+}
+
+fn render_sync_push_json(result: &SyncPushResult) -> String {
+    let mut rendered = format!(
+        "{{\"dry_run\":{},\"backend\":{},\"status\":{},\"tables\":[",
+        result.dry_run,
+        json_string(&result.backend),
+        json_string(&result.status)
+    );
+
+    for (index, table) in result.tables.iter().enumerate() {
+        if index > 0 {
+            rendered.push(',');
+        }
+        let _ = write!(
+            rendered,
+            "{{\"class\":{},\"table\":{},\"row_count\":{},\"executed\":{}}}",
+            json_string(&table.class),
+            json_string(&table.table),
+            table.row_count,
+            table.executed
+        );
+    }
+
+    rendered.push_str("]}");
+    rendered
+}
+
 #[cfg(test)]
 mod tests {
-    use super::render_recall_json;
-    use crate::store::Memory;
+    use super::{
+        render_recall_json, render_sync_push_json, render_sync_push_text, render_sync_status_json,
+        render_sync_status_text,
+    };
+    use crate::store::{Memory, SyncExecutionPlan, SyncPushResult, SyncTableResult};
 
     #[test]
     fn recall_json_includes_query_and_memories() {
@@ -285,5 +417,52 @@ mod tests {
         assert!(json.contains("\"query\":\"plugin hooks\""));
         assert!(json.contains("\"id\":\"mem_1\""));
         assert!(json.contains("\"created_at_ms\":7"));
+    }
+
+    #[test]
+    fn sync_status_renderers_include_execution_plan() {
+        let plan = SyncExecutionPlan {
+            storage_mode: "hybrid".to_string(),
+            backend: "direct_libsql".to_string(),
+            local_writes_enabled: true,
+            remote_configured: true,
+            remote_auth_configured: true,
+            remote_reads_enabled: false,
+            remote_writes_enabled: false,
+            sync_classes: vec!["memories".to_string(), "full_source".to_string()],
+            explicit_opt_in_classes: vec!["full_source".to_string()],
+            status: "planned_remote_sync_disabled".to_string(),
+        };
+
+        let text = render_sync_status_text(&plan);
+        assert!(text.contains("backend: direct_libsql"));
+        assert!(text.contains("explicit_opt_in_classes: full_source"));
+
+        let json = render_sync_status_json(&plan);
+        assert!(json.contains("\"storage_mode\":\"hybrid\""));
+        assert!(json.contains("\"sync_classes\":[\"memories\",\"full_source\"]"));
+    }
+
+    #[test]
+    fn sync_push_renderers_include_table_counts() {
+        let result = SyncPushResult {
+            dry_run: true,
+            backend: "direct_libsql".to_string(),
+            status: "dry_run".to_string(),
+            tables: vec![SyncTableResult {
+                class: "memories".to_string(),
+                table: "memories".to_string(),
+                row_count: 2,
+                executed: false,
+            }],
+        };
+
+        let text = render_sync_push_text(&result);
+        assert!(text.contains("mode: dry-run"));
+        assert!(text.contains("memories.memories: 2 rows"));
+
+        let json = render_sync_push_json(&result);
+        assert!(json.contains("\"dry_run\":true"));
+        assert!(json.contains("\"row_count\":2"));
     }
 }
