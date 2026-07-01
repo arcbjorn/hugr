@@ -1797,6 +1797,130 @@ fn normalized_memory_text(text: &str) -> String {
         .to_lowercase()
 }
 
+fn stale_memory_candidates(memories: &[Memory]) -> Vec<StaleMemoryCandidate> {
+    let analyzed = memories
+        .iter()
+        .map(|memory| {
+            (
+                memory,
+                meaningful_memory_terms(&memory.text),
+                query_terms(&memory.text),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+
+    for left_index in 0..analyzed.len() {
+        for right_index in (left_index + 1)..analyzed.len() {
+            let (left, left_meaningful, left_terms) = &analyzed[left_index];
+            let (right, right_meaningful, right_terms) = &analyzed[right_index];
+            let Some(signal) = opposing_signal(left_terms, right_terms) else {
+                continue;
+            };
+            let mut shared_terms = left_meaningful
+                .iter()
+                .filter(|term| right_meaningful.contains(*term))
+                .cloned()
+                .collect::<Vec<_>>();
+            shared_terms.sort();
+            shared_terms.dedup();
+            if shared_terms.len() < 2 {
+                continue;
+            }
+
+            let (newer_memory, older_memory) = if left.created_at_ms >= right.created_at_ms {
+                ((**left).clone(), (**right).clone())
+            } else {
+                ((**right).clone(), (**left).clone())
+            };
+
+            candidates.push(StaleMemoryCandidate {
+                reason: "opposing_terms".to_string(),
+                signal,
+                shared_terms,
+                newer_memory,
+                older_memory,
+            });
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .newer_memory
+            .created_at_ms
+            .cmp(&left.newer_memory.created_at_ms)
+            .then_with(|| {
+                right
+                    .older_memory
+                    .created_at_ms
+                    .cmp(&left.older_memory.created_at_ms)
+            })
+            .then_with(|| left.signal.cmp(&right.signal))
+    });
+    candidates
+}
+
+fn meaningful_memory_terms(text: &str) -> HashSet<String> {
+    query_terms(text)
+        .into_iter()
+        .filter(|term| !is_memory_stop_term(term) && !is_opposing_signal_term(term))
+        .collect()
+}
+
+fn is_memory_stop_term(term: &str) -> bool {
+    matches!(
+        term,
+        "are"
+            | "but"
+            | "can"
+            | "for"
+            | "had"
+            | "has"
+            | "have"
+            | "now"
+            | "not"
+            | "should"
+            | "that"
+            | "the"
+            | "then"
+            | "this"
+            | "was"
+            | "were"
+            | "when"
+            | "will"
+            | "with"
+    )
+}
+
+fn is_opposing_signal_term(term: &str) -> bool {
+    OPPOSING_MEMORY_SIGNALS
+        .iter()
+        .any(|(left, right, _)| term == *left || term == *right)
+}
+
+fn opposing_signal(left_terms: &[String], right_terms: &[String]) -> Option<String> {
+    for (left, right, signal) in OPPOSING_MEMORY_SIGNALS {
+        let left_has_left = left_terms.iter().any(|term| term == left);
+        let left_has_right = left_terms.iter().any(|term| term == right);
+        let right_has_left = right_terms.iter().any(|term| term == left);
+        let right_has_right = right_terms.iter().any(|term| term == right);
+        if (left_has_left && right_has_right) || (left_has_right && right_has_left) {
+            return Some((*signal).to_string());
+        }
+    }
+    None
+}
+
+const OPPOSING_MEMORY_SIGNALS: &[(&str, &str, &str)] = &[
+    ("after", "before", "after_vs_before"),
+    ("allow", "deny", "allow_vs_deny"),
+    ("allowed", "denied", "allowed_vs_denied"),
+    ("enabled", "disabled", "enabled_vs_disabled"),
+    ("enable", "disable", "enable_vs_disable"),
+    ("present", "absent", "present_vs_absent"),
+    ("true", "false", "true_vs_false"),
+];
+
 async fn finish_sync_table_result(
     conn: &Connection,
     table: SyncTableKind,
@@ -4254,6 +4378,43 @@ mod tests {
             "plugin hooks are loaded"
         );
         assert_eq!(report.duplicate_groups[0].memories.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn memory_maintenance_report_flags_opposing_memory_terms() {
+        let test = TestStore::new("stale_candidates");
+        test.store.init().await.unwrap();
+        let conn = test.store.connect().await.unwrap();
+        insert_memory_for_sync(
+            &conn,
+            "mem_old",
+            "plugin hooks run after configuration is loaded",
+            10,
+        )
+        .await
+        .unwrap();
+        insert_memory_for_sync(
+            &conn,
+            "mem_new",
+            "plugin hooks now run before configuration is loaded",
+            20,
+        )
+        .await
+        .unwrap();
+        insert_memory_for_sync(&conn, "mem_other", "database migrations are recorded", 30)
+            .await
+            .unwrap();
+
+        let report = test.store.memory_maintenance_report().await.unwrap();
+
+        assert_eq!(report.stale_candidates.len(), 1);
+        let candidate = &report.stale_candidates[0];
+        assert_eq!(candidate.reason, "opposing_terms");
+        assert_eq!(candidate.signal, "after_vs_before");
+        assert_eq!(candidate.newer_memory.id, "mem_new");
+        assert_eq!(candidate.older_memory.id, "mem_old");
+        assert!(candidate.shared_terms.contains(&"plugin".to_string()));
+        assert!(candidate.shared_terms.contains(&"hooks".to_string()));
     }
 
     #[tokio::test]
