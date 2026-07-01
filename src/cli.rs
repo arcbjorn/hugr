@@ -44,9 +44,14 @@ pub enum Command {
         format: OutputFormat,
     },
     Mcp,
-    Improve,
+    Improve {
+        execute: bool,
+        duplicates: bool,
+        format: OutputFormat,
+    },
     Forget {
-        query: Option<String>,
+        query: String,
+        format: OutputFormat,
     },
     Doctor,
     Help,
@@ -96,10 +101,21 @@ impl Command {
             "session" => parse_session_command(args),
             "sync" => parse_sync_command(args),
             "mcp" => Ok(Self::Mcp),
-            "improve" => Ok(Self::Improve),
-            "forget" => Ok(Self::Forget {
-                query: optional_text(args),
-            }),
+            "improve" => {
+                let options = improve_options_from(args, 2)?;
+                Ok(Self::Improve {
+                    execute: options.execute,
+                    duplicates: options.duplicates,
+                    format: options.format,
+                })
+            }
+            "forget" => {
+                let text = required_text_output(args, "forget")?;
+                Ok(Self::Forget {
+                    query: text.value,
+                    format: text.format,
+                })
+            }
             "doctor" => Ok(Self::Doctor),
             "help" | "--help" | "-h" => Ok(Self::Help),
             unknown => Err(format!("unknown command '{unknown}'")),
@@ -168,6 +184,12 @@ fn parse_sync_command(args: &[String]) -> Result<Command, String> {
 
 struct SyncPushOptions {
     dry_run: bool,
+    format: OutputFormat,
+}
+
+struct ImproveOptions {
+    execute: bool,
+    duplicates: bool,
     format: OutputFormat,
 }
 
@@ -250,8 +272,29 @@ fn sync_push_options_from(args: &[String], start: usize) -> Result<SyncPushOptio
     Ok(SyncPushOptions { dry_run, format })
 }
 
+fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions, String> {
+    let mut execute = false;
+    let mut duplicates = false;
+    let mut format = OutputFormat::Markdown;
+
+    for arg in args.iter().skip(start) {
+        match arg.as_str() {
+            "--execute" => execute = true,
+            "--duplicates" => duplicates = true,
+            "--json" => format = OutputFormat::Json,
+            unknown => return Err(format!("unknown option '{unknown}'")),
+        }
+    }
+
+    Ok(ImproveOptions {
+        execute,
+        duplicates,
+        format,
+    })
+}
+
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr impact [--json] <file-or-symbol>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr mcp\n  hugr improve\n  hugr forget [query]\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr impact [--json] <file-or-symbol>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr mcp\n  hugr improve [--execute] [--duplicates] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
 }
 
 #[cfg(test)]
@@ -455,11 +498,56 @@ mod tests {
     }
 
     #[test]
+    fn parses_memory_maintenance_commands() {
+        assert_eq!(
+            Command::parse(&["hugr".into(), "improve".into(), "--json".into()]),
+            Ok(Command::Improve {
+                execute: false,
+                duplicates: false,
+                format: OutputFormat::Json
+            })
+        );
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "improve".into(),
+                "--execute".into(),
+                "--duplicates".into(),
+                "--json".into()
+            ]),
+            Ok(Command::Improve {
+                execute: true,
+                duplicates: true,
+                format: OutputFormat::Json
+            })
+        );
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "forget".into(),
+                "--json".into(),
+                "plugin".into(),
+                "hooks".into()
+            ]),
+            Ok(Command::Forget {
+                query: "plugin hooks".into(),
+                format: OutputFormat::Json
+            })
+        );
+    }
+
+    #[test]
     fn rejects_missing_text() {
         let args = vec!["hugr".into(), "remember".into()];
         assert_eq!(
             Command::parse(&args),
             Err("hugr remember requires text".into())
+        );
+
+        let args = vec!["hugr".into(), "forget".into()];
+        assert_eq!(
+            Command::parse(&args),
+            Err("hugr forget requires text".into())
         );
     }
 }
