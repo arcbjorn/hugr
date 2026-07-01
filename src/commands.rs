@@ -5,11 +5,12 @@ use crate::impact as impact_analysis;
 use crate::indexer;
 use crate::mcp;
 use crate::store::{
-    ForgetResult, Memory, MemoryConsolidationResult, MemoryMaintenanceReport, Store,
-    SyncConflictSummary, SyncExecutionPlan, SyncPullResult, SyncPushResult, SyncRunHistory,
-    SyncTableResult,
+    ForgetResult, Memory, MemoryConsolidationResult, MemoryMaintenanceReport,
+    StaleRetirementResult, Store, SyncConflictSummary, SyncExecutionPlan, SyncPullResult,
+    SyncPushResult, SyncRunHistory, SyncTableResult,
 };
 use crate::worktree;
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::Path;
 
@@ -34,8 +35,9 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::Improve {
             execute,
             duplicates,
+            stale,
             format,
-        } => improve(execute, duplicates, format).await,
+        } => improve(execute, duplicates, stale, format).await,
         Command::Forget { query, format } => forget(&query, format).await,
         Command::Doctor => doctor().await,
         Command::Help => {
@@ -117,6 +119,20 @@ async fn context(task: &str, format: OutputFormat) -> Result<(), String> {
 pub(crate) async fn compile_context_pack(task: &str) -> Result<ContextPack, String> {
     let store = Store::open_current();
     let memories = store.recall(task, 5).await?;
+    let relevant_memory_ids = memories
+        .iter()
+        .map(|memory| memory.id.clone())
+        .collect::<HashSet<_>>();
+    let stale_candidates = store
+        .memory_maintenance_report()
+        .await?
+        .stale_candidates
+        .into_iter()
+        .filter(|candidate| {
+            relevant_memory_ids.contains(&candidate.newer_memory.id)
+                || relevant_memory_ids.contains(&candidate.older_memory.id)
+        })
+        .collect::<Vec<_>>();
     let sessions = store.recent_session_facts(task, 5).await?;
     let file_candidates = discovery::discover_candidate_files(Path::new("."), task, 12)?;
     indexer::index_candidates(&store, Path::new("."), &file_candidates).await?;
@@ -127,15 +143,18 @@ pub(crate) async fn compile_context_pack(task: &str) -> Result<ContextPack, Stri
         .collect::<Vec<_>>();
     let affected_tests = store.likely_tests_for_files(&files, 5).await?;
     let branch_state = worktree::inspect(Path::new("."));
-    Ok(ContextPack::with_sessions_symbols_tests_and_branch(
-        task,
-        files,
-        memories,
-        sessions,
-        symbols,
-        affected_tests,
-        Some(branch_state),
-    ))
+    Ok(
+        ContextPack::with_sessions_symbols_tests_branch_and_stale_risks(
+            task,
+            files,
+            memories,
+            sessions,
+            symbols,
+            affected_tests,
+            Some(branch_state),
+            stale_candidates,
+        ),
+    )
 }
 
 async fn index() -> Result<(), String> {
@@ -264,18 +283,35 @@ async fn sync_history(format: OutputFormat) -> Result<(), String> {
     Ok(())
 }
 
-async fn improve(execute: bool, duplicates: bool, format: OutputFormat) -> Result<(), String> {
+async fn improve(
+    execute: bool,
+    duplicates: bool,
+    stale: bool,
+    format: OutputFormat,
+) -> Result<(), String> {
     if execute {
-        if !duplicates {
-            return Err("hugr improve --execute requires --duplicates".to_string());
+        if duplicates == stale {
+            return Err(
+                "hugr improve --execute requires exactly one of --duplicates or --stale"
+                    .to_string(),
+            );
         }
-        let result = Store::open_current()
-            .consolidate_duplicate_memories()
-            .await?;
-        if format == OutputFormat::Json {
-            println!("{}", render_consolidation_json(&result));
+        if duplicates {
+            let result = Store::open_current()
+                .consolidate_duplicate_memories()
+                .await?;
+            if format == OutputFormat::Json {
+                println!("{}", render_consolidation_json(&result));
+            } else {
+                print!("{}", render_consolidation_text(&result));
+            }
         } else {
-            print!("{}", render_consolidation_text(&result));
+            let result = Store::open_current().retire_stale_memories().await?;
+            if format == OutputFormat::Json {
+                println!("{}", render_stale_retirement_json(&result));
+            } else {
+                print!("{}", render_stale_retirement_text(&result));
+            }
         }
         return Ok(());
     }
@@ -525,6 +561,43 @@ fn render_consolidation_json(result: &MemoryConsolidationResult) -> String {
     )
 }
 
+fn render_stale_retirement_text(result: &StaleRetirementResult) -> String {
+    let mut rendered = format!(
+        "Hugr improve\n  action: stale\n  executed_at: {}\n  stale_candidates: {}\n  kept: {}\n  retired: {}\n",
+        result.executed_at,
+        result.stale_candidates.len(),
+        result.kept_memories.len(),
+        result.retired_memories.len()
+    );
+
+    for memory in &result.kept_memories {
+        let _ = writeln!(
+            rendered,
+            "- kept {} [{}]: {}",
+            memory.id, memory.kind, memory.text
+        );
+    }
+    for memory in &result.retired_memories {
+        let _ = writeln!(
+            rendered,
+            "- retired {} [{}]: {}",
+            memory.id, memory.kind, memory.text
+        );
+    }
+
+    rendered
+}
+
+fn render_stale_retirement_json(result: &StaleRetirementResult) -> String {
+    format!(
+        "{{\"action\":\"stale\",\"executed_at\":{},\"stale_candidates\":{},\"kept_memories\":{},\"retired_memories\":{}}}",
+        json_string(&result.executed_at),
+        render_stale_candidates_json(&result.stale_candidates),
+        render_memory_list_json(&result.kept_memories),
+        render_memory_list_json(&result.retired_memories)
+    )
+}
+
 fn render_sync_status_text(plan: &SyncExecutionPlan) -> String {
     let sync_classes = if plan.sync_classes.is_empty() {
         "none".to_string()
@@ -767,14 +840,15 @@ mod tests {
     use super::{
         render_consolidation_json, render_consolidation_text, render_forget_json,
         render_forget_text, render_improve_json, render_improve_text, render_recall_json,
-        render_sync_history_json, render_sync_history_text, render_sync_pull_json,
-        render_sync_pull_text, render_sync_push_json, render_sync_push_text,
-        render_sync_status_json, render_sync_status_text,
+        render_stale_retirement_json, render_stale_retirement_text, render_sync_history_json,
+        render_sync_history_text, render_sync_pull_json, render_sync_pull_text,
+        render_sync_push_json, render_sync_push_text, render_sync_status_json,
+        render_sync_status_text,
     };
     use crate::store::{
         DuplicateMemoryGroup, ForgetResult, Memory, MemoryConsolidationResult,
-        MemoryMaintenanceReport, StaleMemoryCandidate, SyncConflictSummary, SyncExecutionPlan,
-        SyncPullResult, SyncPushResult, SyncRunHistory, SyncTableResult,
+        MemoryMaintenanceReport, StaleMemoryCandidate, StaleRetirementResult, SyncConflictSummary,
+        SyncExecutionPlan, SyncPullResult, SyncPushResult, SyncRunHistory, SyncTableResult,
     };
 
     #[test]
@@ -911,6 +985,51 @@ mod tests {
         let json = render_consolidation_json(&result);
         assert!(json.contains("\"action\":\"duplicates\""));
         assert!(json.contains("\"id\":\"mem_retire\""));
+    }
+
+    #[test]
+    fn stale_retirement_renderers_include_retired_memories() {
+        let result = StaleRetirementResult {
+            executed_at: "42".to_string(),
+            stale_candidates: vec![StaleMemoryCandidate {
+                reason: "opposing_terms".to_string(),
+                signal: "after_vs_before".to_string(),
+                shared_terms: vec!["hooks".to_string(), "plugin".to_string(), "run".to_string()],
+                newer_memory: Memory {
+                    id: "mem_new".to_string(),
+                    created_at_ms: 8,
+                    kind: "fact".to_string(),
+                    text: "plugin hooks run before configuration".to_string(),
+                },
+                older_memory: Memory {
+                    id: "mem_old".to_string(),
+                    created_at_ms: 7,
+                    kind: "fact".to_string(),
+                    text: "plugin hooks run after configuration".to_string(),
+                },
+            }],
+            kept_memories: vec![Memory {
+                id: "mem_new".to_string(),
+                created_at_ms: 8,
+                kind: "fact".to_string(),
+                text: "plugin hooks run before configuration".to_string(),
+            }],
+            retired_memories: vec![Memory {
+                id: "mem_old".to_string(),
+                created_at_ms: 7,
+                kind: "fact".to_string(),
+                text: "plugin hooks run after configuration".to_string(),
+            }],
+        };
+
+        let text = render_stale_retirement_text(&result);
+        assert!(text.contains("action: stale"));
+        assert!(text.contains("retired: 1"));
+
+        let json = render_stale_retirement_json(&result);
+        assert!(json.contains("\"action\":\"stale\""));
+        assert!(json.contains("\"signal\":\"after_vs_before\""));
+        assert!(json.contains("\"id\":\"mem_old\""));
     }
 
     #[test]
