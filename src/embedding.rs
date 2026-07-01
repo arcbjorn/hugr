@@ -1,5 +1,12 @@
+use serde_json::{Value, json};
+use std::env;
+use std::io::Write as _;
+use std::process::{Command as ProcessCommand, Stdio};
+
 pub(crate) const DEFAULT_EMBEDDING_DIMENSIONS: usize = 1536;
 pub(crate) const DETERMINISTIC_MODEL: &str = "hugr-deterministic-v1";
+const DEFAULT_OPENAI_EMBEDDING_MODEL: &str = "text-embedding-3-small";
+const DEFAULT_OPENAI_EMBEDDING_URL: &str = "https://api.openai.com/v1/embeddings";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Embedding {
@@ -37,6 +44,129 @@ pub(crate) trait EmbeddingProvider {
     fn model(&self) -> &str;
     fn dimensions(&self) -> usize;
     fn embed(&self, text: &str) -> Result<Embedding, String>;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum SelectedEmbeddingProvider {
+    Deterministic(DeterministicEmbeddingProvider),
+    OpenAi(OpenAiEmbeddingProvider),
+}
+
+impl SelectedEmbeddingProvider {
+    pub fn from_env() -> Result<Self, String> {
+        EmbeddingProviderConfig::from_env()?.provider()
+    }
+}
+
+impl Default for SelectedEmbeddingProvider {
+    fn default() -> Self {
+        Self::Deterministic(DeterministicEmbeddingProvider::default())
+    }
+}
+
+impl EmbeddingProvider for SelectedEmbeddingProvider {
+    fn model(&self) -> &str {
+        match self {
+            Self::Deterministic(provider) => provider.model(),
+            Self::OpenAi(provider) => provider.model(),
+        }
+    }
+
+    fn dimensions(&self) -> usize {
+        match self {
+            Self::Deterministic(provider) => provider.dimensions(),
+            Self::OpenAi(provider) => provider.dimensions(),
+        }
+    }
+
+    fn embed(&self, text: &str) -> Result<Embedding, String> {
+        match self {
+            Self::Deterministic(provider) => provider.embed(text),
+            Self::OpenAi(provider) => provider.embed(text),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EmbeddingProviderConfig {
+    Deterministic {
+        dimensions: usize,
+    },
+    OpenAi {
+        api_key: String,
+        model: String,
+        url: String,
+        dimensions: usize,
+    },
+}
+
+impl EmbeddingProviderConfig {
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|key| env::var(key).ok())
+    }
+
+    fn provider(self) -> Result<SelectedEmbeddingProvider, String> {
+        match self {
+            Self::Deterministic { dimensions } => Ok(SelectedEmbeddingProvider::Deterministic(
+                DeterministicEmbeddingProvider::new(dimensions)?,
+            )),
+            Self::OpenAi {
+                api_key,
+                model,
+                url,
+                dimensions,
+            } => Ok(SelectedEmbeddingProvider::OpenAi(OpenAiEmbeddingProvider {
+                api_key,
+                model,
+                url,
+                dimensions,
+            })),
+        }
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let provider = lookup("HUGR_EMBEDDING_PROVIDER")
+            .unwrap_or_else(|| "deterministic".to_string())
+            .trim()
+            .to_lowercase();
+        let dimensions = lookup("HUGR_EMBEDDING_DIMENSIONS")
+            .as_deref()
+            .map(parse_dimensions)
+            .transpose()?
+            .unwrap_or(DEFAULT_EMBEDDING_DIMENSIONS);
+
+        match provider.as_str() {
+            "deterministic" | "local" | "offline" => Ok(Self::Deterministic { dimensions }),
+            "openai" => {
+                let api_key = lookup("HUGR_OPENAI_API_KEY")
+                    .or_else(|| lookup("OPENAI_API_KEY"))
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        "HUGR_EMBEDDING_PROVIDER=openai requires HUGR_OPENAI_API_KEY or OPENAI_API_KEY"
+                            .to_string()
+                    })?;
+                let model = lookup("HUGR_OPENAI_EMBEDDING_MODEL")
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| DEFAULT_OPENAI_EMBEDDING_MODEL.to_string());
+                let url = lookup("HUGR_OPENAI_EMBEDDING_URL")
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| DEFAULT_OPENAI_EMBEDDING_URL.to_string());
+
+                Ok(Self::OpenAi {
+                    api_key,
+                    model,
+                    url,
+                    dimensions,
+                })
+            }
+            unknown => Err(format!(
+                "unknown embedding provider '{unknown}'; expected deterministic or openai"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +217,141 @@ impl EmbeddingProvider for DeterministicEmbeddingProvider {
             model: self.model().to_string(),
             vector,
         })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OpenAiEmbeddingProvider {
+    api_key: String,
+    model: String,
+    url: String,
+    dimensions: usize,
+}
+
+impl EmbeddingProvider for OpenAiEmbeddingProvider {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    fn embed(&self, text: &str) -> Result<Embedding, String> {
+        let body = openai_embedding_request(&self.model, text);
+        let response = post_json_with_curl(&self.url, &self.api_key, &body)?;
+        parse_openai_embedding_response(&response, &self.model, self.dimensions)
+    }
+}
+
+fn openai_embedding_request(model: &str, text: &str) -> Value {
+    json!({
+        "model": model,
+        "input": text
+    })
+}
+
+fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String, String> {
+    let mut child = ProcessCommand::new("curl")
+        .args([
+            "-fsS",
+            "-X",
+            "POST",
+            url,
+            "-H",
+            "Content-Type: application/json",
+            "-H",
+            &format!("Authorization: Bearer {api_key}"),
+            "--data-binary",
+            "@-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to execute curl for embeddings: {error}"))?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "failed to open curl stdin".to_string())?;
+        stdin
+            .write_all(body.to_string().as_bytes())
+            .map_err(|error| format!("failed to write embedding request: {error}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to read embedding response: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            return Err(format!("embedding request failed with status {}", output.status));
+        }
+        return Err(format!("embedding request failed: {stderr}"));
+    }
+
+    String::from_utf8(output.stdout).map_err(|error| error.to_string())
+}
+
+fn parse_openai_embedding_response(
+    response: &str,
+    fallback_model: &str,
+    expected_dimensions: usize,
+) -> Result<Embedding, String> {
+    let value = serde_json::from_str::<Value>(response).map_err(|error| error.to_string())?;
+    if let Some(message) = value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+    {
+        return Err(format!("embedding request failed: {message}"));
+    }
+
+    let embedding = value
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|data| data.first())
+        .and_then(|item| item.get("embedding"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "embedding response did not include data[0].embedding".to_string())?;
+    let vector = embedding
+        .iter()
+        .map(|value| {
+            value
+                .as_f64()
+                .map(|value| value as f32)
+                .ok_or_else(|| "embedding response included a non-numeric value".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if vector.len() != expected_dimensions {
+        return Err(format!(
+            "embedding response dimensions {} did not match expected {}",
+            vector.len(),
+            expected_dimensions
+        ));
+    }
+
+    let model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_model)
+        .to_string();
+
+    Ok(Embedding { model, vector })
+}
+
+fn parse_dimensions(value: &str) -> Result<usize, String> {
+    let dimensions = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|error| format!("invalid HUGR_EMBEDDING_DIMENSIONS: {error}"))?;
+    if dimensions == 0 {
+        Err("embedding dimensions must be greater than zero".to_string())
+    } else {
+        Ok(dimensions)
     }
 }
 
