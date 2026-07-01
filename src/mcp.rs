@@ -159,10 +159,11 @@ async fn tool_recall(arguments: &Value) -> Result<Value, String> {
 }
 
 async fn tool_project_status() -> Result<Value, String> {
-    let project = Store::open_current().sync_current_project().await?;
+    let store = Store::open_current();
+    let project = store.sync_current_project().await?;
     Ok(tool_result(
         format!("project {} at {}", project.name, project.root_path),
-        json!({ "project": project_json(&project) }),
+        json!({ "project": project_json(&project), "storage": store.storage_summary() }),
     ))
 }
 
