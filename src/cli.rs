@@ -40,6 +40,9 @@ pub enum Command {
         dry_run: bool,
         format: OutputFormat,
     },
+    SyncHistory {
+        format: OutputFormat,
+    },
     Mcp,
     Improve,
     Forget {
@@ -155,6 +158,9 @@ fn parse_sync_command(args: &[String]) -> Result<Command, String> {
                 format: options.format,
             })
         }
+        Some("history") => Ok(Command::SyncHistory {
+            format: output_format_from(args, 3)?,
+        }),
         Some(unknown) => Err(format!("unknown sync command '{unknown}'")),
         None => Err("hugr sync requires a subcommand".to_string()),
     }
@@ -245,7 +251,7 @@ fn sync_push_options_from(args: &[String], start: usize) -> Result<SyncPushOptio
 }
 
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr impact [--json] <file-or-symbol>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr mcp\n  hugr improve\n  hugr forget [query]\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr impact [--json] <file-or-symbol>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr mcp\n  hugr improve\n  hugr forget [query]\n  hugr doctor\n"
 }
 
 #[cfg(test)]
@@ -416,6 +422,27 @@ mod tests {
             ]),
             Ok(Command::SyncPull {
                 dry_run: false,
+                format: OutputFormat::Json
+            })
+        );
+    }
+
+    #[test]
+    fn parses_sync_history() {
+        assert_eq!(
+            Command::parse(&["hugr".into(), "sync".into(), "history".into()]),
+            Ok(Command::SyncHistory {
+                format: OutputFormat::Markdown
+            })
+        );
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "sync".into(),
+                "history".into(),
+                "--json".into()
+            ]),
+            Ok(Command::SyncHistory {
                 format: OutputFormat::Json
             })
         );
