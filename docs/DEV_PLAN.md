@@ -42,13 +42,14 @@ Implemented:
 - important symbol citations in context packs
 - `hugr impact <file-or-symbol>` for direct indexed impact reports
 - local branch, upstream, ahead/behind, and worktree changes in context packs
+- environment-driven cloud/hybrid storage config placeholders with redacted status output
 - initial vision, storage, and technical blueprint docs
 
 Not implemented yet:
 
 - tree-sitter-backed parsing for additional languages beyond Rust, Python, TypeScript, and Go
 - richer symbol graph edges
-- cloud or hybrid sync
+- cloud or hybrid sync execution
 
 ## Runtime Decision
 
@@ -346,6 +347,13 @@ Tasks:
   - private notes
 - Add config placeholders for remote URL and auth token.
 
+Implemented first slice:
+
+- `HUGR_STORAGE_MODE=local|hybrid|remote` is parsed and validated.
+- `HUGR_REMOTE_DATABASE_URL` and `HUGR_REMOTE_AUTH_TOKEN` placeholders are recognized, with common libSQL/Turso aliases.
+- CLI status, project status, doctor, and MCP project status expose redacted storage configuration.
+- Remote mode fails closed instead of silently writing to the local database; hybrid mode keeps local storage active while remote sync remains disabled.
+
 Open questions:
 
 - Should cloud mode be direct remote libSQL first, or a Hugr API service first?
@@ -374,6 +382,7 @@ Recommended next commits:
 17. Done: `feat(parser): use tree-sitter python`
 18. Done: `feat(parser): use tree-sitter typescript`
 19. Done: `feat(parser): use tree-sitter go`
+20. Done: `feat(config): add storage mode placeholders`
 
 Each commit should leave the CLI usable.
 
@@ -390,6 +399,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add cloud and hybrid configuration.
+Define cloud and hybrid sync classes.
 
-That is the right next step because Hugr now has parser-backed extraction for the first practical Rust, Python, TypeScript, and Go slice while keeping the line-scanner fallback. The next useful layer is defining the remote libSQL/Turso configuration boundary without syncing source contents by default.
+That is the right next step because Hugr now has a validated remote configuration boundary without syncing source contents by default. The next useful layer is representing sync classes so memories, sessions, embeddings, and code indexes can be opted in independently before any remote execution is wired up.
