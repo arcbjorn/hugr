@@ -490,11 +490,11 @@ mod tests {
             local_writes_enabled: true,
             remote_configured: true,
             remote_auth_configured: true,
-            remote_reads_enabled: false,
-            remote_writes_enabled: false,
+            remote_reads_enabled: true,
+            remote_writes_enabled: true,
             sync_classes: vec!["memories".to_string(), "full_source".to_string()],
             explicit_opt_in_classes: vec!["full_source".to_string()],
-            status: "planned_remote_sync_disabled".to_string(),
+            status: "remote_sync_ready".to_string(),
         };
 
         let text = render_sync_status_text(&plan);
