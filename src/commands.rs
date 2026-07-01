@@ -226,6 +226,10 @@ async fn doctor() -> Result<(), String> {
     println!("  store_exists: {}", store.exists());
     println!("  store_root: {}", store.root().display());
     println!("  memories_readable: {}", store.memories().await.is_ok());
+    println!(
+        "  embedding_provider: {}",
+        store.embedding_provider_summary()
+    );
     Ok(())
 }
 
