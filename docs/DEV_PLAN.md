@@ -48,6 +48,9 @@ Implemented:
 - guarded `hugr sync push` dry-run and explicit execution path for safe sync classes
 - guarded `hugr sync pull` dry-run and explicit execution path for safe sync classes
 - `hugr sync history` with per-table sync counters and conflict summaries
+- `hugr forget [--json] <query>` soft-retires active memories by setting `valid_to`
+- `hugr improve [--json]` reports active/retired memory counts and exact duplicate active-memory groups
+- `hugr improve --execute --duplicates [--json]` retires older duplicate memories and points them at the kept fact
 - initial vision, storage, and technical blueprint docs
 
 Not implemented yet:
@@ -55,7 +58,7 @@ Not implemented yet:
 - tree-sitter-backed parsing for additional languages beyond Rust, Python, TypeScript, and Go
 - richer symbol graph edges
 - remote-only storage execution and the Hugr API sync backend
-- concrete memory maintenance flows behind `hugr improve` and `hugr forget`
+- richer stale or contradicted fact detection
 
 ## Runtime Decision
 
@@ -128,17 +131,17 @@ The product should avoid becoming a generic note database or a dashboard-first a
 
 ## Next Session Goal
 
-Build the first concrete memory maintenance flow.
+Build deterministic stale-fact detection.
 
 Target outcome:
 
 ```bash
 hugr remember "plugin hooks run after configuration is loaded"
-hugr forget "plugin hooks"
-hugr recall "plugin hooks"
+hugr remember "plugin hooks now run before configuration is loaded"
+hugr improve --json
 ```
 
-The CLI should let users inspect and retire stale or unwanted memories without editing the database directly.
+The report should identify likely contradictory memories so a later execution path can retire stale facts with clear evidence.
 
 ## Phase 1: Make Storage Real
 
@@ -376,6 +379,33 @@ Open questions:
 - Should cloud mode stay on direct remote libSQL first, or move behind a Hugr API service before broader use?
 - How long should sync history be retained before pruning?
 
+## Phase 11: Memory Maintenance
+
+Tasks:
+
+- Keep ordinary recall and context generation limited to active memories.
+- Soft-retire memories instead of physically deleting rows.
+- Add `hugr forget [--json] <query>` for term-based memory retirement.
+- Add `hugr improve [--json]` for maintenance inspection.
+- Surface active and retired memory counts.
+- Detect exact duplicate active-memory groups.
+- Wire `hugr_forget` through MCP.
+
+Implemented first slice:
+
+- `hugr forget [--json] <query>` matches active memories by query terms, sets `valid_to`, and returns the retired rows.
+- Retired memories stay in `memories` for audit/sync but are excluded from `memories()`, FTS recall, vector recall, and context packs.
+- `hugr improve [--json]` renders active count, retired count, and exact duplicate active-memory groups.
+- `hugr improve --execute --duplicates [--json]` keeps the newest duplicate in each exact group, retires older duplicates, and writes `superseded_by`.
+- `hugr_forget` now uses the same soft-retire behavior through MCP.
+- Hybrid pull can propagate remote memory retirement metadata without overwriting local memory text.
+
+Open questions:
+
+- Should `hugr improve --execute` support multiple maintenance actions at once, or require one explicit action flag per run?
+- Should retired memories remain syncable forever, or be pruned after a retention window?
+- What stale-fact signals should be deterministic before introducing LLM-assisted consolidation?
+
 ## Near-Term Implementation Order
 
 Recommended next commits:
@@ -405,6 +435,8 @@ Recommended next commits:
 23. Done: `feat(sync): push safe sync classes`
 24. Done: `feat(sync): pull safe sync classes`
 25. Done: `feat(sync): report conflicts and history`
+26. Done: `feat(memory): soft forget memories`
+27. Done: `feat(memory): consolidate duplicates`
 
 Each commit should leave the CLI usable.
 
@@ -421,6 +453,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Implement memory maintenance workflows.
+Add deterministic stale-fact detection.
 
-That is the right next step because `hugr improve` and `hugr forget` are still placeholders while the store already has recall, sessions, and syncable memory records. Users need a supported way to inspect, retire, and eventually consolidate stale facts without editing `.hugr/hugr.db` directly.
+That is the right next step because Hugr can now retire memories and consolidate exact duplicates. The remaining maintenance gap is detecting likely contradictions or stale facts without relying on an LLM, then surfacing those candidates in `hugr improve --json`.
