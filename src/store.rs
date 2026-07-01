@@ -2460,11 +2460,16 @@ async fn pull_memories(
         let affected = local_conn
             .execute(
                 "
-                INSERT OR IGNORE INTO memories (
+                INSERT INTO memories (
                     id, created_at_ms, kind, text, confidence, valid_from, valid_to,
                     superseded_by, sensitivity, structured_payload
                 )
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT(id) DO UPDATE SET
+                    valid_to = COALESCE(memories.valid_to, excluded.valid_to),
+                    superseded_by = COALESCE(memories.superseded_by, excluded.superseded_by)
+                WHERE (memories.valid_to IS NULL AND excluded.valid_to IS NOT NULL)
+                   OR (memories.superseded_by IS NULL AND excluded.superseded_by IS NOT NULL)
                 ",
                 params![
                     row.get::<String>(0).map_err(|error| error.to_string())?,
