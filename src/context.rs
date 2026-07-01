@@ -1,5 +1,5 @@
 use crate::code::CodeSymbol;
-use crate::store::{Memory, SessionFact};
+use crate::store::{Memory, SessionFact, StaleMemoryCandidate};
 use crate::testmap::TestCandidate;
 use crate::worktree::WorktreeState;
 use std::fmt::Write;
@@ -11,6 +11,7 @@ pub struct ContextPack {
     pub important_symbols: Vec<ContextSymbol>,
     pub affected_tests: Vec<ContextTest>,
     pub relevant_memories: Vec<ContextMemory>,
+    pub stale_memory_risks: Vec<ContextStaleMemoryRisk>,
     pub recent_sessions: Vec<ContextSessionFact>,
     pub branch_state: Option<ContextBranchState>,
     pub suggested_path: Vec<String>,
@@ -48,6 +49,16 @@ pub struct ContextMemory {
     pub created_at_ms: i64,
     pub kind: String,
     pub text: String,
+    pub citation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextStaleMemoryRisk {
+    pub reason: String,
+    pub signal: String,
+    pub shared_terms: Vec<String>,
+    pub newer_memory: ContextMemory,
+    pub older_memory: ContextMemory,
     pub citation_id: String,
 }
 
@@ -109,6 +120,7 @@ impl ContextPack {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_sessions_symbols_tests_and_branch(
         task: &str,
         files: Vec<String>,
@@ -117,6 +129,28 @@ impl ContextPack {
         symbols: Vec<CodeSymbol>,
         tests: Vec<TestCandidate>,
         branch_state: Option<WorktreeState>,
+    ) -> Self {
+        Self::with_sessions_symbols_tests_branch_and_stale_risks(
+            task,
+            files,
+            memories,
+            sessions,
+            symbols,
+            tests,
+            branch_state,
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn with_sessions_symbols_tests_branch_and_stale_risks(
+        task: &str,
+        files: Vec<String>,
+        memories: Vec<Memory>,
+        sessions: Vec<SessionFact>,
+        symbols: Vec<CodeSymbol>,
+        tests: Vec<TestCandidate>,
+        branch_state: Option<WorktreeState>,
+        stale_candidates: Vec<StaleMemoryCandidate>,
     ) -> Self {
         let relevant_files = files
             .into_iter()
@@ -151,12 +185,21 @@ impl ContextPack {
             .collect::<Vec<_>>();
         let relevant_memories = memories
             .into_iter()
-            .map(|memory| ContextMemory {
-                citation_id: memory.id.clone(),
-                id: memory.id,
-                created_at_ms: memory.created_at_ms,
-                kind: memory.kind,
-                text: memory.text,
+            .map(context_memory_from)
+            .collect::<Vec<_>>();
+        let stale_memory_risks = stale_candidates
+            .into_iter()
+            .map(|candidate| {
+                let newer_memory = context_memory_from(candidate.newer_memory);
+                let older_memory = context_memory_from(candidate.older_memory);
+                ContextStaleMemoryRisk {
+                    citation_id: format!("stale:{}:{}", older_memory.id, newer_memory.id),
+                    reason: candidate.reason,
+                    signal: candidate.signal,
+                    shared_terms: candidate.shared_terms,
+                    newer_memory,
+                    older_memory,
+                }
             })
             .collect::<Vec<_>>();
         let recent_sessions = sessions
@@ -214,6 +257,14 @@ impl ContextPack {
             source_type: "memory".to_string(),
             label: memory.text.clone(),
         }));
+        citations.extend(stale_memory_risks.iter().map(|risk| Citation {
+            id: risk.citation_id.clone(),
+            source_type: "stale_memory".to_string(),
+            label: format!(
+                "{}: older {} conflicts with newer {}",
+                risk.signal, risk.older_memory.id, risk.newer_memory.id
+            ),
+        }));
         citations.extend(recent_sessions.iter().map(|fact| Citation {
             id: fact.citation_id.clone(),
             source_type: "session".to_string(),
@@ -226,6 +277,7 @@ impl ContextPack {
             important_symbols,
             affected_tests,
             relevant_memories,
+            stale_memory_risks,
             recent_sessions,
             branch_state,
             suggested_path: vec![
@@ -296,6 +348,34 @@ impl ContextPack {
                     rendered,
                     "- {} [{}]: {}",
                     memory.id, memory.kind, memory.text
+                );
+            }
+        }
+        rendered.push('\n');
+
+        rendered.push_str("## Stale Memory Risks\n");
+        if self.stale_memory_risks.is_empty() {
+            rendered.push_str("No stale memory risks detected for this task.\n");
+        } else {
+            for risk in &self.stale_memory_risks {
+                let _ = writeln!(
+                    rendered,
+                    "- {} [{}]: older {} may be stale; newer {} shares {}",
+                    risk.signal,
+                    risk.citation_id,
+                    risk.older_memory.id,
+                    risk.newer_memory.id,
+                    risk.shared_terms.join(",")
+                );
+                let _ = writeln!(
+                    rendered,
+                    "  - older [{}]: {}",
+                    risk.older_memory.kind, risk.older_memory.text
+                );
+                let _ = writeln!(
+                    rendered,
+                    "  - newer [{}]: {}",
+                    risk.newer_memory.kind, risk.newer_memory.text
                 );
             }
         }
@@ -431,6 +511,30 @@ impl ContextPack {
         }
         rendered.push_str("],");
 
+        rendered.push_str("\"stale_memory_risks\":[");
+        for (index, risk) in self.stale_memory_risks.iter().enumerate() {
+            if index > 0 {
+                rendered.push(',');
+            }
+            let shared_terms = risk
+                .shared_terms
+                .iter()
+                .map(|term| json_string(term))
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = write!(
+                rendered,
+                "{{\"reason\":{},\"signal\":{},\"shared_terms\":[{}],\"newer_memory\":{},\"older_memory\":{},\"citation_id\":{}}}",
+                json_string(&risk.reason),
+                json_string(&risk.signal),
+                shared_terms,
+                render_context_memory_json(&risk.newer_memory),
+                render_context_memory_json(&risk.older_memory),
+                json_string(&risk.citation_id)
+            );
+        }
+        rendered.push_str("],");
+
         rendered.push_str("\"recent_sessions\":[");
         for (index, fact) in self.recent_sessions.iter().enumerate() {
             if index > 0 {
@@ -506,6 +610,27 @@ impl ContextPack {
     }
 }
 
+fn context_memory_from(memory: Memory) -> ContextMemory {
+    ContextMemory {
+        citation_id: memory.id.clone(),
+        id: memory.id,
+        created_at_ms: memory.created_at_ms,
+        kind: memory.kind,
+        text: memory.text,
+    }
+}
+
+fn render_context_memory_json(memory: &ContextMemory) -> String {
+    format!(
+        "{{\"id\":{},\"created_at_ms\":{},\"kind\":{},\"text\":{},\"citation_id\":{}}}",
+        json_string(&memory.id),
+        memory.created_at_ms,
+        json_string(&memory.kind),
+        json_string(&memory.text),
+        json_string(&memory.citation_id)
+    )
+}
+
 pub(crate) fn json_string(value: &str) -> String {
     let mut escaped = String::from("\"");
     for char in value.chars() {
@@ -558,7 +683,7 @@ fn change_label(file: &ContextChangedFile) -> String {
 mod tests {
     use super::{ContextPack, json_string};
     use crate::code::CodeSymbol;
-    use crate::store::Memory;
+    use crate::store::{Memory, StaleMemoryCandidate};
     use crate::testmap::TestCandidate;
     use crate::worktree::{ChangedFile, WorktreeState};
 
@@ -660,5 +785,59 @@ mod tests {
         assert!(json.contains("\"branch_state\""));
         assert!(json.contains("\"ahead\":2"));
         assert!(json.contains("\"unstaged_status\":\"modified\""));
+    }
+
+    #[test]
+    fn markdown_and_json_include_stale_memory_risks() {
+        let pack = ContextPack::with_sessions_symbols_tests_branch_and_stale_risks(
+            "add plugin hooks",
+            Vec::new(),
+            vec![
+                Memory {
+                    id: "mem_new".to_string(),
+                    created_at_ms: 20,
+                    kind: "fact".to_string(),
+                    text: "plugin hooks now run before configuration is loaded".to_string(),
+                },
+                Memory {
+                    id: "mem_old".to_string(),
+                    created_at_ms: 10,
+                    kind: "fact".to_string(),
+                    text: "plugin hooks run after configuration is loaded".to_string(),
+                },
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            vec![StaleMemoryCandidate {
+                reason: "opposing_terms".to_string(),
+                signal: "after_vs_before".to_string(),
+                shared_terms: vec!["hooks".to_string(), "plugin".to_string(), "run".to_string()],
+                newer_memory: Memory {
+                    id: "mem_new".to_string(),
+                    created_at_ms: 20,
+                    kind: "fact".to_string(),
+                    text: "plugin hooks now run before configuration is loaded".to_string(),
+                },
+                older_memory: Memory {
+                    id: "mem_old".to_string(),
+                    created_at_ms: 10,
+                    kind: "fact".to_string(),
+                    text: "plugin hooks run after configuration is loaded".to_string(),
+                },
+            }],
+        );
+
+        let markdown = pack.render_markdown();
+        let json = pack.render_json();
+
+        assert!(markdown.contains("## Stale Memory Risks"));
+        assert!(markdown.contains("after_vs_before"));
+        assert!(markdown.contains("older mem_old may be stale"));
+        assert!(json.contains("\"stale_memory_risks\""));
+        assert!(json.contains("\"signal\":\"after_vs_before\""));
+        assert!(json.contains("\"citation_id\":\"stale:mem_old:mem_new\""));
+        assert!(markdown.contains("stale:mem_old:mem_new [stale_memory]"));
     }
 }
