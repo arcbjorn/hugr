@@ -2,6 +2,7 @@ use crate::discovery::FileCandidate;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use tree_sitter::{Node, Parser};
 
 const MAX_INDEX_BYTES: u64 = 1_000_000;
 const MAX_SIGNATURE_CHARS: usize = 180;
@@ -143,6 +144,21 @@ fn extract_symbols(
     language: Option<&str>,
     contents: &str,
 ) -> Result<Vec<CodeSymbol>, String> {
+    if matches!(language, Some("rust")) {
+        let symbols = extract_rust_symbols_with_tree_sitter(path, contents)?;
+        if !symbols.is_empty() {
+            return Ok(symbols);
+        }
+    }
+
+    extract_symbols_from_lines(path, language, contents)
+}
+
+fn extract_symbols_from_lines(
+    path: &str,
+    language: Option<&str>,
+    contents: &str,
+) -> Result<Vec<CodeSymbol>, String> {
     let mut symbols = Vec::new();
     let line_count = i64::try_from(contents.lines().count()).map_err(|error| error.to_string())?;
 
@@ -179,6 +195,113 @@ fn extract_symbols(
 
     assign_symbol_ranges(&mut symbols, line_count);
     Ok(symbols)
+}
+
+fn extract_rust_symbols_with_tree_sitter(
+    path: &str,
+    contents: &str,
+) -> Result<Vec<CodeSymbol>, String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .map_err(|error| error.to_string())?;
+    let Some(tree) = parser.parse(contents, None) else {
+        return Ok(Vec::new());
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return Ok(Vec::new());
+    }
+
+    let mut symbols = Vec::new();
+    collect_rust_symbols(path, contents, root, &mut symbols)?;
+    symbols.sort_by(|left, right| {
+        left.line_start
+            .cmp(&right.line_start)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(symbols)
+}
+
+fn collect_rust_symbols(
+    path: &str,
+    contents: &str,
+    node: Node<'_>,
+    symbols: &mut Vec<CodeSymbol>,
+) -> Result<(), String> {
+    if let Some(symbol) = rust_symbol_from_node(path, contents, node)? {
+        symbols.push(symbol);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_rust_symbols(path, contents, child, symbols)?;
+    }
+
+    Ok(())
+}
+
+fn rust_symbol_from_node(
+    path: &str,
+    contents: &str,
+    node: Node<'_>,
+) -> Result<Option<CodeSymbol>, String> {
+    let (kind, name_node) = match node.kind() {
+        "function_item" => ("function", node.child_by_field_name("name")),
+        "struct_item" => ("struct", node.child_by_field_name("name")),
+        "enum_item" => ("enum", node.child_by_field_name("name")),
+        "trait_item" => ("trait", node.child_by_field_name("name")),
+        "mod_item" => ("module", node.child_by_field_name("name")),
+        "type_item" => ("type", node.child_by_field_name("name")),
+        "const_item" => ("constant", node.child_by_field_name("name")),
+        "static_item" => ("static", node.child_by_field_name("name")),
+        "impl_item" => ("impl", rust_impl_target_node(node)),
+        _ => return Ok(None),
+    };
+    let Some(name_node) = name_node else {
+        return Ok(None);
+    };
+    let name = node_text(name_node, contents)?;
+
+    Ok(Some(CodeSymbol {
+        path: path.to_string(),
+        language: Some("rust".to_string()),
+        name,
+        kind: kind.to_string(),
+        line_start: line_number(node.start_position().row),
+        line_end: Some(line_number(node.end_position().row)),
+        signature: rust_signature(node, contents),
+    }))
+}
+
+fn rust_impl_target_node(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find(|child| {
+        matches!(
+            child.kind(),
+            "type_identifier" | "scoped_type_identifier" | "generic_type" | "reference_type"
+        )
+    })
+}
+
+fn rust_signature(node: Node<'_>, contents: &str) -> String {
+    let start = node.start_byte();
+    let end = contents[node.start_byte()..node.end_byte()]
+        .find('{')
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| node.end_byte());
+    clean_signature(&contents[start..end])
+}
+
+fn node_text(node: Node<'_>, contents: &str) -> Result<String, String> {
+    node.utf8_text(contents.as_bytes())
+        .map(str::trim)
+        .map(str::to_string)
+        .map_err(|error| error.to_string())
+}
+
+fn line_number(row: usize) -> i64 {
+    i64::try_from(row + 1).unwrap_or(i64::MAX)
 }
 
 fn extract_rust_symbol(line: &str) -> Option<(String, String)> {
@@ -553,8 +676,33 @@ impl PluginHooks {
                 .iter()
                 .find(|symbol| symbol.name == "run_after_config")
                 .and_then(|symbol| symbol.line_end),
-            Some(7)
+            Some(6)
         );
+    }
+
+    #[test]
+    fn tree_sitter_rust_extracts_multiline_ranges() {
+        let symbols = extract_symbols(
+            "src/plugin_hooks.rs",
+            Some("rust"),
+            r#"
+pub fn run_after_config() -> bool {
+    let loaded = true;
+    loaded
+}
+"#,
+        )
+        .unwrap();
+
+        let function = symbols
+            .iter()
+            .find(|symbol| symbol.name == "run_after_config")
+            .unwrap();
+
+        assert_eq!(function.kind, "function");
+        assert_eq!(function.line_start, 2);
+        assert_eq!(function.line_end, Some(5));
+        assert!(function.signature.contains("pub fn run_after_config"));
     }
 
     #[test]
