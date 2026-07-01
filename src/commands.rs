@@ -4,7 +4,10 @@ use crate::discovery;
 use crate::impact as impact_analysis;
 use crate::indexer;
 use crate::mcp;
-use crate::store::{Memory, Store, SyncExecutionPlan, SyncPullResult, SyncPushResult};
+use crate::store::{
+    Memory, Store, SyncConflictSummary, SyncExecutionPlan, SyncPullResult, SyncPushResult,
+    SyncRunHistory, SyncTableResult,
+};
 use crate::worktree;
 use std::fmt::Write;
 use std::path::Path;
@@ -25,6 +28,7 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::SyncStatus { format } => sync_status(format).await,
         Command::SyncPush { dry_run, format } => sync_push(dry_run, format).await,
         Command::SyncPull { dry_run, format } => sync_pull(dry_run, format).await,
+        Command::SyncHistory { format } => sync_history(format).await,
         Command::Mcp => mcp::serve_stdio().await,
         Command::Improve => placeholder("improve", "memory consolidation is not implemented yet"),
         Command::Forget { query } => forget(query),
@@ -243,6 +247,18 @@ async fn sync_pull(dry_run: bool, format: OutputFormat) -> Result<(), String> {
     Ok(())
 }
 
+async fn sync_history(format: OutputFormat) -> Result<(), String> {
+    let history = Store::open_current().sync_history(10).await?;
+
+    if format == OutputFormat::Json {
+        println!("{}", render_sync_history_json(&history));
+    } else {
+        print!("{}", render_sync_history_text(&history));
+    }
+
+    Ok(())
+}
+
 fn forget(query: Option<String>) -> Result<(), String> {
     match query {
         Some(query) => placeholder(
@@ -359,6 +375,79 @@ fn render_string_array_json(values: &[String]) -> String {
     rendered
 }
 
+fn render_run_id_json(run_id: &Option<String>) -> String {
+    run_id
+        .as_ref()
+        .map(|id| json_string(id))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn render_sync_table_text(rendered: &mut String, table: &SyncTableResult, action: &str) {
+    let _ = writeln!(
+        rendered,
+        "- {}.{}: {} rows ({}), inserted {}, updated {}, skipped {}, conflicts {}",
+        table.class,
+        table.table,
+        table.row_count,
+        action,
+        table.inserted_count,
+        table.updated_count,
+        table.skipped_count,
+        table.conflict_count
+    );
+    for conflict in &table.conflicts {
+        let _ = writeln!(
+            rendered,
+            "  conflict {}: {}",
+            conflict.reason, conflict.count
+        );
+    }
+}
+
+fn render_sync_table_json(table: &SyncTableResult) -> String {
+    format!(
+        "{{\"class\":{},\"table\":{},\"row_count\":{},\"inserted_count\":{},\"updated_count\":{},\"skipped_count\":{},\"conflict_count\":{},\"executed\":{},\"conflicts\":{}}}",
+        json_string(&table.class),
+        json_string(&table.table),
+        table.row_count,
+        table.inserted_count,
+        table.updated_count,
+        table.skipped_count,
+        table.conflict_count,
+        table.executed,
+        render_sync_conflicts_json(&table.conflicts)
+    )
+}
+
+fn render_sync_conflicts_json(conflicts: &[SyncConflictSummary]) -> String {
+    let mut rendered = String::from("[");
+    for (index, conflict) in conflicts.iter().enumerate() {
+        if index > 0 {
+            rendered.push(',');
+        }
+        let _ = write!(
+            rendered,
+            "{{\"reason\":{},\"count\":{}}}",
+            json_string(&conflict.reason),
+            conflict.count
+        );
+    }
+    rendered.push(']');
+    rendered
+}
+
+fn render_sync_tables_json(tables: &[SyncTableResult]) -> String {
+    let mut rendered = String::from("[");
+    for (index, table) in tables.iter().enumerate() {
+        if index > 0 {
+            rendered.push(',');
+        }
+        rendered.push_str(&render_sync_table_json(table));
+    }
+    rendered.push(']');
+    rendered
+}
+
 fn render_sync_push_text(result: &SyncPushResult) -> String {
     let mut rendered = format!(
         "Hugr sync push\n  mode: {}\n  backend: {}\n  status: {}\n",
@@ -366,15 +455,15 @@ fn render_sync_push_text(result: &SyncPushResult) -> String {
         result.backend,
         result.status
     );
+    if let Some(run_id) = &result.run_id {
+        let _ = writeln!(rendered, "  run_id: {run_id}");
+    }
 
     for table in &result.tables {
-        let _ = writeln!(
-            rendered,
-            "- {}.{}: {} rows ({})",
-            table.class,
-            table.table,
-            table.row_count,
-            if table.executed { "pushed" } else { "planned" }
+        render_sync_table_text(
+            &mut rendered,
+            table,
+            if table.executed { "pushed" } else { "planned" },
         );
     }
 
@@ -382,29 +471,14 @@ fn render_sync_push_text(result: &SyncPushResult) -> String {
 }
 
 fn render_sync_push_json(result: &SyncPushResult) -> String {
-    let mut rendered = format!(
-        "{{\"dry_run\":{},\"backend\":{},\"status\":{},\"tables\":[",
+    format!(
+        "{{\"run_id\":{},\"dry_run\":{},\"backend\":{},\"status\":{},\"tables\":{}}}",
+        render_run_id_json(&result.run_id),
         result.dry_run,
         json_string(&result.backend),
-        json_string(&result.status)
-    );
-
-    for (index, table) in result.tables.iter().enumerate() {
-        if index > 0 {
-            rendered.push(',');
-        }
-        let _ = write!(
-            rendered,
-            "{{\"class\":{},\"table\":{},\"row_count\":{},\"executed\":{}}}",
-            json_string(&table.class),
-            json_string(&table.table),
-            table.row_count,
-            table.executed
-        );
-    }
-
-    rendered.push_str("]}");
-    rendered
+        json_string(&result.status),
+        render_sync_tables_json(&result.tables)
+    )
 }
 
 fn render_sync_pull_text(result: &SyncPullResult) -> String {
@@ -414,15 +488,15 @@ fn render_sync_pull_text(result: &SyncPullResult) -> String {
         result.backend,
         result.status
     );
+    if let Some(run_id) = &result.run_id {
+        let _ = writeln!(rendered, "  run_id: {run_id}");
+    }
 
     for table in &result.tables {
-        let _ = writeln!(
-            rendered,
-            "- {}.{}: {} rows ({})",
-            table.class,
-            table.table,
-            table.row_count,
-            if table.executed { "pulled" } else { "planned" }
+        render_sync_table_text(
+            &mut rendered,
+            table,
+            if table.executed { "pulled" } else { "planned" },
         );
     }
 
@@ -430,27 +504,55 @@ fn render_sync_pull_text(result: &SyncPullResult) -> String {
 }
 
 fn render_sync_pull_json(result: &SyncPullResult) -> String {
-    let mut rendered = format!(
-        "{{\"dry_run\":{},\"backend\":{},\"status\":{},\"tables\":[",
+    format!(
+        "{{\"run_id\":{},\"dry_run\":{},\"backend\":{},\"status\":{},\"tables\":{}}}",
+        render_run_id_json(&result.run_id),
         result.dry_run,
         json_string(&result.backend),
-        json_string(&result.status)
-    );
+        json_string(&result.status),
+        render_sync_tables_json(&result.tables)
+    )
+}
 
-    for (index, table) in result.tables.iter().enumerate() {
+fn render_sync_history_text(history: &[SyncRunHistory]) -> String {
+    let mut rendered = String::from("Hugr sync history\n");
+    if history.is_empty() {
+        rendered.push_str("  runs: 0\n");
+        return rendered;
+    }
+
+    for run in history {
+        let _ = writeln!(
+            rendered,
+            "Run {}\n  operation: {}\n  backend: {}\n  status: {}\n  started_at_ms: {}\n  ended_at_ms: {}",
+            run.id, run.operation, run.backend, run.status, run.started_at_ms, run.ended_at_ms
+        );
+        for table in &run.tables {
+            render_sync_table_text(&mut rendered, table, "recorded");
+        }
+    }
+
+    rendered
+}
+
+fn render_sync_history_json(history: &[SyncRunHistory]) -> String {
+    let mut rendered = String::from("{\"runs\":[");
+    for (index, run) in history.iter().enumerate() {
         if index > 0 {
             rendered.push(',');
         }
         let _ = write!(
             rendered,
-            "{{\"class\":{},\"table\":{},\"row_count\":{},\"executed\":{}}}",
-            json_string(&table.class),
-            json_string(&table.table),
-            table.row_count,
-            table.executed
+            "{{\"id\":{},\"operation\":{},\"backend\":{},\"status\":{},\"started_at_ms\":{},\"ended_at_ms\":{},\"tables\":{}}}",
+            json_string(&run.id),
+            json_string(&run.operation),
+            json_string(&run.backend),
+            json_string(&run.status),
+            run.started_at_ms,
+            run.ended_at_ms,
+            render_sync_tables_json(&run.tables)
         );
     }
-
     rendered.push_str("]}");
     rendered
 }
@@ -458,11 +560,13 @@ fn render_sync_pull_json(result: &SyncPullResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        render_recall_json, render_sync_pull_json, render_sync_pull_text, render_sync_push_json,
-        render_sync_push_text, render_sync_status_json, render_sync_status_text,
+        render_recall_json, render_sync_history_json, render_sync_history_text,
+        render_sync_pull_json, render_sync_pull_text, render_sync_push_json, render_sync_push_text,
+        render_sync_status_json, render_sync_status_text,
     };
     use crate::store::{
-        Memory, SyncExecutionPlan, SyncPullResult, SyncPushResult, SyncTableResult,
+        Memory, SyncConflictSummary, SyncExecutionPlan, SyncPullResult, SyncPushResult,
+        SyncRunHistory, SyncTableResult,
     };
 
     #[test]
@@ -509,6 +613,7 @@ mod tests {
     #[test]
     fn sync_push_renderers_include_table_counts() {
         let result = SyncPushResult {
+            run_id: None,
             dry_run: true,
             backend: "direct_libsql".to_string(),
             status: "dry_run".to_string(),
@@ -516,7 +621,12 @@ mod tests {
                 class: "memories".to_string(),
                 table: "memories".to_string(),
                 row_count: 2,
+                inserted_count: 0,
+                updated_count: 0,
+                skipped_count: 0,
+                conflict_count: 0,
                 executed: false,
+                conflicts: Vec::new(),
             }],
         };
 
@@ -532,6 +642,7 @@ mod tests {
     #[test]
     fn sync_pull_renderers_include_table_counts() {
         let result = SyncPullResult {
+            run_id: Some("sync_pull_7".to_string()),
             dry_run: true,
             backend: "direct_libsql".to_string(),
             status: "dry_run".to_string(),
@@ -539,16 +650,61 @@ mod tests {
                 class: "memories".to_string(),
                 table: "memories".to_string(),
                 row_count: 2,
+                inserted_count: 1,
+                updated_count: 0,
+                skipped_count: 1,
+                conflict_count: 1,
                 executed: false,
+                conflicts: vec![SyncConflictSummary {
+                    reason: "local_row_preserved".to_string(),
+                    count: 1,
+                }],
             }],
         };
 
         let text = render_sync_pull_text(&result);
         assert!(text.contains("mode: dry-run"));
         assert!(text.contains("memories.memories: 2 rows"));
+        assert!(text.contains("conflict local_row_preserved: 1"));
 
         let json = render_sync_pull_json(&result);
+        assert!(json.contains("\"run_id\":\"sync_pull_7\""));
         assert!(json.contains("\"dry_run\":true"));
         assert!(json.contains("\"row_count\":2"));
+        assert!(json.contains("\"skipped_count\":1"));
+    }
+
+    #[test]
+    fn sync_history_renderers_include_conflicts() {
+        let history = vec![SyncRunHistory {
+            id: "sync_pull_9".to_string(),
+            operation: "pull".to_string(),
+            backend: "direct_libsql".to_string(),
+            status: "executed".to_string(),
+            started_at_ms: 8,
+            ended_at_ms: 9,
+            tables: vec![SyncTableResult {
+                class: "memories".to_string(),
+                table: "memories".to_string(),
+                row_count: 2,
+                inserted_count: 1,
+                updated_count: 0,
+                skipped_count: 1,
+                conflict_count: 1,
+                executed: true,
+                conflicts: vec![SyncConflictSummary {
+                    reason: "local_row_preserved".to_string(),
+                    count: 1,
+                }],
+            }],
+        }];
+
+        let text = render_sync_history_text(&history);
+        assert!(text.contains("Run sync_pull_9"));
+        assert!(text.contains("conflict local_row_preserved: 1"));
+
+        let json = render_sync_history_json(&history);
+        assert!(json.contains("\"operation\":\"pull\""));
+        assert!(json.contains("\"conflict_count\":1"));
     }
 }
