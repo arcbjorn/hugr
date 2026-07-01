@@ -790,6 +790,38 @@ pub fn run_after_config() -> bool {
     }
 
     #[test]
+    fn tree_sitter_python_extracts_classes_and_functions() {
+        let symbols = extract_symbols(
+            "app/plugin_hooks.py",
+            Some("python"),
+            r#"
+class PluginHooks:
+    def run_after_config(self):
+        loaded = True
+        return loaded
+"#,
+        )
+        .unwrap();
+
+        let class = symbols
+            .iter()
+            .find(|symbol| symbol.name == "PluginHooks")
+            .unwrap();
+        let method = symbols
+            .iter()
+            .find(|symbol| symbol.name == "run_after_config")
+            .unwrap();
+
+        assert_eq!(class.kind, "class");
+        assert_eq!(class.line_start, 2);
+        assert_eq!(class.line_end, Some(5));
+        assert_eq!(method.kind, "function");
+        assert_eq!(method.line_start, 3);
+        assert_eq!(method.line_end, Some(5));
+        assert!(method.signature.contains("def run_after_config"));
+    }
+
+    #[test]
     fn extracts_common_script_symbols() {
         let symbols = extract_symbols(
             "src/pluginHooks.ts",
