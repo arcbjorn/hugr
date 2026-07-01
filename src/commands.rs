@@ -5,8 +5,9 @@ use crate::impact as impact_analysis;
 use crate::indexer;
 use crate::mcp;
 use crate::store::{
-    Memory, Store, SyncConflictSummary, SyncExecutionPlan, SyncPullResult, SyncPushResult,
-    SyncRunHistory, SyncTableResult,
+    ForgetResult, Memory, MemoryConsolidationResult, MemoryMaintenanceReport, Store,
+    SyncConflictSummary, SyncExecutionPlan, SyncPullResult, SyncPushResult, SyncRunHistory,
+    SyncTableResult,
 };
 use crate::worktree;
 use std::fmt::Write;
@@ -30,8 +31,12 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::SyncPull { dry_run, format } => sync_pull(dry_run, format).await,
         Command::SyncHistory { format } => sync_history(format).await,
         Command::Mcp => mcp::serve_stdio().await,
-        Command::Improve => placeholder("improve", "memory consolidation is not implemented yet"),
-        Command::Forget { query } => forget(query),
+        Command::Improve {
+            execute,
+            duplicates,
+            format,
+        } => improve(execute, duplicates, format).await,
+        Command::Forget { query, format } => forget(&query, format).await,
         Command::Doctor => doctor().await,
         Command::Help => {
             print!("{}", help_text());
@@ -259,17 +264,42 @@ async fn sync_history(format: OutputFormat) -> Result<(), String> {
     Ok(())
 }
 
-fn forget(query: Option<String>) -> Result<(), String> {
-    match query {
-        Some(query) => placeholder(
-            "forget",
-            &format!("forget matching '{query}' is not implemented yet"),
-        ),
-        None => placeholder(
-            "forget",
-            "forget requires a future selector such as --stale or a query",
-        ),
+async fn improve(execute: bool, duplicates: bool, format: OutputFormat) -> Result<(), String> {
+    if execute {
+        if !duplicates {
+            return Err("hugr improve --execute requires --duplicates".to_string());
+        }
+        let result = Store::open_current()
+            .consolidate_duplicate_memories()
+            .await?;
+        if format == OutputFormat::Json {
+            println!("{}", render_consolidation_json(&result));
+        } else {
+            print!("{}", render_consolidation_text(&result));
+        }
+        return Ok(());
     }
+
+    let report = Store::open_current().memory_maintenance_report().await?;
+    if format == OutputFormat::Json {
+        println!("{}", render_improve_json(&report));
+    } else {
+        print!("{}", render_improve_text(&report));
+    }
+
+    Ok(())
+}
+
+async fn forget(query: &str, format: OutputFormat) -> Result<(), String> {
+    let result = Store::open_current().forget(query, 25).await?;
+
+    if format == OutputFormat::Json {
+        println!("{}", render_forget_json(&result));
+    } else {
+        print!("{}", render_forget_text(&result));
+    }
+
+    Ok(())
 }
 
 async fn doctor() -> Result<(), String> {
@@ -292,11 +322,6 @@ async fn doctor() -> Result<(), String> {
     Ok(())
 }
 
-fn placeholder(command: &str, detail: &str) -> Result<(), String> {
-    println!("hugr {command}: {detail}");
-    Ok(())
-}
-
 fn render_recall_json(query: &str, memories: &[Memory]) -> String {
     let mut rendered = String::new();
 
@@ -306,18 +331,150 @@ fn render_recall_json(query: &str, memories: &[Memory]) -> String {
         if index > 0 {
             rendered.push(',');
         }
-        let _ = write!(
-            rendered,
-            "{{\"id\":{},\"created_at_ms\":{},\"kind\":{},\"text\":{}}}",
-            json_string(&memory.id),
-            memory.created_at_ms,
-            json_string(&memory.kind),
-            json_string(&memory.text)
-        );
+        rendered.push_str(&render_memory_json(memory));
     }
     rendered.push_str("]}");
 
     rendered
+}
+
+fn render_memory_json(memory: &Memory) -> String {
+    format!(
+        "{{\"id\":{},\"created_at_ms\":{},\"kind\":{},\"text\":{}}}",
+        json_string(&memory.id),
+        memory.created_at_ms,
+        json_string(&memory.kind),
+        json_string(&memory.text)
+    )
+}
+
+fn render_memory_list_json(memories: &[Memory]) -> String {
+    let mut rendered = String::from("[");
+    for (index, memory) in memories.iter().enumerate() {
+        if index > 0 {
+            rendered.push(',');
+        }
+        rendered.push_str(&render_memory_json(memory));
+    }
+    rendered.push(']');
+    rendered
+}
+
+fn render_forget_text(result: &ForgetResult) -> String {
+    let mut rendered = format!(
+        "Hugr forget\n  query: {}\n  forgotten: {}\n  forgotten_at: {}\n",
+        result.query, result.forgotten_count, result.forgotten_at
+    );
+
+    for memory in &result.memories {
+        let _ = writeln!(
+            rendered,
+            "- {} [{}]: {}",
+            memory.id, memory.kind, memory.text
+        );
+    }
+
+    rendered
+}
+
+fn render_forget_json(result: &ForgetResult) -> String {
+    format!(
+        "{{\"query\":{},\"forgotten_count\":{},\"forgotten_at\":{},\"memories\":{}}}",
+        json_string(&result.query),
+        result.forgotten_count,
+        json_string(&result.forgotten_at),
+        render_memory_list_json(&result.memories)
+    )
+}
+
+fn render_improve_text(report: &MemoryMaintenanceReport) -> String {
+    let mut rendered = format!(
+        "Hugr improve\n  active_memories: {}\n  retired_memories: {}\n  duplicate_groups: {}\n",
+        report.active_count,
+        report.retired_count,
+        report.duplicate_groups.len()
+    );
+
+    for group in &report.duplicate_groups {
+        let _ = writeln!(
+            rendered,
+            "- duplicate: {} ({} memories)",
+            group.normalized_text,
+            group.memories.len()
+        );
+        for memory in &group.memories {
+            let _ = writeln!(
+                rendered,
+                "  - {} [{}]: {}",
+                memory.id, memory.kind, memory.text
+            );
+        }
+    }
+
+    rendered
+}
+
+fn render_improve_json(report: &MemoryMaintenanceReport) -> String {
+    format!(
+        "{{\"active_count\":{},\"retired_count\":{},\"duplicate_groups\":{}}}",
+        report.active_count,
+        report.retired_count,
+        render_duplicate_groups_json(&report.duplicate_groups)
+    )
+}
+
+fn render_duplicate_groups_json(groups: &[crate::store::DuplicateMemoryGroup]) -> String {
+    let mut rendered = String::from("[");
+    for (index, group) in groups.iter().enumerate() {
+        if index > 0 {
+            rendered.push(',');
+        }
+        let _ = write!(
+            rendered,
+            "{{\"normalized_text\":{},\"memories\":{}}}",
+            json_string(&group.normalized_text),
+            render_memory_list_json(&group.memories)
+        );
+    }
+    rendered.push(']');
+    rendered
+}
+
+fn render_consolidation_text(result: &MemoryConsolidationResult) -> String {
+    let mut rendered = format!(
+        "Hugr improve\n  action: duplicates\n  executed_at: {}\n  duplicate_groups: {}\n  kept: {}\n  retired: {}\n",
+        result.executed_at,
+        result.duplicate_groups.len(),
+        result.kept_memories.len(),
+        result.retired_memories.len()
+    );
+
+    for memory in &result.kept_memories {
+        let _ = writeln!(
+            rendered,
+            "- kept {} [{}]: {}",
+            memory.id, memory.kind, memory.text
+        );
+    }
+    for memory in &result.retired_memories {
+        let _ = writeln!(
+            rendered,
+            "- retired {} [{}]: {}",
+            memory.id, memory.kind, memory.text
+        );
+    }
+
+    rendered
+}
+
+fn render_consolidation_json(result: &MemoryConsolidationResult) -> String {
+    format!(
+        "{{\"action\":\"duplicates\",\"executed_at\":{},\"duplicate_groups\":{},\"kept_memories\":{},\"retired_memories\":{}}}",
+        json_string(&result.executed_at),
+        render_duplicate_groups_json(&result.duplicate_groups),
+        render_memory_list_json(&result.kept_memories),
+        render_memory_list_json(&result.retired_memories)
+    )
 }
 
 fn render_sync_status_text(plan: &SyncExecutionPlan) -> String {
@@ -560,13 +717,16 @@ fn render_sync_history_json(history: &[SyncRunHistory]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        render_recall_json, render_sync_history_json, render_sync_history_text,
-        render_sync_pull_json, render_sync_pull_text, render_sync_push_json, render_sync_push_text,
+        render_consolidation_json, render_consolidation_text, render_forget_json,
+        render_forget_text, render_improve_json, render_improve_text, render_recall_json,
+        render_sync_history_json, render_sync_history_text, render_sync_pull_json,
+        render_sync_pull_text, render_sync_push_json, render_sync_push_text,
         render_sync_status_json, render_sync_status_text,
     };
     use crate::store::{
-        Memory, SyncConflictSummary, SyncExecutionPlan, SyncPullResult, SyncPushResult,
-        SyncRunHistory, SyncTableResult,
+        DuplicateMemoryGroup, ForgetResult, Memory, MemoryConsolidationResult,
+        MemoryMaintenanceReport, SyncConflictSummary, SyncExecutionPlan, SyncPullResult,
+        SyncPushResult, SyncRunHistory, SyncTableResult,
     };
 
     #[test]
@@ -584,6 +744,106 @@ mod tests {
         assert!(json.contains("\"query\":\"plugin hooks\""));
         assert!(json.contains("\"id\":\"mem_1\""));
         assert!(json.contains("\"created_at_ms\":7"));
+    }
+
+    #[test]
+    fn forget_renderers_include_retired_memories() {
+        let result = ForgetResult {
+            query: "plugin hooks".to_string(),
+            forgotten_count: 1,
+            forgotten_at: "42".to_string(),
+            memories: vec![Memory {
+                id: "mem_1".to_string(),
+                created_at_ms: 7,
+                kind: "fact".to_string(),
+                text: "plugin hooks run after configuration is loaded".to_string(),
+            }],
+        };
+
+        let text = render_forget_text(&result);
+        assert!(text.contains("forgotten: 1"));
+        assert!(text.contains("mem_1 [fact]"));
+
+        let json = render_forget_json(&result);
+        assert!(json.contains("\"forgotten_count\":1"));
+        assert!(json.contains("\"query\":\"plugin hooks\""));
+    }
+
+    #[test]
+    fn improve_renderers_include_duplicate_groups() {
+        let report = MemoryMaintenanceReport {
+            active_count: 2,
+            retired_count: 1,
+            duplicate_groups: vec![DuplicateMemoryGroup {
+                normalized_text: "plugin hooks".to_string(),
+                memories: vec![
+                    Memory {
+                        id: "mem_1".to_string(),
+                        created_at_ms: 7,
+                        kind: "fact".to_string(),
+                        text: "plugin hooks".to_string(),
+                    },
+                    Memory {
+                        id: "mem_2".to_string(),
+                        created_at_ms: 8,
+                        kind: "fact".to_string(),
+                        text: "Plugin hooks".to_string(),
+                    },
+                ],
+            }],
+        };
+
+        let text = render_improve_text(&report);
+        assert!(text.contains("active_memories: 2"));
+        assert!(text.contains("duplicate: plugin hooks"));
+
+        let json = render_improve_json(&report);
+        assert!(json.contains("\"retired_count\":1"));
+        assert!(json.contains("\"normalized_text\":\"plugin hooks\""));
+    }
+
+    #[test]
+    fn consolidation_renderers_include_retired_memories() {
+        let result = MemoryConsolidationResult {
+            executed_at: "42".to_string(),
+            duplicate_groups: vec![DuplicateMemoryGroup {
+                normalized_text: "plugin hooks".to_string(),
+                memories: vec![
+                    Memory {
+                        id: "mem_keep".to_string(),
+                        created_at_ms: 8,
+                        kind: "fact".to_string(),
+                        text: "plugin hooks".to_string(),
+                    },
+                    Memory {
+                        id: "mem_retire".to_string(),
+                        created_at_ms: 7,
+                        kind: "fact".to_string(),
+                        text: "Plugin hooks".to_string(),
+                    },
+                ],
+            }],
+            kept_memories: vec![Memory {
+                id: "mem_keep".to_string(),
+                created_at_ms: 8,
+                kind: "fact".to_string(),
+                text: "plugin hooks".to_string(),
+            }],
+            retired_memories: vec![Memory {
+                id: "mem_retire".to_string(),
+                created_at_ms: 7,
+                kind: "fact".to_string(),
+                text: "Plugin hooks".to_string(),
+            }],
+        };
+
+        let text = render_consolidation_text(&result);
+        assert!(text.contains("action: duplicates"));
+        assert!(text.contains("retired: 1"));
+
+        let json = render_consolidation_json(&result);
+        assert!(json.contains("\"action\":\"duplicates\""));
+        assert!(json.contains("\"id\":\"mem_retire\""));
     }
 
     #[test]
