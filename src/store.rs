@@ -176,6 +176,14 @@ pub struct MemoryConsolidationResult {
     pub retired_memories: Vec<Memory>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleRetirementResult {
+    pub executed_at: String,
+    pub stale_candidates: Vec<StaleMemoryCandidate>,
+    pub kept_memories: Vec<Memory>,
+    pub retired_memories: Vec<Memory>,
+}
+
 pub struct Store {
     root: PathBuf,
     embedding_provider: Result<SelectedEmbeddingProvider, String>,
@@ -455,6 +463,51 @@ impl Store {
         Ok(MemoryConsolidationResult {
             executed_at,
             duplicate_groups: report.duplicate_groups,
+            kept_memories,
+            retired_memories,
+        })
+    }
+
+    pub async fn retire_stale_memories(&self) -> Result<StaleRetirementResult, String> {
+        self.init().await?;
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let report = self.memory_maintenance_report().await?;
+        let executed_at = now_ms()?.to_string();
+        let mut kept_memories = Vec::new();
+        let mut retired_memories = Vec::new();
+        let mut seen_kept = HashSet::new();
+        let mut seen_retired = HashSet::new();
+
+        for candidate in &report.stale_candidates {
+            if seen_kept.insert(candidate.newer_memory.id.clone()) {
+                kept_memories.push(candidate.newer_memory.clone());
+            }
+            if !seen_retired.insert(candidate.older_memory.id.clone()) {
+                continue;
+            }
+
+            conn.execute(
+                "
+                UPDATE memories
+                SET valid_to = ?1,
+                    superseded_by = ?2
+                WHERE id = ?3 AND valid_to IS NULL
+                ",
+                params![
+                    executed_at.clone(),
+                    candidate.newer_memory.id.clone(),
+                    candidate.older_memory.id.clone()
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            retired_memories.push(candidate.older_memory.clone());
+        }
+
+        Ok(StaleRetirementResult {
+            executed_at,
+            stale_candidates: report.stale_candidates,
             kept_memories,
             retired_memories,
         })
@@ -4415,6 +4468,60 @@ mod tests {
         assert_eq!(candidate.older_memory.id, "mem_old");
         assert!(candidate.shared_terms.contains(&"plugin".to_string()));
         assert!(candidate.shared_terms.contains(&"hooks".to_string()));
+    }
+
+    #[tokio::test]
+    async fn retire_stale_memories_retires_older_candidates() {
+        let test = TestStore::new("stale_execute");
+        test.store.init().await.unwrap();
+        let conn = test.store.connect().await.unwrap();
+        insert_memory_for_sync(
+            &conn,
+            "mem_old",
+            "plugin hooks run after configuration is loaded",
+            10,
+        )
+        .await
+        .unwrap();
+        insert_memory_for_sync(
+            &conn,
+            "mem_new",
+            "plugin hooks now run before configuration is loaded",
+            20,
+        )
+        .await
+        .unwrap();
+
+        let result = test.store.retire_stale_memories().await.unwrap();
+        let report = test.store.memory_maintenance_report().await.unwrap();
+        let active_ids = test
+            .store
+            .memories()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|memory| memory.id)
+            .collect::<Vec<_>>();
+        let mut rows = conn
+            .query(
+                "SELECT valid_to, superseded_by FROM memories WHERE id = 'mem_old'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+
+        assert_eq!(result.kept_memories[0].id, "mem_new");
+        assert_eq!(result.retired_memories[0].id, "mem_old");
+        assert_eq!(report.active_count, 1);
+        assert_eq!(report.retired_count, 1);
+        assert!(report.stale_candidates.is_empty());
+        assert_eq!(active_ids, vec!["mem_new".to_string()]);
+        assert!(row.get::<Option<String>>(0).unwrap().is_some());
+        assert_eq!(
+            row.get::<Option<String>>(1).unwrap(),
+            Some("mem_new".to_string())
+        );
     }
 
     #[tokio::test]
