@@ -1407,10 +1407,6 @@ async fn copy_projects(local_conn: &Connection, remote_conn: &Connection) -> Res
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        let memory_id = row.get::<String>(0).map_err(|error| error.to_string())?;
-        if !memory_exists(remote_conn, &memory_id).await? {
-            continue;
-        }
         remote_conn
             .execute(
                 "
@@ -1459,10 +1455,6 @@ async fn copy_memories(local_conn: &Connection, remote_conn: &Connection) -> Res
         .map_err(|error| error.to_string())?;
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        let memory_id = row.get::<String>(0).map_err(|error| error.to_string())?;
-        if !memory_exists(remote_conn, &memory_id).await? {
-            continue;
-        }
         remote_conn
             .execute(
                 "
@@ -2419,8 +2411,12 @@ impl StorageConfig {
                 )
             }
             StorageMode::Local => "local".to_string(),
+            StorageMode::Hybrid if self.backend == SyncBackend::DirectLibsql => format!(
+                "hybrid (local active, guarded remote sync enabled, backend: {}, {auth_status}, sync classes: {sync_classes})",
+                self.backend.as_str()
+            ),
             StorageMode::Hybrid => format!(
-                "hybrid (local active, remote sync configured but disabled, backend: {}, {auth_status}, sync classes: {sync_classes})",
+                "hybrid (local active, remote sync backend not implemented, backend: {}, {auth_status}, sync classes: {sync_classes})",
                 self.backend.as_str()
             ),
             StorageMode::Remote => format!(
@@ -2432,9 +2428,14 @@ impl StorageConfig {
 
     fn sync_execution_plan(&self) -> SyncExecutionPlan {
         let remote_configured = self.remote_url.is_some();
+        let direct_hybrid_sync_ready = matches!(self.mode, StorageMode::Hybrid)
+            && self.backend == SyncBackend::DirectLibsql
+            && remote_configured
+            && self.auth_token_configured;
         let status = match self.mode {
             StorageMode::Local => "local_only",
-            StorageMode::Hybrid => "planned_remote_sync_disabled",
+            StorageMode::Hybrid if direct_hybrid_sync_ready => "remote_sync_ready",
+            StorageMode::Hybrid => "remote_sync_backend_pending",
             StorageMode::Remote => "remote_execution_disabled",
         };
 
@@ -2444,8 +2445,8 @@ impl StorageConfig {
             local_writes_enabled: !matches!(self.mode, StorageMode::Remote),
             remote_configured,
             remote_auth_configured: self.auth_token_configured,
-            remote_reads_enabled: false,
-            remote_writes_enabled: false,
+            remote_reads_enabled: direct_hybrid_sync_ready,
+            remote_writes_enabled: direct_hybrid_sync_ready,
             sync_classes: self
                 .sync_classes
                 .iter()
@@ -3025,18 +3026,18 @@ mod tests {
         assert!(config.auth_token_configured);
         assert_eq!(
             config.summary(),
-            "hybrid (local active, remote sync configured but disabled, backend: direct_libsql, auth configured, sync classes: memories,sources,entities,edges,embeddings,context_packs,session_summaries)"
+            "hybrid (local active, guarded remote sync enabled, backend: direct_libsql, auth configured, sync classes: memories,sources,entities,edges,embeddings,context_packs,session_summaries)"
         );
 
         let plan = config.sync_execution_plan();
         assert_eq!(plan.storage_mode, "hybrid");
         assert_eq!(plan.backend, "direct_libsql");
-        assert_eq!(plan.status, "planned_remote_sync_disabled");
+        assert_eq!(plan.status, "remote_sync_ready");
         assert!(plan.local_writes_enabled);
         assert!(plan.remote_configured);
         assert!(plan.remote_auth_configured);
-        assert!(!plan.remote_reads_enabled);
-        assert!(!plan.remote_writes_enabled);
+        assert!(plan.remote_reads_enabled);
+        assert!(plan.remote_writes_enabled);
     }
 
     #[test]
@@ -3099,6 +3100,16 @@ mod tests {
 
         assert_eq!(config.backend, SyncBackend::HugrApi);
         assert_eq!(config.sync_execution_plan().backend, "hugr_api");
+        assert_eq!(
+            config.summary(),
+            "hybrid (local active, remote sync backend not implemented, backend: hugr_api, auth configured, sync classes: memories,sources,entities,edges,embeddings,context_packs,session_summaries)"
+        );
+        assert_eq!(
+            config.sync_execution_plan().status,
+            "remote_sync_backend_pending"
+        );
+        assert!(!config.sync_execution_plan().remote_reads_enabled);
+        assert!(!config.sync_execution_plan().remote_writes_enabled);
     }
 
     #[tokio::test]
