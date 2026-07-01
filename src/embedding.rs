@@ -287,7 +287,10 @@ fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String,
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if stderr.is_empty() {
-            return Err(format!("embedding request failed with status {}", output.status));
+            return Err(format!(
+                "embedding request failed with status {}",
+                output.status
+            ));
         }
         return Err(format!("embedding request failed: {stderr}"));
     }
@@ -385,7 +388,11 @@ fn normalize(vector: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DETERMINISTIC_MODEL, DeterministicEmbeddingProvider, EmbeddingProvider};
+    use super::{
+        DEFAULT_EMBEDDING_DIMENSIONS, DETERMINISTIC_MODEL, DeterministicEmbeddingProvider,
+        EmbeddingProvider, EmbeddingProviderConfig, parse_openai_embedding_response,
+    };
+    use std::collections::HashMap;
 
     #[test]
     fn deterministic_provider_rejects_zero_dimensions() {
@@ -430,5 +437,89 @@ mod tests {
         assert!(literal.starts_with('['));
         assert!(literal.ends_with(']'));
         assert_eq!(literal.matches(',').count(), 3);
+    }
+
+    #[test]
+    fn config_defaults_to_deterministic_provider() {
+        let config = EmbeddingProviderConfig::from_lookup(|_| None).unwrap();
+
+        assert_eq!(
+            config,
+            EmbeddingProviderConfig::Deterministic {
+                dimensions: DEFAULT_EMBEDDING_DIMENSIONS
+            }
+        );
+    }
+
+    #[test]
+    fn config_reads_openai_provider() {
+        let config = EmbeddingProviderConfig::from_lookup(env_lookup(&[
+            ("HUGR_EMBEDDING_PROVIDER", "openai"),
+            ("OPENAI_API_KEY", "secret"),
+            ("HUGR_OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
+            ("HUGR_EMBEDDING_DIMENSIONS", "1536"),
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            config,
+            EmbeddingProviderConfig::OpenAi {
+                api_key: "secret".to_string(),
+                model: "text-embedding-3-small".to_string(),
+                url: "https://api.openai.com/v1/embeddings".to_string(),
+                dimensions: 1536
+            }
+        );
+    }
+
+    #[test]
+    fn config_requires_openai_key() {
+        let error = EmbeddingProviderConfig::from_lookup(env_lookup(&[(
+            "HUGR_EMBEDDING_PROVIDER",
+            "openai",
+        )]))
+        .unwrap_err();
+
+        assert!(error.contains("requires HUGR_OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn parses_openai_embedding_response() {
+        let response = r#"
+        {
+            "object": "list",
+            "model": "text-embedding-3-small",
+            "data": [
+                {
+                    "object": "embedding",
+                    "index": 0,
+                    "embedding": [0.25, -0.5, 0.75]
+                }
+            ]
+        }
+        "#;
+
+        let embedding = parse_openai_embedding_response(response, "fallback-model", 3).unwrap();
+
+        assert_eq!(embedding.model, "text-embedding-3-small");
+        assert_eq!(embedding.vector, vec![0.25, -0.5, 0.75]);
+    }
+
+    #[test]
+    fn rejects_openai_dimension_mismatch() {
+        let response = r#"{"data":[{"embedding":[1.0,2.0]}]}"#;
+
+        let error = parse_openai_embedding_response(response, "model", 3).unwrap_err();
+
+        assert!(error.contains("did not match expected"));
+    }
+
+    fn env_lookup(values: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let values = values
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect::<HashMap<_, _>>();
+
+        move |key| values.get(key).cloned()
     }
 }
