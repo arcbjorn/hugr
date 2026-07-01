@@ -23,6 +23,7 @@ Implemented:
 - structured `ContextPack` generation and Markdown rendering
 - JSON output for `hugr recall --json` and `hugr context --json`
 - deterministic local embedding provider for tests and offline development
+- optional OpenAI-compatible embedding provider selected through environment config
 - synchronous embedding persistence on `hugr remember`
 - `vector_top_k` recall over stored deterministic embeddings
 - combined FTS and vector recall ranking
@@ -44,7 +45,6 @@ Implemented:
 
 Not implemented yet:
 
-- real embedding provider integration
 - tree-sitter-backed parsing
 - richer symbol graph edges
 - cloud or hybrid sync
@@ -183,6 +183,14 @@ Tasks:
 - Add vector search using `vector_top_k`.
 - Combine FTS and vector results in recall.
 - Add a `hugr embed` or background embedding path.
+
+Implemented provider support:
+
+- Deterministic provider remains the default for local/offline work and tests.
+- `HUGR_EMBEDDING_PROVIDER=openai` enables an OpenAI-compatible embeddings endpoint through `curl`.
+- `HUGR_OPENAI_API_KEY` or `OPENAI_API_KEY` supplies credentials.
+- `HUGR_OPENAI_EMBEDDING_MODEL`, `HUGR_OPENAI_EMBEDDING_URL`, and `HUGR_EMBEDDING_DIMENSIONS` configure the provider.
+- `hugr doctor` reports the selected embedding provider without exposing secrets.
 
 Open questions:
 
@@ -358,7 +366,8 @@ Recommended next commits:
 11. Done: `feat(impact): trace symbol impact`
 12. Done: `feat(graph): enrich code relationships`
 13. Done: `feat(testmap): suggest affected tests`
-14. In progress: `feat(git): add worktree context`
+14. Done: `feat(git): add worktree context`
+15. Done: `feat(embed): add openai provider`
 
 Each commit should leave the CLI usable.
 
@@ -375,6 +384,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add real embedding provider integration.
+Add tree-sitter-backed parsing.
 
-That is the right next step because Hugr now reports local code, test, and worktree context. The next useful layer is replacing deterministic offline embeddings with an optional real provider while keeping local development deterministic.
+That is the right next step because Hugr now has an optional API-backed embedding provider while keeping deterministic local defaults. The next useful layer is replacing best-effort line scanning with syntax-aware symbol extraction where language parsers are available.
