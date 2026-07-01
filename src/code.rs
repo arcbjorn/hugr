@@ -156,6 +156,18 @@ fn extract_symbols(
             return Ok(symbols);
         }
     }
+    if matches!(language, Some("typescript")) {
+        let symbols = extract_typescript_symbols_with_tree_sitter(path, contents)?;
+        if !symbols.is_empty() {
+            return Ok(symbols);
+        }
+    }
+    if matches!(language, Some("go")) {
+        let symbols = extract_go_symbols_with_tree_sitter(path, contents)?;
+        if !symbols.is_empty() {
+            return Ok(symbols);
+        }
+    }
 
     extract_symbols_from_lines(path, language, contents)
 }
@@ -386,6 +398,197 @@ fn python_signature(node: Node<'_>, contents: &str) -> String {
         .nth(node.start_position().row)
         .map(|line| clean_signature(line.trim_end_matches(':')))
         .unwrap_or_else(|| clean_signature(&contents[node.start_byte()..node.end_byte()]))
+}
+
+fn extract_typescript_symbols_with_tree_sitter(
+    path: &str,
+    contents: &str,
+) -> Result<Vec<CodeSymbol>, String> {
+    let mut parser = Parser::new();
+    if path.ends_with(".tsx") {
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
+            .map_err(|error| error.to_string())?;
+    } else {
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .map_err(|error| error.to_string())?;
+    }
+    let Some(tree) = parser.parse(contents, None) else {
+        return Ok(Vec::new());
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return Ok(Vec::new());
+    }
+
+    let mut symbols = Vec::new();
+    collect_typescript_symbols(path, contents, root, &mut symbols)?;
+    symbols.sort_by(|left, right| {
+        left.line_start
+            .cmp(&right.line_start)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(symbols)
+}
+
+fn collect_typescript_symbols(
+    path: &str,
+    contents: &str,
+    node: Node<'_>,
+    symbols: &mut Vec<CodeSymbol>,
+) -> Result<(), String> {
+    if let Some(symbol) = typescript_symbol_from_node(path, contents, node)? {
+        symbols.push(symbol);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_typescript_symbols(path, contents, child, symbols)?;
+    }
+
+    Ok(())
+}
+
+fn typescript_symbol_from_node(
+    path: &str,
+    contents: &str,
+    node: Node<'_>,
+) -> Result<Option<CodeSymbol>, String> {
+    let (kind, name_node) = match node.kind() {
+        "abstract_class_declaration" | "class_declaration" => {
+            ("class", node.child_by_field_name("name"))
+        }
+        "enum_declaration" => ("enum", node.child_by_field_name("name")),
+        "function_declaration" | "generator_function_declaration" | "method_definition" => {
+            ("function", node.child_by_field_name("name"))
+        }
+        "interface_declaration" => ("interface", node.child_by_field_name("name")),
+        "type_alias_declaration" => ("type", node.child_by_field_name("name")),
+        "variable_declarator" => typescript_function_variable(node),
+        _ => return Ok(None),
+    };
+    let Some(name_node) = name_node else {
+        return Ok(None);
+    };
+    let name = node_text(name_node, contents)?;
+
+    Ok(Some(CodeSymbol {
+        path: path.to_string(),
+        language: Some("typescript".to_string()),
+        name,
+        kind: kind.to_string(),
+        line_start: line_number(node.start_position().row),
+        line_end: Some(line_number(node.end_position().row)),
+        signature: line_signature(node, contents),
+    }))
+}
+
+fn typescript_function_variable(node: Node<'_>) -> (&'static str, Option<Node<'_>>) {
+    let value = node.child_by_field_name("value");
+    let is_function = value.is_some_and(|value| {
+        matches!(
+            value.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        )
+    });
+    if !is_function {
+        return ("variable", None);
+    }
+
+    let name = node
+        .child_by_field_name("name")
+        .filter(|name| name.kind() == "identifier");
+    ("function", name)
+}
+
+fn line_signature(node: Node<'_>, contents: &str) -> String {
+    contents
+        .lines()
+        .nth(node.start_position().row)
+        .map(clean_signature)
+        .unwrap_or_else(|| clean_signature(&contents[node.start_byte()..node.end_byte()]))
+}
+
+fn extract_go_symbols_with_tree_sitter(
+    path: &str,
+    contents: &str,
+) -> Result<Vec<CodeSymbol>, String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .map_err(|error| error.to_string())?;
+    let Some(tree) = parser.parse(contents, None) else {
+        return Ok(Vec::new());
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return Ok(Vec::new());
+    }
+
+    let mut symbols = Vec::new();
+    collect_go_symbols(path, contents, root, &mut symbols)?;
+    symbols.sort_by(|left, right| {
+        left.line_start
+            .cmp(&right.line_start)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(symbols)
+}
+
+fn collect_go_symbols(
+    path: &str,
+    contents: &str,
+    node: Node<'_>,
+    symbols: &mut Vec<CodeSymbol>,
+) -> Result<(), String> {
+    if let Some(symbol) = go_symbol_from_node(path, contents, node)? {
+        symbols.push(symbol);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_go_symbols(path, contents, child, symbols)?;
+    }
+
+    Ok(())
+}
+
+fn go_symbol_from_node(
+    path: &str,
+    contents: &str,
+    node: Node<'_>,
+) -> Result<Option<CodeSymbol>, String> {
+    let (kind, name_node) = match node.kind() {
+        "function_declaration" | "method_declaration" => {
+            ("function", node.child_by_field_name("name"))
+        }
+        "type_alias" => ("type", node.child_by_field_name("name")),
+        "type_spec" => (go_type_spec_kind(node), node.child_by_field_name("name")),
+        _ => return Ok(None),
+    };
+    let Some(name_node) = name_node else {
+        return Ok(None);
+    };
+    let name = node_text(name_node, contents)?;
+
+    Ok(Some(CodeSymbol {
+        path: path.to_string(),
+        language: Some("go".to_string()),
+        name,
+        kind: kind.to_string(),
+        line_start: line_number(node.start_position().row),
+        line_end: Some(line_number(node.end_position().row)),
+        signature: line_signature(node, contents),
+    }))
+}
+
+fn go_type_spec_kind(node: Node<'_>) -> &'static str {
+    match node.child_by_field_name("type").map(|node| node.kind()) {
+        Some("struct_type") => "struct",
+        Some("interface_type") => "interface",
+        _ => "type",
+    }
 }
 
 fn extract_rust_symbol(line: &str) -> Option<(String, String)> {
@@ -837,6 +1040,135 @@ export class PluginRegistry {}
         assert!(has_symbol(&symbols, "interface", "PluginHook", 2));
         assert!(has_symbol(&symbols, "function", "runPluginHooks", 3));
         assert!(has_symbol(&symbols, "class", "PluginRegistry", 4));
+    }
+
+    #[test]
+    fn tree_sitter_typescript_extracts_multiline_ranges() {
+        let symbols = extract_symbols(
+            "src/pluginHooks.ts",
+            Some("typescript"),
+            r#"
+export interface PluginHook {
+    enabled: boolean;
+}
+
+export type HookResult = {
+    loaded: boolean;
+};
+
+export class PluginRegistry {
+    runPluginHooks() {
+        return true;
+    }
+}
+
+export const createRegistry = () => {
+    return new PluginRegistry();
+};
+"#,
+        )
+        .unwrap();
+
+        let interface = symbols
+            .iter()
+            .find(|symbol| symbol.name == "PluginHook")
+            .unwrap();
+        let type_alias = symbols
+            .iter()
+            .find(|symbol| symbol.name == "HookResult")
+            .unwrap();
+        let class = symbols
+            .iter()
+            .find(|symbol| symbol.name == "PluginRegistry")
+            .unwrap();
+        let method = symbols
+            .iter()
+            .find(|symbol| symbol.name == "runPluginHooks")
+            .unwrap();
+        let arrow_function = symbols
+            .iter()
+            .find(|symbol| symbol.name == "createRegistry")
+            .unwrap();
+
+        assert_eq!(interface.kind, "interface");
+        assert_eq!(interface.line_start, 2);
+        assert_eq!(interface.line_end, Some(4));
+        assert_eq!(type_alias.kind, "type");
+        assert_eq!(type_alias.line_start, 6);
+        assert_eq!(type_alias.line_end, Some(8));
+        assert_eq!(class.kind, "class");
+        assert_eq!(class.line_start, 10);
+        assert_eq!(class.line_end, Some(14));
+        assert_eq!(method.kind, "function");
+        assert_eq!(method.line_start, 11);
+        assert_eq!(method.line_end, Some(13));
+        assert_eq!(arrow_function.kind, "function");
+        assert_eq!(arrow_function.line_start, 16);
+        assert_eq!(arrow_function.line_end, Some(18));
+        assert!(
+            arrow_function
+                .signature
+                .contains("export const createRegistry")
+        );
+    }
+
+    #[test]
+    fn tree_sitter_go_extracts_multiline_ranges() {
+        let symbols = extract_symbols(
+            "plugin/hooks.go",
+            Some("go"),
+            r#"
+package plugin
+
+type PluginRegistry struct {
+    enabled bool
+}
+
+type PluginHook interface {
+    RunPluginHooks() bool
+}
+
+func NewPluginRegistry() *PluginRegistry {
+    return &PluginRegistry{}
+}
+
+func (r *PluginRegistry) RunPluginHooks() bool {
+    return r.enabled
+}
+"#,
+        )
+        .unwrap();
+
+        let registry = symbols
+            .iter()
+            .find(|symbol| symbol.name == "PluginRegistry")
+            .unwrap();
+        let hook = symbols
+            .iter()
+            .find(|symbol| symbol.name == "PluginHook")
+            .unwrap();
+        let constructor = symbols
+            .iter()
+            .find(|symbol| symbol.name == "NewPluginRegistry")
+            .unwrap();
+        let method = symbols
+            .iter()
+            .find(|symbol| symbol.name == "RunPluginHooks")
+            .unwrap();
+
+        assert_eq!(registry.kind, "struct");
+        assert_eq!(registry.line_start, 4);
+        assert_eq!(registry.line_end, Some(6));
+        assert_eq!(hook.kind, "interface");
+        assert_eq!(hook.line_start, 8);
+        assert_eq!(hook.line_end, Some(10));
+        assert_eq!(constructor.kind, "function");
+        assert_eq!(constructor.line_start, 12);
+        assert_eq!(constructor.line_end, Some(14));
+        assert_eq!(method.kind, "function");
+        assert_eq!(method.line_start, 16);
+        assert_eq!(method.line_end, Some(18));
+        assert!(method.signature.contains("RunPluginHooks"));
     }
 
     fn has_symbol(symbols: &[CodeSymbol], kind: &str, name: &str, line_start: i64) -> bool {
