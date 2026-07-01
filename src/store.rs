@@ -1,6 +1,6 @@
 use crate::code::{CodeReference, CodeSymbol};
 use crate::discovery::FileCandidate;
-use crate::embedding::{DeterministicEmbeddingProvider, EmbeddingProvider};
+use crate::embedding::{EmbeddingProvider, SelectedEmbeddingProvider};
 use crate::migrations;
 use crate::testmap::{self, TestCandidate};
 use libsql::{Builder, Connection, Row, params};
@@ -25,6 +25,7 @@ pub struct Memory {
 
 pub struct Store {
     root: PathBuf,
+    embedding_provider: Result<SelectedEmbeddingProvider, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,12 +78,16 @@ impl Store {
     pub fn open_current() -> Self {
         Self {
             root: PathBuf::from(HUGR_DIR),
+            embedding_provider: SelectedEmbeddingProvider::from_env(),
         }
     }
 
     #[cfg(test)]
     fn open_at(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            embedding_provider: Ok(SelectedEmbeddingProvider::default()),
+        }
     }
 
     pub async fn init(&self) -> Result<(), String> {
@@ -122,7 +127,7 @@ impl Store {
         .await
         .map_err(|error| error.to_string())?;
 
-        let embedding = DeterministicEmbeddingProvider::default().embed(&memory.text)?;
+        let embedding = self.embedding_provider()?.embed(&memory.text)?;
         let embedding_dimensions =
             i64::try_from(embedding.dimensions()).map_err(|error| error.to_string())?;
         let embedding_vector = embedding.to_vector_literal();
@@ -872,7 +877,7 @@ impl Store {
         query: &str,
         limit: usize,
     ) -> Result<Vec<RankedMemory>, String> {
-        let embedding = DeterministicEmbeddingProvider::default().embed(query)?;
+        let embedding = self.embedding_provider()?.embed(query)?;
         let query_vector = embedding.to_vector_literal();
         let candidate_limit = i64::try_from(limit.max(50)).map_err(|error| error.to_string())?;
         let mut rows = conn
@@ -946,6 +951,17 @@ impl Store {
         self.root.join(HUGR_DB)
     }
 
+    pub fn embedding_provider_summary(&self) -> String {
+        match self.embedding_provider() {
+            Ok(provider) => format!(
+                "{} ({} dimensions)",
+                provider.model(),
+                provider.dimensions()
+            ),
+            Err(error) => format!("configuration error: {error}"),
+        }
+    }
+
     async fn connect(&self) -> Result<Connection, String> {
         let db = Builder::new_local(self.db_path())
             .build()
@@ -956,6 +972,12 @@ impl Store {
             .await
             .map_err(|error| error.to_string())?;
         Ok(conn)
+    }
+
+    fn embedding_provider(&self) -> Result<&SelectedEmbeddingProvider, String> {
+        self.embedding_provider
+            .as_ref()
+            .map_err(|error| error.clone())
     }
 }
 
