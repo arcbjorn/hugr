@@ -51,6 +51,7 @@ Implemented:
 - `hugr forget [--json] <query>` soft-retires active memories by setting `valid_to`
 - `hugr improve [--json]` reports active/retired memory counts and exact duplicate active-memory groups
 - `hugr improve --execute --duplicates [--json]` retires older duplicate memories and points them at the kept fact
+- `hugr improve [--json]` reports deterministic stale candidates for active memories with opposing terms
 - initial vision, storage, and technical blueprint docs
 
 Not implemented yet:
@@ -58,7 +59,7 @@ Not implemented yet:
 - tree-sitter-backed parsing for additional languages beyond Rust, Python, TypeScript, and Go
 - richer symbol graph edges
 - remote-only storage execution and the Hugr API sync backend
-- richer stale or contradicted fact detection
+- executable stale-candidate retirement behind `hugr improve`
 
 ## Runtime Decision
 
@@ -389,6 +390,7 @@ Tasks:
 - Add `hugr improve [--json]` for maintenance inspection.
 - Surface active and retired memory counts.
 - Detect exact duplicate active-memory groups.
+- Detect likely stale or contradictory memory pairs with deterministic signals.
 - Wire `hugr_forget` through MCP.
 
 Implemented first slice:
@@ -397,6 +399,7 @@ Implemented first slice:
 - Retired memories stay in `memories` for audit/sync but are excluded from `memories()`, FTS recall, vector recall, and context packs.
 - `hugr improve [--json]` renders active count, retired count, and exact duplicate active-memory groups.
 - `hugr improve --execute --duplicates [--json]` keeps the newest duplicate in each exact group, retires older duplicates, and writes `superseded_by`.
+- `hugr improve [--json]` reports stale candidates when active memories share meaningful terms but contain opposing deterministic signal terms such as `after` versus `before`.
 - `hugr_forget` now uses the same soft-retire behavior through MCP.
 - Hybrid pull can propagate remote memory retirement metadata without overwriting local memory text.
 
@@ -404,7 +407,7 @@ Open questions:
 
 - Should `hugr improve --execute` support multiple maintenance actions at once, or require one explicit action flag per run?
 - Should retired memories remain syncable forever, or be pruned after a retention window?
-- What stale-fact signals should be deterministic before introducing LLM-assisted consolidation?
+- Which stale-candidate signals should be executable without a human confirmation step?
 
 ## Near-Term Implementation Order
 
@@ -437,6 +440,7 @@ Recommended next commits:
 25. Done: `feat(sync): report conflicts and history`
 26. Done: `feat(memory): soft forget memories`
 27. Done: `feat(memory): consolidate duplicates`
+28. Done: `feat(memory): detect stale candidates`
 
 Each commit should leave the CLI usable.
 
@@ -453,6 +457,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add deterministic stale-fact detection.
+Add explicit stale-candidate retirement.
 
-That is the right next step because Hugr can now retire memories and consolidate exact duplicates. The remaining maintenance gap is detecting likely contradictions or stale facts without relying on an LLM, then surfacing those candidates in `hugr improve --json`.
+That is the right next step because Hugr can now surface likely stale or contradictory memory pairs with deterministic evidence. The next useful layer is an explicit execution path that retires the older candidate only when the signal is strong enough and the user opts in.
