@@ -389,10 +389,11 @@ fn render_forget_json(result: &ForgetResult) -> String {
 
 fn render_improve_text(report: &MemoryMaintenanceReport) -> String {
     let mut rendered = format!(
-        "Hugr improve\n  active_memories: {}\n  retired_memories: {}\n  duplicate_groups: {}\n",
+        "Hugr improve\n  active_memories: {}\n  retired_memories: {}\n  duplicate_groups: {}\n  stale_candidates: {}\n",
         report.active_count,
         report.retired_count,
-        report.duplicate_groups.len()
+        report.duplicate_groups.len(),
+        report.stale_candidates.len()
     );
 
     for group in &report.duplicate_groups {
@@ -411,15 +412,36 @@ fn render_improve_text(report: &MemoryMaintenanceReport) -> String {
         }
     }
 
+    for candidate in &report.stale_candidates {
+        let _ = writeln!(
+            rendered,
+            "- stale_candidate: {} ({}) shared: {}",
+            candidate.reason,
+            candidate.signal,
+            candidate.shared_terms.join(",")
+        );
+        let _ = writeln!(
+            rendered,
+            "  newer {} [{}]: {}",
+            candidate.newer_memory.id, candidate.newer_memory.kind, candidate.newer_memory.text
+        );
+        let _ = writeln!(
+            rendered,
+            "  older {} [{}]: {}",
+            candidate.older_memory.id, candidate.older_memory.kind, candidate.older_memory.text
+        );
+    }
+
     rendered
 }
 
 fn render_improve_json(report: &MemoryMaintenanceReport) -> String {
     format!(
-        "{{\"active_count\":{},\"retired_count\":{},\"duplicate_groups\":{}}}",
+        "{{\"active_count\":{},\"retired_count\":{},\"duplicate_groups\":{},\"stale_candidates\":{}}}",
         report.active_count,
         report.retired_count,
-        render_duplicate_groups_json(&report.duplicate_groups)
+        render_duplicate_groups_json(&report.duplicate_groups),
+        render_stale_candidates_json(&report.stale_candidates)
     )
 }
 
@@ -434,6 +456,32 @@ fn render_duplicate_groups_json(groups: &[crate::store::DuplicateMemoryGroup]) -
             "{{\"normalized_text\":{},\"memories\":{}}}",
             json_string(&group.normalized_text),
             render_memory_list_json(&group.memories)
+        );
+    }
+    rendered.push(']');
+    rendered
+}
+
+fn render_stale_candidates_json(candidates: &[crate::store::StaleMemoryCandidate]) -> String {
+    let mut rendered = String::from("[");
+    for (index, candidate) in candidates.iter().enumerate() {
+        if index > 0 {
+            rendered.push(',');
+        }
+        let shared_terms = candidate
+            .shared_terms
+            .iter()
+            .map(|term| json_string(term))
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = write!(
+            rendered,
+            "{{\"reason\":{},\"signal\":{},\"shared_terms\":[{}],\"newer_memory\":{},\"older_memory\":{}}}",
+            json_string(&candidate.reason),
+            json_string(&candidate.signal),
+            shared_terms,
+            render_memory_json(&candidate.newer_memory),
+            render_memory_json(&candidate.older_memory)
         );
     }
     rendered.push(']');
@@ -725,8 +773,8 @@ mod tests {
     };
     use crate::store::{
         DuplicateMemoryGroup, ForgetResult, Memory, MemoryConsolidationResult,
-        MemoryMaintenanceReport, SyncConflictSummary, SyncExecutionPlan, SyncPullResult,
-        SyncPushResult, SyncRunHistory, SyncTableResult,
+        MemoryMaintenanceReport, StaleMemoryCandidate, SyncConflictSummary, SyncExecutionPlan,
+        SyncPullResult, SyncPushResult, SyncRunHistory, SyncTableResult,
     };
 
     #[test]
@@ -791,15 +839,34 @@ mod tests {
                     },
                 ],
             }],
+            stale_candidates: vec![StaleMemoryCandidate {
+                reason: "opposing_terms".to_string(),
+                signal: "after_vs_before".to_string(),
+                shared_terms: vec!["hooks".to_string(), "plugin".to_string(), "run".to_string()],
+                newer_memory: Memory {
+                    id: "mem_new".to_string(),
+                    created_at_ms: 9,
+                    kind: "fact".to_string(),
+                    text: "plugin hooks run before configuration".to_string(),
+                },
+                older_memory: Memory {
+                    id: "mem_old".to_string(),
+                    created_at_ms: 7,
+                    kind: "fact".to_string(),
+                    text: "plugin hooks run after configuration".to_string(),
+                },
+            }],
         };
 
         let text = render_improve_text(&report);
         assert!(text.contains("active_memories: 2"));
         assert!(text.contains("duplicate: plugin hooks"));
+        assert!(text.contains("stale_candidate: opposing_terms"));
 
         let json = render_improve_json(&report);
         assert!(json.contains("\"retired_count\":1"));
         assert!(json.contains("\"normalized_text\":\"plugin hooks\""));
+        assert!(json.contains("\"signal\":\"after_vs_before\""));
     }
 
     #[test]
