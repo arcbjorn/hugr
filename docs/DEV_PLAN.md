@@ -43,13 +43,16 @@ Implemented:
 - `hugr impact <file-or-symbol>` for direct indexed impact reports
 - local branch, upstream, ahead/behind, and worktree changes in context packs
 - environment-driven cloud/hybrid storage config placeholders with redacted status output
+- safe default and explicit opt-in cloud/hybrid sync class policy
+- `hugr sync status` execution-plan output for cloud/hybrid sync decisions
+- guarded `hugr sync push` dry-run and explicit execution path for safe sync classes
 - initial vision, storage, and technical blueprint docs
 
 Not implemented yet:
 
 - tree-sitter-backed parsing for additional languages beyond Rust, Python, TypeScript, and Go
 - richer symbol graph edges
-- cloud or hybrid sync execution
+- cloud or hybrid pull, reconciliation, and conflict handling
 
 ## Runtime Decision
 
@@ -353,6 +356,11 @@ Implemented first slice:
 - `HUGR_REMOTE_DATABASE_URL` and `HUGR_REMOTE_AUTH_TOKEN` placeholders are recognized, with common libSQL/Turso aliases.
 - CLI status, project status, doctor, and MCP project status expose redacted storage configuration.
 - Remote mode fails closed instead of silently writing to the local database; hybrid mode keeps local storage active while remote sync remains disabled.
+- `HUGR_SYNC_CLASSES` represents safe default sync classes and explicit opt-ins for full source, raw command output, secrets, and private notes.
+- `HUGR_SYNC_BACKEND=direct_libsql|hugr_api` records the execution strategy decision, defaulting to direct libSQL/Turso.
+- `hugr sync status [--json]` renders the current sync execution plan, with remote reads and writes disabled until execution is implemented.
+- `hugr sync push [--dry-run|--execute] [--json]` counts configured sync-class tables locally by default and only writes to direct libSQL/Turso when `--execute` and hybrid remote config are explicit.
+- Sync push currently covers project metadata, memories, embeddings, source references, entity/code-symbol indexes, graph/code-reference edges, and finalized session summaries. It does not sync raw session events, shell output, secrets, private notes, or full source without future explicit data sources.
 
 Open questions:
 
@@ -383,6 +391,9 @@ Recommended next commits:
 18. Done: `feat(parser): use tree-sitter typescript`
 19. Done: `feat(parser): use tree-sitter go`
 20. Done: `feat(config): add storage mode placeholders`
+21. Done: `feat(sync): define sync class policy`
+22. Done: `feat(sync): expose sync execution plan`
+23. Done: `feat(sync): push safe sync classes`
 
 Each commit should leave the CLI usable.
 
@@ -399,6 +410,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Define cloud and hybrid sync classes.
+Implement hybrid sync pull and reconciliation.
 
-That is the right next step because Hugr now has a validated remote configuration boundary without syncing source contents by default. The next useful layer is representing sync classes so memories, sessions, embeddings, and code indexes can be opted in independently before any remote execution is wired up.
+That is the right next step because Hugr now has a guarded push path for safe sync classes without syncing source contents by default. The next useful layer is pull/reconciliation semantics so hybrid workspaces can converge without clobbering local memories or indexes.
