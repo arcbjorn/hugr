@@ -150,6 +150,12 @@ fn extract_symbols(
             return Ok(symbols);
         }
     }
+    if matches!(language, Some("python")) {
+        let symbols = extract_python_symbols_with_tree_sitter(path, contents)?;
+        if !symbols.is_empty() {
+            return Ok(symbols);
+        }
+    }
 
     extract_symbols_from_lines(path, language, contents)
 }
@@ -302,6 +308,84 @@ fn node_text(node: Node<'_>, contents: &str) -> Result<String, String> {
 
 fn line_number(row: usize) -> i64 {
     i64::try_from(row + 1).unwrap_or(i64::MAX)
+}
+
+fn extract_python_symbols_with_tree_sitter(
+    path: &str,
+    contents: &str,
+) -> Result<Vec<CodeSymbol>, String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .map_err(|error| error.to_string())?;
+    let Some(tree) = parser.parse(contents, None) else {
+        return Ok(Vec::new());
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return Ok(Vec::new());
+    }
+
+    let mut symbols = Vec::new();
+    collect_python_symbols(path, contents, root, &mut symbols)?;
+    symbols.sort_by(|left, right| {
+        left.line_start
+            .cmp(&right.line_start)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(symbols)
+}
+
+fn collect_python_symbols(
+    path: &str,
+    contents: &str,
+    node: Node<'_>,
+    symbols: &mut Vec<CodeSymbol>,
+) -> Result<(), String> {
+    if let Some(symbol) = python_symbol_from_node(path, contents, node)? {
+        symbols.push(symbol);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_python_symbols(path, contents, child, symbols)?;
+    }
+
+    Ok(())
+}
+
+fn python_symbol_from_node(
+    path: &str,
+    contents: &str,
+    node: Node<'_>,
+) -> Result<Option<CodeSymbol>, String> {
+    let (kind, name_node) = match node.kind() {
+        "function_definition" => ("function", node.child_by_field_name("name")),
+        "class_definition" => ("class", node.child_by_field_name("name")),
+        _ => return Ok(None),
+    };
+    let Some(name_node) = name_node else {
+        return Ok(None);
+    };
+    let name = node_text(name_node, contents)?;
+
+    Ok(Some(CodeSymbol {
+        path: path.to_string(),
+        language: Some("python".to_string()),
+        name,
+        kind: kind.to_string(),
+        line_start: line_number(node.start_position().row),
+        line_end: Some(line_number(node.end_position().row)),
+        signature: python_signature(node, contents),
+    }))
+}
+
+fn python_signature(node: Node<'_>, contents: &str) -> String {
+    contents
+        .lines()
+        .nth(node.start_position().row)
+        .map(|line| clean_signature(line.trim_end_matches(':')))
+        .unwrap_or_else(|| clean_signature(&contents[node.start_byte()..node.end_byte()]))
 }
 
 fn extract_rust_symbol(line: &str) -> Option<(String, String)> {
