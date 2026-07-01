@@ -105,7 +105,7 @@ async fn handle_tool_call(params: Value) -> Result<Value, String> {
         "hugr_session_end" => tool_session_end(&arguments).await,
         "hugr_index" => tool_index(&arguments).await,
         "hugr_impact" => tool_impact(&arguments).await,
-        "hugr_forget" => Ok(tool_error_result(&format!("{name} is not implemented yet"))),
+        "hugr_forget" => tool_forget(&arguments).await,
         unknown => Err(format!("unknown tool '{unknown}'")),
     }
 }
@@ -156,6 +156,23 @@ async fn tool_recall(arguments: &Value) -> Result<Value, String> {
         "memories": memories.iter().map(memory_json).collect::<Vec<_>>()
     });
     Ok(tool_result(structured.to_string(), structured))
+}
+
+async fn tool_forget(arguments: &Value) -> Result<Value, String> {
+    let query = required_string(arguments, "query")?;
+    let limit = optional_bounded_usize(arguments, "limit", 25, 100)?;
+    let result = Store::open_current().forget(&query, limit).await?;
+    let structured = json!({
+        "query": result.query,
+        "forgotten_count": result.forgotten_count,
+        "forgotten_at": result.forgotten_at,
+        "memories": result.memories.iter().map(memory_json).collect::<Vec<_>>()
+    });
+
+    Ok(tool_result(
+        format!("forgot {} memories", result.forgotten_count),
+        structured,
+    ))
 }
 
 async fn tool_project_status() -> Result<Value, String> {
@@ -262,7 +279,7 @@ fn tools() -> Vec<Value> {
         ),
         tool_schema(
             "hugr_forget",
-            "Placeholder for future memory deletion.",
+            "Retire memories matching a query.",
             &[("query", "string")],
         ),
         tool_schema("hugr_index", "Index project files and symbols.", &[]),
@@ -288,13 +305,13 @@ fn tool_schema(name: &str, description: &str, properties: &[(&str, &str)]) -> Va
         required.push(json!(property));
     }
 
-    if name == "hugr_recall" {
+    if name == "hugr_recall" || name == "hugr_forget" {
         props.insert(
             "limit".to_string(),
             json!({
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 50
+                "maximum": if name == "hugr_forget" { 100 } else { 50 }
             }),
         );
     }
@@ -381,18 +398,6 @@ fn tool_result(text: String, structured: Value) -> Value {
             }
         ],
         "structuredContent": structured
-    })
-}
-
-fn tool_error_result(message: &str) -> Value {
-    json!({
-        "isError": true,
-        "content": [
-            {
-                "type": "text",
-                "text": message
-            }
-        ]
     })
 }
 
@@ -492,5 +497,6 @@ mod tests {
         assert!(names.contains(&"hugr_session_start"));
         assert!(names.contains(&"hugr_session_event"));
         assert!(names.contains(&"hugr_session_end"));
+        assert!(names.contains(&"hugr_forget"));
     }
 }
