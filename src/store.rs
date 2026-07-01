@@ -22,11 +22,79 @@ enum StorageMode {
     Remote,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncBackend {
+    DirectLibsql,
+    HugrApi,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncClass {
+    Memories,
+    Sources,
+    Entities,
+    Edges,
+    Embeddings,
+    ContextPacks,
+    SessionSummaries,
+    FullSource,
+    RawCommandOutput,
+    Secrets,
+    PrivateNotes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SyncTableKind {
+    Projects,
+    Memories,
+    MemoryEmbeddings,
+    Sources,
+    DiscoveredFiles,
+    Entities,
+    CodeSymbols,
+    Edges,
+    CodeReferences,
+    Sessions,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StorageConfig {
     mode: StorageMode,
+    backend: SyncBackend,
     remote_url: Option<String>,
+    remote_auth_token: Option<String>,
     auth_token_configured: bool,
+    sync_classes: Vec<SyncClass>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncExecutionPlan {
+    pub storage_mode: String,
+    pub backend: String,
+    pub local_writes_enabled: bool,
+    pub remote_configured: bool,
+    pub remote_auth_configured: bool,
+    pub remote_reads_enabled: bool,
+    pub remote_writes_enabled: bool,
+    pub sync_classes: Vec<String>,
+    pub explicit_opt_in_classes: Vec<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncPushResult {
+    pub dry_run: bool,
+    pub backend: String,
+    pub status: String,
+    pub tables: Vec<SyncTableResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncTableResult {
+    pub class: String,
+    pub table: String,
+    pub row_count: usize,
+    pub executed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -986,6 +1054,51 @@ impl Store {
         }
     }
 
+    pub fn sync_execution_plan(&self) -> Result<SyncExecutionPlan, String> {
+        self.storage_config()
+            .map(StorageConfig::sync_execution_plan)
+    }
+
+    pub async fn sync_push(&self, dry_run: bool) -> Result<SyncPushResult, String> {
+        self.init().await?;
+        let config = self.storage_config()?.clone();
+        let local_conn = self.connect().await?;
+        migrations::migrate(&local_conn).await?;
+        let mut tables = self.sync_table_results(&local_conn, &config, false).await?;
+
+        if !dry_run {
+            self.ensure_sync_push_execution_allowed(&config)?;
+            let remote_url = config
+                .remote_url
+                .as_ref()
+                .ok_or_else(|| "remote database URL is not configured".to_string())?;
+            let remote_auth_token = config
+                .remote_auth_token
+                .as_ref()
+                .ok_or_else(|| "remote auth token is not configured".to_string())?;
+            let remote_db = Builder::new_remote(remote_url.clone(), remote_auth_token.clone())
+                .build()
+                .await
+                .map_err(|error| error.to_string())?;
+            let remote_conn = remote_db.connect().map_err(|error| error.to_string())?;
+            migrations::migrate(&remote_conn).await?;
+            self.copy_sync_tables(&local_conn, &remote_conn, &config)
+                .await?;
+            tables = self.sync_table_results(&local_conn, &config, true).await?;
+        }
+
+        Ok(SyncPushResult {
+            dry_run,
+            backend: config.backend.as_str().to_string(),
+            status: if dry_run {
+                "dry_run".to_string()
+            } else {
+                "executed".to_string()
+            },
+            tables,
+        })
+    }
+
     async fn connect(&self) -> Result<Connection, String> {
         let storage_config = self.storage_config()?;
         if matches!(storage_config.mode, StorageMode::Remote) {
@@ -1015,6 +1128,607 @@ impl Store {
     fn storage_config(&self) -> Result<&StorageConfig, String> {
         self.storage_config.as_ref().map_err(|error| error.clone())
     }
+
+    fn ensure_sync_push_execution_allowed(&self, config: &StorageConfig) -> Result<(), String> {
+        if !matches!(config.mode, StorageMode::Hybrid) {
+            return Err("hugr sync push --execute requires HUGR_STORAGE_MODE=hybrid".to_string());
+        }
+        if !matches!(config.backend, SyncBackend::DirectLibsql) {
+            return Err("hugr sync push --execute only supports direct_libsql backend".to_string());
+        }
+        if config.remote_url.is_none() {
+            return Err("hugr sync push --execute requires HUGR_REMOTE_DATABASE_URL".to_string());
+        }
+        if config.remote_auth_token.is_none() {
+            return Err("hugr sync push --execute requires HUGR_REMOTE_AUTH_TOKEN".to_string());
+        }
+        Ok(())
+    }
+
+    async fn sync_table_results(
+        &self,
+        conn: &Connection,
+        config: &StorageConfig,
+        executed: bool,
+    ) -> Result<Vec<SyncTableResult>, String> {
+        let mut results = Vec::new();
+        for table in sync_tables_for_config(config) {
+            results.push(SyncTableResult {
+                class: table.sync_class().to_string(),
+                table: table.table_name().to_string(),
+                row_count: table_row_count(conn, table.table_name()).await?,
+                executed,
+            });
+        }
+        Ok(results)
+    }
+
+    async fn copy_sync_tables(
+        &self,
+        local_conn: &Connection,
+        remote_conn: &Connection,
+        config: &StorageConfig,
+    ) -> Result<(), String> {
+        for table in sync_tables_for_config(config) {
+            copy_sync_table(local_conn, remote_conn, table).await?;
+        }
+        Ok(())
+    }
+}
+
+impl SyncTableKind {
+    fn table_name(self) -> &'static str {
+        match self {
+            Self::Projects => "projects",
+            Self::Memories => "memories",
+            Self::MemoryEmbeddings => "memory_embeddings",
+            Self::Sources => "sources",
+            Self::DiscoveredFiles => "discovered_files",
+            Self::Entities => "entities",
+            Self::CodeSymbols => "code_symbols",
+            Self::Edges => "edges",
+            Self::CodeReferences => "code_references",
+            Self::Sessions => "sessions",
+        }
+    }
+
+    fn sync_class(self) -> &'static str {
+        match self {
+            Self::Projects => "project_metadata",
+            Self::Memories => "memories",
+            Self::MemoryEmbeddings => "embeddings",
+            Self::Sources | Self::DiscoveredFiles => "sources",
+            Self::Entities | Self::CodeSymbols => "entities",
+            Self::Edges | Self::CodeReferences => "edges",
+            Self::Sessions => "session_summaries",
+        }
+    }
+}
+
+fn sync_tables_for_config(config: &StorageConfig) -> Vec<SyncTableKind> {
+    let mut tables = Vec::new();
+    let mut seen = HashSet::new();
+
+    push_sync_table(&mut tables, &mut seen, SyncTableKind::Projects);
+    for class in &config.sync_classes {
+        match class {
+            SyncClass::Memories => push_sync_table(&mut tables, &mut seen, SyncTableKind::Memories),
+            SyncClass::Sources => {
+                push_sync_table(&mut tables, &mut seen, SyncTableKind::Sources);
+                push_sync_table(&mut tables, &mut seen, SyncTableKind::DiscoveredFiles);
+            }
+            SyncClass::Entities => {
+                push_sync_table(&mut tables, &mut seen, SyncTableKind::Entities);
+                push_sync_table(&mut tables, &mut seen, SyncTableKind::CodeSymbols);
+            }
+            SyncClass::Edges => {
+                push_sync_table(&mut tables, &mut seen, SyncTableKind::Edges);
+                push_sync_table(&mut tables, &mut seen, SyncTableKind::CodeReferences);
+            }
+            SyncClass::Embeddings => {
+                push_sync_table(&mut tables, &mut seen, SyncTableKind::MemoryEmbeddings)
+            }
+            SyncClass::SessionSummaries => {
+                push_sync_table(&mut tables, &mut seen, SyncTableKind::Sessions)
+            }
+            SyncClass::ContextPacks
+            | SyncClass::FullSource
+            | SyncClass::RawCommandOutput
+            | SyncClass::Secrets
+            | SyncClass::PrivateNotes => {}
+        }
+    }
+
+    tables
+}
+
+fn push_sync_table(
+    tables: &mut Vec<SyncTableKind>,
+    seen: &mut HashSet<SyncTableKind>,
+    table: SyncTableKind,
+) {
+    if seen.insert(table) {
+        tables.push(table);
+    }
+}
+
+async fn table_row_count(conn: &Connection, table_name: &str) -> Result<usize, String> {
+    let sql = format!("SELECT COUNT(*) FROM {table_name}");
+    let mut rows = conn
+        .query(&sql, ())
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+        return Ok(0);
+    };
+    let count = row.get::<i64>(0).map_err(|error| error.to_string())?;
+    usize::try_from(count).map_err(|error| error.to_string())
+}
+
+async fn copy_sync_table(
+    local_conn: &Connection,
+    remote_conn: &Connection,
+    table: SyncTableKind,
+) -> Result<(), String> {
+    match table {
+        SyncTableKind::Projects => copy_projects(local_conn, remote_conn).await,
+        SyncTableKind::Memories => copy_memories(local_conn, remote_conn).await,
+        SyncTableKind::MemoryEmbeddings => copy_memory_embeddings(local_conn, remote_conn).await,
+        SyncTableKind::Sources => copy_sources(local_conn, remote_conn).await,
+        SyncTableKind::DiscoveredFiles => copy_discovered_files(local_conn, remote_conn).await,
+        SyncTableKind::Entities => copy_entities(local_conn, remote_conn).await,
+        SyncTableKind::CodeSymbols => copy_code_symbols(local_conn, remote_conn).await,
+        SyncTableKind::Edges => copy_edges(local_conn, remote_conn).await,
+        SyncTableKind::CodeReferences => copy_code_references(local_conn, remote_conn).await,
+        SyncTableKind::Sessions => copy_sessions(local_conn, remote_conn).await,
+    }
+}
+
+async fn copy_projects(local_conn: &Connection, remote_conn: &Connection) -> Result<(), String> {
+    let mut rows = local_conn
+        .query(
+            "
+            SELECT id, name, root_path, git_remote, default_branch, created_at_ms, updated_at_ms
+            FROM projects
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        remote_conn
+            .execute(
+                "
+                INSERT INTO projects (
+                    id, name, root_path, git_remote, default_branch, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    root_path = excluded.root_path,
+                    git_remote = excluded.git_remote,
+                    default_branch = excluded.default_branch,
+                    updated_at_ms = excluded.updated_at_ms
+                ",
+                params![
+                    row.get::<String>(0).map_err(|error| error.to_string())?,
+                    row.get::<String>(1).map_err(|error| error.to_string())?,
+                    row.get::<String>(2).map_err(|error| error.to_string())?,
+                    row.get::<Option<String>>(3)
+                        .map_err(|error| error.to_string())?,
+                    row.get::<Option<String>>(4)
+                        .map_err(|error| error.to_string())?,
+                    row.get::<i64>(5).map_err(|error| error.to_string())?,
+                    row.get::<i64>(6).map_err(|error| error.to_string())?,
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+async fn copy_memories(local_conn: &Connection, remote_conn: &Connection) -> Result<(), String> {
+    let mut rows = local_conn
+        .query(
+            "
+            SELECT
+                id, created_at_ms, kind, text, confidence, valid_from, valid_to,
+                superseded_by, sensitivity, structured_payload
+            FROM memories
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        remote_conn
+            .execute(
+                "
+                INSERT INTO memories (
+                    id, created_at_ms, kind, text, confidence, valid_from, valid_to,
+                    superseded_by, sensitivity, structured_payload
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT(id) DO UPDATE SET
+                    created_at_ms = excluded.created_at_ms,
+                    kind = excluded.kind,
+                    text = excluded.text,
+                    confidence = excluded.confidence,
+                    valid_from = excluded.valid_from,
+                    valid_to = excluded.valid_to,
+                    superseded_by = excluded.superseded_by,
+                    sensitivity = excluded.sensitivity,
+                    structured_payload = excluded.structured_payload
+                ",
+                params![
+                    row.get::<String>(0).map_err(|error| error.to_string())?,
+                    row.get::<i64>(1).map_err(|error| error.to_string())?,
+                    row.get::<String>(2).map_err(|error| error.to_string())?,
+                    row.get::<String>(3).map_err(|error| error.to_string())?,
+                    row.get::<f64>(4).map_err(|error| error.to_string())?,
+                    row.get::<Option<String>>(5)
+                        .map_err(|error| error.to_string())?,
+                    row.get::<Option<String>>(6)
+                        .map_err(|error| error.to_string())?,
+                    row.get::<Option<String>>(7)
+                        .map_err(|error| error.to_string())?,
+                    row.get::<String>(8).map_err(|error| error.to_string())?,
+                    row.get::<Option<String>>(9)
+                        .map_err(|error| error.to_string())?,
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+async fn copy_memory_embeddings(
+    local_conn: &Connection,
+    remote_conn: &Connection,
+) -> Result<(), String> {
+    let mut rows = local_conn
+        .query(
+            "SELECT memory_id, model, dimensions, embedding FROM memory_embeddings",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        remote_conn
+            .execute(
+                "
+                INSERT INTO memory_embeddings (memory_id, model, dimensions, embedding)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(memory_id) DO UPDATE SET
+                    model = excluded.model,
+                    dimensions = excluded.dimensions,
+                    embedding = excluded.embedding
+                ",
+                params![
+                    row.get::<String>(0).map_err(|error| error.to_string())?,
+                    row.get::<String>(1).map_err(|error| error.to_string())?,
+                    row.get::<i64>(2).map_err(|error| error.to_string())?,
+                    row.get::<Vec<u8>>(3).map_err(|error| error.to_string())?,
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+async fn copy_sources(local_conn: &Connection, remote_conn: &Connection) -> Result<(), String> {
+    let mut rows = local_conn
+        .query("SELECT id, kind, locator, created_at_ms FROM sources", ())
+        .await
+        .map_err(|error| error.to_string())?;
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        remote_conn
+            .execute(
+                "
+                INSERT INTO sources (id, kind, locator, created_at_ms)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(id) DO UPDATE SET
+                    kind = excluded.kind,
+                    locator = excluded.locator,
+                    created_at_ms = excluded.created_at_ms
+                ",
+                params![
+                    row.get::<String>(0).map_err(|error| error.to_string())?,
+                    row.get::<String>(1).map_err(|error| error.to_string())?,
+                    row.get::<String>(2).map_err(|error| error.to_string())?,
+                    row.get::<i64>(3).map_err(|error| error.to_string())?,
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+async fn copy_discovered_files(
+    local_conn: &Connection,
+    remote_conn: &Connection,
+) -> Result<(), String> {
+    let mut rows = local_conn
+        .query(
+            "
+            SELECT project_id, path, language, size_bytes, discovered_at_ms, updated_at_ms
+            FROM discovered_files
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        remote_conn
+            .execute(
+                "
+                INSERT INTO discovered_files (
+                    project_id, path, language, size_bytes, discovered_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(project_id, path) DO UPDATE SET
+                    language = excluded.language,
+                    size_bytes = excluded.size_bytes,
+                    updated_at_ms = excluded.updated_at_ms
+                ",
+                params![
+                    row.get::<String>(0).map_err(|error| error.to_string())?,
+                    row.get::<String>(1).map_err(|error| error.to_string())?,
+                    row.get::<Option<String>>(2)
+                        .map_err(|error| error.to_string())?,
+                    row.get::<Option<i64>>(3)
+                        .map_err(|error| error.to_string())?,
+                    row.get::<i64>(4).map_err(|error| error.to_string())?,
+                    row.get::<i64>(5).map_err(|error| error.to_string())?,
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+async fn copy_entities(local_conn: &Connection, remote_conn: &Connection) -> Result<(), String> {
+    let mut rows = local_conn
+        .query(
+            "SELECT id, kind, name, locator, created_at_ms FROM entities",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        remote_conn
+            .execute(
+                "
+                INSERT INTO entities (id, kind, name, locator, created_at_ms)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT(id) DO UPDATE SET
+                    kind = excluded.kind,
+                    name = excluded.name,
+                    locator = excluded.locator,
+                    created_at_ms = excluded.created_at_ms
+                ",
+                params![
+                    row.get::<String>(0).map_err(|error| error.to_string())?,
+                    row.get::<String>(1).map_err(|error| error.to_string())?,
+                    row.get::<String>(2).map_err(|error| error.to_string())?,
+                    row.get::<Option<String>>(3)
+                        .map_err(|error| error.to_string())?,
+                    row.get::<i64>(4).map_err(|error| error.to_string())?,
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+async fn copy_code_symbols(
+    local_conn: &Connection,
+    remote_conn: &Connection,
+) -> Result<(), String> {
+    let mut rows = local_conn
+        .query(
+            "
+            SELECT
+                project_id, path, name, kind, language, line_start, line_end,
+                signature, indexed_at_ms
+            FROM code_symbols
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        remote_conn
+            .execute(
+                "
+                INSERT INTO code_symbols (
+                    project_id, path, name, kind, language, line_start, line_end,
+                    signature, indexed_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(project_id, path, kind, name, line_start) DO UPDATE SET
+                    language = excluded.language,
+                    line_end = excluded.line_end,
+                    signature = excluded.signature,
+                    indexed_at_ms = excluded.indexed_at_ms
+                ",
+                params![
+                    row.get::<String>(0).map_err(|error| error.to_string())?,
+                    row.get::<String>(1).map_err(|error| error.to_string())?,
+                    row.get::<String>(2).map_err(|error| error.to_string())?,
+                    row.get::<String>(3).map_err(|error| error.to_string())?,
+                    row.get::<Option<String>>(4)
+                        .map_err(|error| error.to_string())?,
+                    row.get::<i64>(5).map_err(|error| error.to_string())?,
+                    row.get::<Option<i64>>(6)
+                        .map_err(|error| error.to_string())?,
+                    row.get::<String>(7).map_err(|error| error.to_string())?,
+                    row.get::<i64>(8).map_err(|error| error.to_string())?,
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+async fn copy_edges(local_conn: &Connection, remote_conn: &Connection) -> Result<(), String> {
+    let mut rows = local_conn
+        .query(
+            "SELECT id, from_id, to_id, kind, created_at_ms FROM edges",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        remote_conn
+            .execute(
+                "
+                INSERT INTO edges (id, from_id, to_id, kind, created_at_ms)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT(id) DO UPDATE SET
+                    from_id = excluded.from_id,
+                    to_id = excluded.to_id,
+                    kind = excluded.kind,
+                    created_at_ms = excluded.created_at_ms
+                ",
+                params![
+                    row.get::<String>(0).map_err(|error| error.to_string())?,
+                    row.get::<String>(1).map_err(|error| error.to_string())?,
+                    row.get::<String>(2).map_err(|error| error.to_string())?,
+                    row.get::<String>(3).map_err(|error| error.to_string())?,
+                    row.get::<i64>(4).map_err(|error| error.to_string())?,
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+async fn copy_code_references(
+    local_conn: &Connection,
+    remote_conn: &Connection,
+) -> Result<(), String> {
+    let mut rows = local_conn
+        .query(
+            "
+            SELECT
+                project_id, path, target_path, target_name, target_kind, kind,
+                language, line_start, excerpt, indexed_at_ms
+            FROM code_references
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        remote_conn
+            .execute(
+                "
+                INSERT INTO code_references (
+                    project_id, path, target_path, target_name, target_kind, kind,
+                    language, line_start, excerpt, indexed_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT(project_id, path, target_path, target_name, line_start, kind)
+                DO UPDATE SET
+                    target_kind = excluded.target_kind,
+                    language = excluded.language,
+                    excerpt = excluded.excerpt,
+                    indexed_at_ms = excluded.indexed_at_ms
+                ",
+                params![
+                    row.get::<String>(0).map_err(|error| error.to_string())?,
+                    row.get::<String>(1).map_err(|error| error.to_string())?,
+                    row.get::<String>(2).map_err(|error| error.to_string())?,
+                    row.get::<String>(3).map_err(|error| error.to_string())?,
+                    row.get::<String>(4).map_err(|error| error.to_string())?,
+                    row.get::<String>(5).map_err(|error| error.to_string())?,
+                    row.get::<Option<String>>(6)
+                        .map_err(|error| error.to_string())?,
+                    row.get::<i64>(7).map_err(|error| error.to_string())?,
+                    row.get::<String>(8).map_err(|error| error.to_string())?,
+                    row.get::<i64>(9).map_err(|error| error.to_string())?,
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+async fn copy_sessions(local_conn: &Connection, remote_conn: &Connection) -> Result<(), String> {
+    let mut rows = local_conn
+        .query(
+            "
+            SELECT id, project_id, task, branch, started_at_ms, ended_at_ms, final_summary
+            FROM sessions
+            WHERE final_summary IS NOT NULL
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        remote_conn
+            .execute(
+                "
+                INSERT INTO sessions (
+                    id, project_id, task, branch, started_at_ms, ended_at_ms, final_summary
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(id) DO UPDATE SET
+                    project_id = excluded.project_id,
+                    task = excluded.task,
+                    branch = excluded.branch,
+                    started_at_ms = excluded.started_at_ms,
+                    ended_at_ms = excluded.ended_at_ms,
+                    final_summary = excluded.final_summary
+                ",
+                params![
+                    row.get::<String>(0).map_err(|error| error.to_string())?,
+                    row.get::<String>(1).map_err(|error| error.to_string())?,
+                    row.get::<String>(2).map_err(|error| error.to_string())?,
+                    row.get::<Option<String>>(3)
+                        .map_err(|error| error.to_string())?,
+                    row.get::<i64>(4).map_err(|error| error.to_string())?,
+                    row.get::<Option<i64>>(5)
+                        .map_err(|error| error.to_string())?,
+                    row.get::<Option<String>>(6)
+                        .map_err(|error| error.to_string())?,
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
 }
 
 impl StorageMode {
@@ -1042,13 +1756,35 @@ impl StorageMode {
     }
 }
 
+impl SyncBackend {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "direct" | "direct_libsql" | "libsql" | "turso" => Ok(Self::DirectLibsql),
+            "api" | "hugr_api" => Ok(Self::HugrApi),
+            unknown => Err(format!(
+                "invalid HUGR_SYNC_BACKEND '{unknown}', expected direct_libsql or hugr_api"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectLibsql => "direct_libsql",
+            Self::HugrApi => "hugr_api",
+        }
+    }
+}
+
 impl StorageConfig {
     #[cfg(test)]
     fn local() -> Self {
         Self {
             mode: StorageMode::Local,
+            backend: SyncBackend::DirectLibsql,
             remote_url: None,
+            remote_auth_token: None,
             auth_token_configured: false,
+            sync_classes: default_sync_classes(),
         }
     }
 
@@ -1064,6 +1800,10 @@ impl StorageConfig {
             .map(|value| StorageMode::parse(&value))
             .transpose()?
             .unwrap_or(StorageMode::Local);
+        let backend = lookup_first(&lookup, &["HUGR_SYNC_BACKEND"])
+            .map(|value| SyncBackend::parse(&value))
+            .transpose()?
+            .unwrap_or(SyncBackend::DirectLibsql);
         let remote_url = lookup_first(
             &lookup,
             &[
@@ -1073,7 +1813,7 @@ impl StorageConfig {
                 "LIBSQL_URL",
             ],
         );
-        let auth_token_configured = lookup_first(
+        let remote_auth_token = lookup_first(
             &lookup,
             &[
                 "HUGR_REMOTE_AUTH_TOKEN",
@@ -1081,8 +1821,12 @@ impl StorageConfig {
                 "TURSO_AUTH_TOKEN",
                 "LIBSQL_AUTH_TOKEN",
             ],
-        )
-        .is_some();
+        );
+        let auth_token_configured = remote_auth_token.is_some();
+        let sync_classes = lookup_first(&lookup, &["HUGR_SYNC_CLASSES"])
+            .map(|value| parse_sync_classes(&value))
+            .transpose()?
+            .unwrap_or_else(default_sync_classes);
 
         if mode.requires_remote_config() {
             if remote_url.is_none() {
@@ -1101,8 +1845,11 @@ impl StorageConfig {
 
         Ok(Self {
             mode,
+            backend,
             remote_url,
+            remote_auth_token,
             auth_token_configured,
+            sync_classes,
         })
     }
 
@@ -1112,17 +1859,142 @@ impl StorageConfig {
         } else {
             "auth missing"
         };
+        let sync_classes = format_sync_classes(&self.sync_classes);
         match self.mode {
             StorageMode::Local if self.remote_url.is_some() => {
-                format!("local (remote configured, inactive, {auth_status})")
+                format!(
+                    "local (remote configured, inactive, backend: {}, {auth_status}, sync classes: {sync_classes})",
+                    self.backend.as_str()
+                )
             }
             StorageMode::Local => "local".to_string(),
-            StorageMode::Hybrid => {
-                format!("hybrid (local active, remote sync configured but disabled, {auth_status})")
-            }
-            StorageMode::Remote => format!("remote configured (not implemented, {auth_status})"),
+            StorageMode::Hybrid => format!(
+                "hybrid (local active, remote sync configured but disabled, backend: {}, {auth_status}, sync classes: {sync_classes})",
+                self.backend.as_str()
+            ),
+            StorageMode::Remote => format!(
+                "remote configured (not implemented, backend: {}, {auth_status}, sync classes: {sync_classes})",
+                self.backend.as_str()
+            ),
         }
     }
+
+    fn sync_execution_plan(&self) -> SyncExecutionPlan {
+        let remote_configured = self.remote_url.is_some();
+        let status = match self.mode {
+            StorageMode::Local => "local_only",
+            StorageMode::Hybrid => "planned_remote_sync_disabled",
+            StorageMode::Remote => "remote_execution_disabled",
+        };
+
+        SyncExecutionPlan {
+            storage_mode: self.mode.as_str().to_string(),
+            backend: self.backend.as_str().to_string(),
+            local_writes_enabled: !matches!(self.mode, StorageMode::Remote),
+            remote_configured,
+            remote_auth_configured: self.auth_token_configured,
+            remote_reads_enabled: false,
+            remote_writes_enabled: false,
+            sync_classes: self
+                .sync_classes
+                .iter()
+                .map(|class| class.as_str().to_string())
+                .collect(),
+            explicit_opt_in_classes: self
+                .sync_classes
+                .iter()
+                .copied()
+                .filter(|class| class.requires_explicit_opt_in())
+                .map(|class| class.as_str().to_string())
+                .collect(),
+            status: status.to_string(),
+        }
+    }
+}
+
+impl SyncClass {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "memories" => Ok(Self::Memories),
+            "sources" => Ok(Self::Sources),
+            "entities" => Ok(Self::Entities),
+            "edges" => Ok(Self::Edges),
+            "embeddings" => Ok(Self::Embeddings),
+            "context_packs" => Ok(Self::ContextPacks),
+            "session_summaries" => Ok(Self::SessionSummaries),
+            "full_source" => Ok(Self::FullSource),
+            "raw_command_output" => Ok(Self::RawCommandOutput),
+            "secrets" => Ok(Self::Secrets),
+            "private_notes" => Ok(Self::PrivateNotes),
+            unknown => Err(format!("invalid HUGR_SYNC_CLASSES value '{unknown}'")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Memories => "memories",
+            Self::Sources => "sources",
+            Self::Entities => "entities",
+            Self::Edges => "edges",
+            Self::Embeddings => "embeddings",
+            Self::ContextPacks => "context_packs",
+            Self::SessionSummaries => "session_summaries",
+            Self::FullSource => "full_source",
+            Self::RawCommandOutput => "raw_command_output",
+            Self::Secrets => "secrets",
+            Self::PrivateNotes => "private_notes",
+        }
+    }
+
+    fn requires_explicit_opt_in(self) -> bool {
+        matches!(
+            self,
+            Self::FullSource | Self::RawCommandOutput | Self::Secrets | Self::PrivateNotes
+        )
+    }
+}
+
+fn default_sync_classes() -> Vec<SyncClass> {
+    vec![
+        SyncClass::Memories,
+        SyncClass::Sources,
+        SyncClass::Entities,
+        SyncClass::Edges,
+        SyncClass::Embeddings,
+        SyncClass::ContextPacks,
+        SyncClass::SessionSummaries,
+    ]
+}
+
+fn parse_sync_classes(value: &str) -> Result<Vec<SyncClass>, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == "default" {
+        return Ok(default_sync_classes());
+    }
+    if normalized == "none" {
+        return Ok(Vec::new());
+    }
+
+    let mut classes = Vec::new();
+    for raw in value.split(',') {
+        let class = SyncClass::parse(raw)?;
+        if !classes.contains(&class) {
+            classes.push(class);
+        }
+    }
+    Ok(classes)
+}
+
+fn format_sync_classes(classes: &[SyncClass]) -> String {
+    if classes.is_empty() {
+        return "none".to_string();
+    }
+
+    classes
+        .iter()
+        .map(|class| class.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn lookup_first<F>(lookup: &F, names: &[&str]) -> Option<String>
@@ -1498,7 +2370,10 @@ fn now_ms() -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Memory, StorageConfig, StorageMode, Store, fts_query, query_terms, recall_score};
+    use super::{
+        Memory, StorageConfig, StorageMode, Store, SyncBackend, SyncClass, fts_query, query_terms,
+        recall_score, table_row_count,
+    };
     use crate::code::{CodeReference, CodeSymbol};
     use crate::discovery::FileCandidate;
     use crate::embedding::{DEFAULT_EMBEDDING_DIMENSIONS, DETERMINISTIC_MODEL};
@@ -1563,8 +2438,21 @@ mod tests {
         let config = StorageConfig::from_lookup(|_| None).unwrap();
 
         assert_eq!(config.mode, StorageMode::Local);
+        assert_eq!(config.backend, SyncBackend::DirectLibsql);
         assert_eq!(config.remote_url, None);
         assert!(!config.auth_token_configured);
+        assert_eq!(
+            config.sync_classes,
+            vec![
+                SyncClass::Memories,
+                SyncClass::Sources,
+                SyncClass::Entities,
+                SyncClass::Edges,
+                SyncClass::Embeddings,
+                SyncClass::ContextPacks,
+                SyncClass::SessionSummaries
+            ]
+        );
         assert_eq!(config.summary(), "local");
     }
 
@@ -1578,6 +2466,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.mode, StorageMode::Hybrid);
+        assert_eq!(config.backend, SyncBackend::DirectLibsql);
         assert_eq!(
             config.remote_url.as_deref(),
             Some("libsql://example.turso.io")
@@ -1585,8 +2474,43 @@ mod tests {
         assert!(config.auth_token_configured);
         assert_eq!(
             config.summary(),
-            "hybrid (local active, remote sync configured but disabled, auth configured)"
+            "hybrid (local active, remote sync configured but disabled, backend: direct_libsql, auth configured, sync classes: memories,sources,entities,edges,embeddings,context_packs,session_summaries)"
         );
+
+        let plan = config.sync_execution_plan();
+        assert_eq!(plan.storage_mode, "hybrid");
+        assert_eq!(plan.backend, "direct_libsql");
+        assert_eq!(plan.status, "planned_remote_sync_disabled");
+        assert!(plan.local_writes_enabled);
+        assert!(plan.remote_configured);
+        assert!(plan.remote_auth_configured);
+        assert!(!plan.remote_reads_enabled);
+        assert!(!plan.remote_writes_enabled);
+    }
+
+    #[test]
+    fn storage_config_reads_sync_class_opt_ins() {
+        let config = StorageConfig::from_lookup(env_lookup(&[
+            ("HUGR_STORAGE_MODE", "hybrid"),
+            ("HUGR_REMOTE_DATABASE_URL", "libsql://example.turso.io"),
+            ("HUGR_REMOTE_AUTH_TOKEN", "secret-token"),
+            ("HUGR_SYNC_CLASSES", "memories,full-source,secrets,memories"),
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            config.sync_classes,
+            vec![
+                SyncClass::Memories,
+                SyncClass::FullSource,
+                SyncClass::Secrets
+            ]
+        );
+        assert_eq!(
+            config.sync_execution_plan().explicit_opt_in_classes,
+            vec!["full_source".to_string(), "secrets".to_string()]
+        );
+        assert!(config.summary().contains("full_source,secrets"));
     }
 
     #[test]
@@ -1601,6 +2525,29 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(missing_token.contains("requires HUGR_REMOTE_AUTH_TOKEN"));
+
+        let invalid_class =
+            StorageConfig::from_lookup(env_lookup(&[("HUGR_SYNC_CLASSES", "memories,unknown")]))
+                .unwrap_err();
+        assert!(invalid_class.contains("invalid HUGR_SYNC_CLASSES"));
+
+        let invalid_backend =
+            StorageConfig::from_lookup(env_lookup(&[("HUGR_SYNC_BACKEND", "ftp")])).unwrap_err();
+        assert!(invalid_backend.contains("invalid HUGR_SYNC_BACKEND"));
+    }
+
+    #[test]
+    fn storage_config_reads_hugr_api_backend() {
+        let config = StorageConfig::from_lookup(env_lookup(&[
+            ("HUGR_STORAGE_MODE", "hybrid"),
+            ("HUGR_SYNC_BACKEND", "hugr-api"),
+            ("HUGR_REMOTE_DATABASE_URL", "https://hugr.example"),
+            ("HUGR_REMOTE_AUTH_TOKEN", "secret-token"),
+        ]))
+        .unwrap();
+
+        assert_eq!(config.backend, SyncBackend::HugrApi);
+        assert_eq!(config.sync_execution_plan().backend, "hugr_api");
     }
 
     #[tokio::test]
@@ -1608,14 +2555,109 @@ mod tests {
         let mut test = TestStore::new("remote_mode");
         test.store.storage_config = Ok(StorageConfig {
             mode: StorageMode::Remote,
+            backend: SyncBackend::DirectLibsql,
             remote_url: Some("libsql://example.turso.io".to_string()),
+            remote_auth_token: Some("secret-token".to_string()),
             auth_token_configured: true,
+            sync_classes: vec![SyncClass::Memories],
         });
 
         let error = test.store.init().await.unwrap_err();
 
         assert!(error.contains("remote storage is not implemented"));
         assert!(!test.store.db_path().exists());
+    }
+
+    #[tokio::test]
+    async fn sync_push_dry_run_counts_selected_tables() {
+        let test = TestStore::new("sync_push_dry_run");
+        test.store
+            .remember("plugin hooks are loaded")
+            .await
+            .unwrap();
+        test.store
+            .record_discovered_files(&[FileCandidate {
+                path: "src/plugin_hooks.rs".to_string(),
+                score: 1,
+                language: Some("rust".to_string()),
+                size_bytes: Some(128),
+            }])
+            .await
+            .unwrap();
+
+        let result = test.store.sync_push(true).await.unwrap();
+        let memories = result
+            .tables
+            .iter()
+            .find(|table| table.table == "memories")
+            .unwrap();
+        let discovered_files = result
+            .tables
+            .iter()
+            .find(|table| table.table == "discovered_files")
+            .unwrap();
+
+        assert!(result.dry_run);
+        assert_eq!(memories.row_count, 1);
+        assert_eq!(discovered_files.row_count, 1);
+        assert!(!memories.executed);
+    }
+
+    #[tokio::test]
+    async fn sync_copy_pushes_safe_tables_to_connection() {
+        let source = TestStore::new("sync_source");
+        let target = TestStore::new("sync_target");
+        source
+            .store
+            .remember("plugin hooks are loaded")
+            .await
+            .unwrap();
+        source
+            .store
+            .record_discovered_files(&[FileCandidate {
+                path: "src/plugin_hooks.rs".to_string(),
+                score: 1,
+                language: Some("rust".to_string()),
+                size_bytes: Some(128),
+            }])
+            .await
+            .unwrap();
+        target.store.init().await.unwrap();
+
+        let source_conn = source.store.connect().await.unwrap();
+        let target_conn = target.store.connect().await.unwrap();
+        let config = StorageConfig {
+            mode: StorageMode::Hybrid,
+            backend: SyncBackend::DirectLibsql,
+            remote_url: Some("libsql://example.turso.io".to_string()),
+            remote_auth_token: Some("secret-token".to_string()),
+            auth_token_configured: true,
+            sync_classes: vec![
+                SyncClass::Memories,
+                SyncClass::Embeddings,
+                SyncClass::Sources,
+            ],
+        };
+
+        source
+            .store
+            .copy_sync_tables(&source_conn, &target_conn, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(table_row_count(&target_conn, "memories").await.unwrap(), 1);
+        assert_eq!(
+            table_row_count(&target_conn, "memory_embeddings")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            table_row_count(&target_conn, "discovered_files")
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
