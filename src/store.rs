@@ -1043,6 +1043,7 @@ impl StorageMode {
 }
 
 impl StorageConfig {
+    #[cfg(test)]
     fn local() -> Self {
         Self {
             mode: StorageMode::Local,
