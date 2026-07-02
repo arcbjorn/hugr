@@ -158,7 +158,11 @@ impl ImpactReport {
             rendered.push_str("No likely tests mapped yet.\n");
         } else {
             for test in &self.likely_tests {
-                let _ = writeln!(rendered, "- {} ({})", test.path, test.reason);
+                let _ = writeln!(
+                    rendered,
+                    "- {} ({}, score {})",
+                    test.path, test.reason, test.score
+                );
             }
         }
 
@@ -253,9 +257,10 @@ impl ImpactReport {
             }
             let _ = write!(
                 rendered,
-                "{{\"path\":{},\"reason\":{}}}",
+                "{{\"path\":{},\"reason\":{},\"score\":{}}}",
                 json_string(&test.path),
-                json_string(&test.reason)
+                json_string(&test.reason),
+                test.score
             );
         }
         rendered.push_str("],");
@@ -339,6 +344,7 @@ mod tests {
             vec![TestCandidate {
                 path: "tests/plugin_hooks.rs".to_string(),
                 reason: "repository tests directory match".to_string(),
+                score: 50,
             }],
         );
 
