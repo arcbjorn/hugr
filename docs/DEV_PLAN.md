@@ -56,12 +56,12 @@ Implemented:
 - `hugr context` and `hugr_context` surface relevant unresolved stale-memory risks with citations
 - `hugr context` and `hugr_context` include deterministic token budget metadata and trim lower-priority context items before rendering
 - `hugr context` and `hugr_context` include deterministic evidence scores and reasons for files, symbols, tests, memories, stale-memory risks, and session facts
+- code-reference edges distinguish imports, calls, member calls, implementations, inheritance, instantiations, type references, and generic references
 - initial vision, storage, and technical blueprint docs
 
 Not implemented yet:
 
 - tree-sitter-backed parsing for additional languages beyond Rust, Python, TypeScript, and Go
-- richer symbol graph edges
 - remote-only storage execution and the Hugr API sync backend
 
 ## Runtime Decision
@@ -311,6 +311,7 @@ Implemented first slice:
 - `hugr index` to populate discovered files and symbols.
 - `hugr_context` and `hugr context` include important symbols when available.
 - `code_references` table for direct references, calls, and imports.
+- Code-reference extraction classifies imports, calls, member calls, implementations, inheritance, instantiations, type references, and generic references.
 - `hugr impact` and `hugr_impact` report matched symbols, direct references, and affected files.
 - Symbol ranges are stored and surfaced in context and impact JSON.
 - Impact reports include inbound references and outbound references from matched symbol or file scope.
@@ -457,6 +458,7 @@ Recommended next commits:
 30. Done: `feat(context): surface stale memory risks`
 31. Done: `feat(context): add token budgeting`
 32. Done: `feat(context): rank context evidence`
+33. Done: `feat(graph): classify richer symbol edges`
 
 Each commit should leave the CLI usable.
 
@@ -473,6 +475,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add richer symbol graph edges.
+Add tree-sitter-backed parsing for the next language.
 
-That is the right next step because context packs now rank and budget the evidence they already receive. The next useful layer is improving the code graph itself so impact analysis and context compilation can surface more precise relationships.
+That is the right next step because the code graph now classifies richer relationships for indexed symbols. The next useful local layer is expanding precise parser coverage beyond Rust, Python, TypeScript, and Go before tackling remote-only storage and the Hugr API backend.
