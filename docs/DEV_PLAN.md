@@ -38,7 +38,7 @@ Implemented:
 - `hugr index` for explicit project indexing
 - best-effort code symbol extraction stored in `code_symbols`
 - best-effort direct reference/call/import extraction stored in `code_references`
-- tree-sitter-backed Rust, Python, TypeScript, and Go symbol extraction with line ranges
+- tree-sitter-backed Rust, Python, TypeScript, JavaScript/JSX, and Go symbol extraction with line ranges
 - important symbol citations in context packs
 - `hugr impact <file-or-symbol>` for direct indexed impact reports
 - local branch, upstream, ahead/behind, and worktree changes in context packs
@@ -61,7 +61,7 @@ Implemented:
 
 Not implemented yet:
 
-- tree-sitter-backed parsing for additional languages beyond Rust, Python, TypeScript, and Go
+- tree-sitter-backed parsing for additional languages beyond Rust, Python, TypeScript, JavaScript/JSX, and Go
 - remote-only storage execution and the Hugr API sync backend
 
 ## Completion Gap Review
@@ -332,7 +332,7 @@ Implemented first slice:
 - Impact reports include inbound references and outbound references from matched symbol or file scope.
 - Likely test files are mapped from discovered project paths and surfaced in context and impact output.
 - Context packs include local branch, upstream, ahead/behind counts, and worktree changes.
-- Rust, Python, TypeScript, and Go symbol extraction use tree-sitter when parsing succeeds, with line-scanner fallback.
+- Rust, Python, TypeScript, JavaScript/JSX, and Go symbol extraction use tree-sitter when parsing succeeds, with line-scanner fallback.
 
 Open questions:
 
@@ -474,6 +474,7 @@ Recommended next commits:
 31. Done: `feat(context): add token budgeting`
 32. Done: `feat(context): rank context evidence`
 33. Done: `feat(graph): classify richer symbol edges`
+34. Done: `feat(parser): use tree-sitter javascript`
 
 Each commit should leave the CLI usable.
 
@@ -490,6 +491,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add tree-sitter-backed parsing for the next language.
+Add tree-sitter-backed parsing for Java.
 
-That is the right next step because the code graph now classifies richer relationships for indexed symbols. The next useful local layer is expanding precise parser coverage beyond Rust, Python, TypeScript, and Go before tackling remote-only storage and the Hugr API backend.
+That is the right next step because JavaScript/JSX now has tree-sitter-backed symbol ranges through the existing TSX grammar. The next useful local parser target is Java, which is already language-detected and currently relies on the line-scanner fallback.
