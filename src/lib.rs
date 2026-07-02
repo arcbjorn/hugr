@@ -2,6 +2,7 @@ mod cli;
 mod code;
 mod commands;
 mod context;
+mod daemon;
 mod discovery;
 mod embedding;
 mod impact;
