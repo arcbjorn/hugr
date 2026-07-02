@@ -165,6 +165,12 @@ fn extract_symbols(
             return Ok(symbols);
         }
     }
+    if matches!(language, Some("javascript")) {
+        let symbols = extract_javascript_symbols_with_tree_sitter(path, contents)?;
+        if !symbols.is_empty() {
+            return Ok(symbols);
+        }
+    }
     if matches!(language, Some("go")) {
         let symbols = extract_go_symbols_with_tree_sitter(path, contents)?;
         if !symbols.is_empty() {
@@ -511,6 +517,35 @@ fn line_signature(node: Node<'_>, contents: &str) -> String {
         .nth(node.start_position().row)
         .map(clean_signature)
         .unwrap_or_else(|| clean_signature(&contents[node.start_byte()..node.end_byte()]))
+}
+
+fn extract_javascript_symbols_with_tree_sitter(
+    path: &str,
+    contents: &str,
+) -> Result<Vec<CodeSymbol>, String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
+        .map_err(|error| error.to_string())?;
+    let Some(tree) = parser.parse(contents, None) else {
+        return Ok(Vec::new());
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return Ok(Vec::new());
+    }
+
+    let mut symbols = Vec::new();
+    collect_typescript_symbols(path, contents, root, &mut symbols)?;
+    for symbol in &mut symbols {
+        symbol.language = Some("javascript".to_string());
+    }
+    symbols.sort_by(|left, right| {
+        left.line_start
+            .cmp(&right.line_start)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(symbols)
 }
 
 fn extract_go_symbols_with_tree_sitter(
@@ -1299,6 +1334,61 @@ export const createRegistry = () => {
                 .signature
                 .contains("export const createRegistry")
         );
+    }
+
+    #[test]
+    fn tree_sitter_javascript_extracts_multiline_ranges() {
+        let symbols = extract_symbols(
+            "src/pluginHooks.jsx",
+            Some("javascript"),
+            r#"
+export class PluginRegistry {
+    register(hook) {
+        return hook;
+    }
+}
+
+export function createRegistry() {
+    return new PluginRegistry();
+}
+
+const renderRegistry = () => (
+    <PluginRegistry />
+);
+"#,
+        )
+        .unwrap();
+
+        let class = symbols
+            .iter()
+            .find(|symbol| symbol.name == "PluginRegistry")
+            .unwrap();
+        let method = symbols
+            .iter()
+            .find(|symbol| symbol.name == "register")
+            .unwrap();
+        let function = symbols
+            .iter()
+            .find(|symbol| symbol.name == "createRegistry")
+            .unwrap();
+        let arrow_function = symbols
+            .iter()
+            .find(|symbol| symbol.name == "renderRegistry")
+            .unwrap();
+
+        assert_eq!(class.language.as_deref(), Some("javascript"));
+        assert_eq!(class.kind, "class");
+        assert_eq!(class.line_start, 2);
+        assert_eq!(class.line_end, Some(6));
+        assert_eq!(method.kind, "function");
+        assert_eq!(method.line_start, 3);
+        assert_eq!(method.line_end, Some(5));
+        assert_eq!(function.kind, "function");
+        assert_eq!(function.line_start, 8);
+        assert_eq!(function.line_end, Some(10));
+        assert_eq!(arrow_function.kind, "function");
+        assert_eq!(arrow_function.line_start, 12);
+        assert_eq!(arrow_function.line_end, Some(14));
     }
 
     #[test]
