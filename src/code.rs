@@ -108,6 +108,9 @@ pub(crate) fn extract_references(
                 if is_declaration_line(&targets, &file.path, line_number, target) {
                     continue;
                 }
+                if line_declares_target(trimmed, target) {
+                    continue;
+                }
                 if !contains_identifier(trimmed, &target.name) {
                     continue;
                 }
@@ -910,6 +913,81 @@ fn is_declaration_line(
             && symbol.kind == target.kind
             && symbol.line_start == line_number
     })
+}
+
+fn line_declares_target(line: &str, target: &CodeSymbol) -> bool {
+    let declaration = strip_leading_modifiers(line);
+    match target.kind.as_str() {
+        "function" => {
+            starts_with_keyword_name(declaration, "fn", &target.name)
+                || starts_with_keyword_name(declaration, "def", &target.name)
+                || starts_with_keyword_name(declaration, "func", &target.name)
+                || starts_with_keyword_name(declaration, "function", &target.name)
+        }
+        "struct" => {
+            starts_with_keyword_name(declaration, "struct", &target.name)
+                || starts_with_keyword_name(declaration, "type", &target.name)
+        }
+        "class" => starts_with_keyword_name(declaration, "class", &target.name),
+        "interface" => starts_with_keyword_name(declaration, "interface", &target.name),
+        "trait" => starts_with_keyword_name(declaration, "trait", &target.name),
+        "enum" => starts_with_keyword_name(declaration, "enum", &target.name),
+        "type" => starts_with_keyword_name(declaration, "type", &target.name),
+        _ => false,
+    }
+}
+
+fn strip_leading_modifiers(line: &str) -> &str {
+    let mut rest = line.trim_start();
+    loop {
+        let Some((token, after_token)) = split_first_token(rest) else {
+            return rest;
+        };
+        if !is_declaration_modifier(token) {
+            return rest;
+        }
+        rest = after_token.trim_start();
+    }
+}
+
+fn split_first_token(value: &str) -> Option<(&str, &str)> {
+    let split_index = value.find(char::is_whitespace)?;
+    Some((&value[..split_index], &value[split_index..]))
+}
+
+fn is_declaration_modifier(token: &str) -> bool {
+    token.starts_with("pub(")
+        || matches!(
+            token,
+            "pub"
+                | "async"
+                | "unsafe"
+                | "const"
+                | "export"
+                | "default"
+                | "public"
+                | "private"
+                | "protected"
+                | "static"
+                | "final"
+                | "abstract"
+                | "open"
+                | "override"
+        )
+}
+
+fn starts_with_keyword_name(line: &str, keyword: &str, name: &str) -> bool {
+    let Some(rest) = line.strip_prefix(keyword) else {
+        return false;
+    };
+    if !rest.starts_with(char::is_whitespace) {
+        return false;
+    }
+
+    let rest = rest.trim_start();
+    rest.strip_prefix(name)
+        .and_then(|after_name| after_name.chars().next())
+        .is_some_and(|char| !is_identifier_char(char))
 }
 
 fn is_import_line(line: &str) -> bool {
