@@ -54,6 +54,7 @@ Implemented:
 - `hugr improve [--json]` reports deterministic stale candidates for active memories with opposing terms
 - `hugr improve --execute --stale [--json]` retires older stale candidates and points them at newer evidence
 - `hugr context` and `hugr_context` surface relevant unresolved stale-memory risks with citations
+- `hugr context` and `hugr_context` include deterministic token budget metadata and trim lower-priority context items before rendering
 - initial vision, storage, and technical blueprint docs
 
 Not implemented yet:
@@ -61,7 +62,7 @@ Not implemented yet:
 - tree-sitter-backed parsing for additional languages beyond Rust, Python, TypeScript, and Go
 - richer symbol graph edges
 - remote-only storage execution and the Hugr API sync backend
-- context-pack token budgeting
+- context-pack evidence ranking
 
 ## Runtime Decision
 
@@ -337,6 +338,7 @@ Tasks:
 
 Implemented first slices:
 
+- `hugr context` and `hugr_context` include deterministic token budget metadata and remove lower-priority items when a pack exceeds the default budget.
 - `hugr context` and `hugr_context` include unresolved stale-memory risks relevant to recalled task memories.
 - Stale-memory risks render in Markdown and JSON with newer/older memory evidence, shared terms, deterministic signal, and `stale_memory` citations.
 
@@ -452,6 +454,7 @@ Recommended next commits:
 28. Done: `feat(memory): detect stale candidates`
 29. Done: `feat(memory): retire stale candidates`
 30. Done: `feat(context): surface stale memory risks`
+31. Done: `feat(context): add token budgeting`
 
 Each commit should leave the CLI usable.
 
@@ -468,8 +471,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add token budgeting to context packs.
+Add evidence ranking to context packs.
 
-That is the right next step because context packs now include files, symbols, tests, memories, session facts, branch state, and stale-memory risks. The next useful layer is a deterministic budget so large projects stay bounded and agents get the highest-signal evidence first.
-
-That is the right next step because Hugr can now detect and retire stale memory candidates through `hugr improve`. The next useful layer is making unresolved stale candidates visible in `hugr context` so agents see the risk before acting on contradictory memories.
+That is the right next step because context packs are now bounded before rendering. The next useful layer is ranking files, symbols, tests, memories, sessions, and stale-memory risks by evidence strength so the budget keeps the highest-signal items first.
