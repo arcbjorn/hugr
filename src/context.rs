@@ -680,12 +680,14 @@ impl ContextPack {
             }
             let _ = write!(
                 rendered,
-                "{{\"session_id\":{},\"kind\":{},\"detail\":{},\"created_at_ms\":{},\"citation_id\":{}}}",
+                "{{\"session_id\":{},\"kind\":{},\"detail\":{},\"created_at_ms\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
                 json_string(&fact.session_id),
                 json_string(&fact.kind),
                 json_string(&fact.detail),
                 fact.created_at_ms,
-                json_string(&fact.citation_id)
+                json_string(&fact.citation_id),
+                fact.evidence_score,
+                json_string(&fact.evidence_reason)
             );
         }
         rendered.push_str("],");
@@ -767,24 +769,32 @@ impl ContextPack {
     }
 }
 
-fn context_memory_from(memory: Memory) -> ContextMemory {
+fn context_memory_from(
+    memory: Memory,
+    evidence_score: usize,
+    evidence_reason: String,
+) -> ContextMemory {
     ContextMemory {
         citation_id: memory.id.clone(),
         id: memory.id,
         created_at_ms: memory.created_at_ms,
         kind: memory.kind,
         text: memory.text,
+        evidence_score,
+        evidence_reason,
     }
 }
 
 fn render_context_memory_json(memory: &ContextMemory) -> String {
     format!(
-        "{{\"id\":{},\"created_at_ms\":{},\"kind\":{},\"text\":{},\"citation_id\":{}}}",
+        "{{\"id\":{},\"created_at_ms\":{},\"kind\":{},\"text\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
         json_string(&memory.id),
         memory.created_at_ms,
         json_string(&memory.kind),
         json_string(&memory.text),
-        json_string(&memory.citation_id)
+        json_string(&memory.citation_id),
+        memory.evidence_score,
+        json_string(&memory.evidence_reason)
     )
 }
 
