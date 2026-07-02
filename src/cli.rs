@@ -1,3 +1,5 @@
+use crate::daemon::DEFAULT_DAEMON_ADDR;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Init,
@@ -44,6 +46,9 @@ pub enum Command {
         format: OutputFormat,
     },
     Mcp,
+    Daemon {
+        addr: String,
+    },
     Improve {
         execute: bool,
         duplicates: bool,
@@ -102,6 +107,7 @@ impl Command {
             "session" => parse_session_command(args),
             "sync" => parse_sync_command(args),
             "mcp" => Ok(Self::Mcp),
+            "daemon" => parse_daemon_command(args),
             "improve" => {
                 let options = improve_options_from(args, 2)?;
                 Ok(Self::Improve {
@@ -123,6 +129,34 @@ impl Command {
             unknown => Err(format!("unknown command '{unknown}'")),
         }
     }
+}
+
+fn parse_daemon_command(args: &[String]) -> Result<Command, String> {
+    let mut addr = DEFAULT_DAEMON_ADDR.to_string();
+    let mut index = 2;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--addr" {
+            index += 1;
+            addr = args
+                .get(index)
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .ok_or_else(|| "hugr daemon --addr requires a value".to_string())?;
+        } else if let Some(value) = arg.strip_prefix("--addr=") {
+            if value.trim().is_empty() {
+                return Err("hugr daemon --addr requires a value".to_string());
+            }
+            addr = value.to_string();
+        } else {
+            return Err(format!("unknown option '{arg}'"));
+        }
+
+        index += 1;
+    }
+
+    Ok(Command::Daemon { addr })
 }
 
 fn parse_project_command(args: &[String]) -> Result<Command, String> {
@@ -300,7 +334,7 @@ fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions,
 }
 
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr impact [--json] <file-or-symbol>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr mcp\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr impact [--json] <file-or-symbol>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
 }
 
 #[cfg(test)]
@@ -501,6 +535,37 @@ mod tests {
     fn parses_mcp_command() {
         let args = vec!["hugr".into(), "mcp".into()];
         assert_eq!(Command::parse(&args), Ok(Command::Mcp));
+    }
+
+    #[test]
+    fn parses_daemon_command() {
+        assert_eq!(
+            Command::parse(&["hugr".into(), "daemon".into()]),
+            Ok(Command::Daemon {
+                addr: "127.0.0.1:5874".into()
+            })
+        );
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "daemon".into(),
+                "--addr".into(),
+                "127.0.0.1:0".into()
+            ]),
+            Ok(Command::Daemon {
+                addr: "127.0.0.1:0".into()
+            })
+        );
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "daemon".into(),
+                "--addr=127.0.0.1:9999".into()
+            ]),
+            Ok(Command::Daemon {
+                addr: "127.0.0.1:9999".into()
+            })
+        );
     }
 
     #[test]
