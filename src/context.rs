@@ -171,6 +171,7 @@ impl ContextPack {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_sessions_symbols_tests_branch_and_stale_risks(
         task: &str,
         files: Vec<String>,
@@ -269,6 +270,7 @@ impl ContextPack {
         let stale_memory_risks = stale_candidates
             .into_iter()
             .map(|candidate| {
+                let (evidence_score, evidence_reason) = stale_memory_evidence(&candidate, &terms);
                 let (newer_score, newer_reason) =
                     memory_evidence(&candidate.newer_memory, &terms, None);
                 let (older_score, older_reason) =
@@ -277,8 +279,6 @@ impl ContextPack {
                     context_memory_from(candidate.newer_memory, newer_score, newer_reason);
                 let older_memory =
                     context_memory_from(candidate.older_memory, older_score, older_reason);
-                let (evidence_score, evidence_reason) =
-                    stale_memory_evidence(&candidate, &newer_memory, &older_memory, &terms);
                 ContextStaleMemoryRisk {
                     citation_id: format!("stale:{}:{}", older_memory.id, newer_memory.id),
                     reason: candidate.reason,
@@ -767,6 +767,51 @@ impl ContextPack {
             }
         }
     }
+
+    fn rank_context_sections(&mut self) {
+        self.relevant_files.sort_by(|left, right| {
+            right
+                .evidence_score
+                .cmp(&left.evidence_score)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        self.important_symbols.sort_by(|left, right| {
+            right
+                .evidence_score
+                .cmp(&left.evidence_score)
+                .then_with(|| left.path.cmp(&right.path))
+                .then_with(|| left.line_start.cmp(&right.line_start))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        self.affected_tests.sort_by(|left, right| {
+            right
+                .evidence_score
+                .cmp(&left.evidence_score)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        self.relevant_memories.sort_by(|left, right| {
+            right
+                .evidence_score
+                .cmp(&left.evidence_score)
+                .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        self.stale_memory_risks.sort_by(|left, right| {
+            right
+                .evidence_score
+                .cmp(&left.evidence_score)
+                .then_with(|| left.signal.cmp(&right.signal))
+                .then_with(|| left.older_memory.id.cmp(&right.older_memory.id))
+                .then_with(|| left.newer_memory.id.cmp(&right.newer_memory.id))
+        });
+        self.recent_sessions.sort_by(|left, right| {
+            right
+                .evidence_score
+                .cmp(&left.evidence_score)
+                .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
+    }
 }
 
 fn context_memory_from(
@@ -796,6 +841,102 @@ fn render_context_memory_json(memory: &ContextMemory) -> String {
         memory.evidence_score,
         json_string(&memory.evidence_reason)
     )
+}
+
+fn file_evidence(candidate: &FileCandidate, terms: &[String]) -> (usize, String) {
+    let language_bonus = candidate
+        .language
+        .as_ref()
+        .filter(|language| terms.iter().any(|term| term == &language.to_lowercase()))
+        .map(|_| 30)
+        .unwrap_or(0);
+    let size_bonus = candidate
+        .size_bytes
+        .map(|bytes| if bytes <= 128_000 { 10 } else { 0 })
+        .unwrap_or(0);
+    let score = 400 + candidate.score * 20 + language_bonus + size_bonus;
+    let reason = if candidate.score > 0 {
+        format!("file discovery score {}", candidate.score)
+    } else {
+        "provided file candidate".to_string()
+    };
+    (score, reason)
+}
+
+fn symbol_evidence(symbol: &CodeSymbol, terms: &[String]) -> (usize, String) {
+    let searchable = format!(
+        "{} {} {} {}",
+        symbol.path, symbol.kind, symbol.name, symbol.signature
+    );
+    let score = 600 + text_match_score(&searchable, terms);
+    (score, "symbol path/name/signature matched task".to_string())
+}
+
+fn memory_evidence(
+    memory: &Memory,
+    terms: &[String],
+    recall_rank: Option<(usize, usize)>,
+) -> (usize, String) {
+    let rank_bonus = recall_rank
+        .map(|(index, total)| total.saturating_sub(index) * 20)
+        .unwrap_or(0);
+    let score = 700 + rank_bonus + text_match_score(&memory.text, terms);
+    let reason = recall_rank
+        .map(|(index, _)| format!("memory recall rank {}", index + 1))
+        .unwrap_or_else(|| "memory included as stale evidence".to_string());
+    (score, reason)
+}
+
+fn stale_memory_evidence(candidate: &StaleMemoryCandidate, terms: &[String]) -> (usize, String) {
+    let shared_term_score = candidate.shared_terms.len() * 20;
+    let text_score = text_match_score(&candidate.newer_memory.text, terms)
+        + text_match_score(&candidate.older_memory.text, terms);
+    let score = 900 + shared_term_score + text_score;
+    (
+        score,
+        format!("unresolved stale-memory signal {}", candidate.signal),
+    )
+}
+
+fn session_evidence(
+    fact: &SessionFact,
+    terms: &[String],
+    index: usize,
+    total: usize,
+) -> (usize, String) {
+    let rank_bonus = total.saturating_sub(index) * 20;
+    let searchable = format!("{} {}", fact.kind, fact.detail);
+    let score = 300 + rank_bonus + text_match_score(&searchable, terms);
+    (score, format!("session fact recall rank {}", index + 1))
+}
+
+fn context_query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|char: char| !char.is_alphanumeric() && char != '_' && char != '-')
+        .filter(|term| term.len() > 2)
+        .map(|term| term.to_lowercase())
+        .collect()
+}
+
+fn text_match_score(value: &str, terms: &[String]) -> usize {
+    if terms.is_empty() {
+        return 0;
+    }
+
+    let lower = value.to_lowercase();
+    let tokens = context_query_terms(value);
+    terms
+        .iter()
+        .map(|term| {
+            if tokens.iter().any(|token| token == term) {
+                20
+            } else if lower.contains(term) {
+                10
+            } else {
+                0
+            }
+        })
+        .sum()
 }
 
 fn build_citations(pack: &ContextPack) -> Vec<Citation> {
@@ -856,31 +997,74 @@ fn remove_lowest_priority_context_item(
         record_truncation(truncated_sections, "suggested_path");
         return true;
     }
-    if pack.recent_sessions.pop().is_some() {
-        record_truncation(truncated_sections, "recent_sessions");
-        return true;
+
+    let mut weakest = None;
+    if let Some(fact) = pack.recent_sessions.last() {
+        consider_weakest_evidence(&mut weakest, "recent_sessions", fact.evidence_score, 0);
     }
-    if pack.affected_tests.pop().is_some() {
-        record_truncation(truncated_sections, "affected_tests");
-        return true;
+    if let Some(test) = pack.affected_tests.last() {
+        consider_weakest_evidence(&mut weakest, "affected_tests", test.evidence_score, 1);
     }
-    if pack.relevant_files.pop().is_some() {
-        record_truncation(truncated_sections, "relevant_files");
-        return true;
+    if let Some(file) = pack.relevant_files.last() {
+        consider_weakest_evidence(&mut weakest, "relevant_files", file.evidence_score, 2);
     }
-    if pack.important_symbols.pop().is_some() {
-        record_truncation(truncated_sections, "important_symbols");
-        return true;
+    if let Some(symbol) = pack.important_symbols.last() {
+        consider_weakest_evidence(&mut weakest, "important_symbols", symbol.evidence_score, 3);
     }
-    if pack.stale_memory_risks.pop().is_some() {
-        record_truncation(truncated_sections, "stale_memory_risks");
-        return true;
+    if let Some(risk) = pack.stale_memory_risks.last() {
+        consider_weakest_evidence(&mut weakest, "stale_memory_risks", risk.evidence_score, 4);
     }
-    if pack.relevant_memories.pop().is_some() {
-        record_truncation(truncated_sections, "relevant_memories");
-        return true;
+    if let Some(memory) = pack.relevant_memories.last() {
+        consider_weakest_evidence(&mut weakest, "relevant_memories", memory.evidence_score, 5);
     }
-    false
+
+    match weakest.map(|(_, _, section)| section) {
+        Some("recent_sessions") => {
+            pack.recent_sessions.pop();
+            record_truncation(truncated_sections, "recent_sessions");
+            true
+        }
+        Some("affected_tests") => {
+            pack.affected_tests.pop();
+            record_truncation(truncated_sections, "affected_tests");
+            true
+        }
+        Some("relevant_files") => {
+            pack.relevant_files.pop();
+            record_truncation(truncated_sections, "relevant_files");
+            true
+        }
+        Some("important_symbols") => {
+            pack.important_symbols.pop();
+            record_truncation(truncated_sections, "important_symbols");
+            true
+        }
+        Some("stale_memory_risks") => {
+            pack.stale_memory_risks.pop();
+            record_truncation(truncated_sections, "stale_memory_risks");
+            true
+        }
+        Some("relevant_memories") => {
+            pack.relevant_memories.pop();
+            record_truncation(truncated_sections, "relevant_memories");
+            true
+        }
+        _ => false,
+    }
+}
+
+fn consider_weakest_evidence(
+    weakest: &mut Option<(usize, usize, &'static str)>,
+    section: &'static str,
+    evidence_score: usize,
+    tie_breaker: usize,
+) {
+    match weakest {
+        Some((current_score, current_tie_breaker, _))
+            if evidence_score > *current_score
+                || (evidence_score == *current_score && tie_breaker >= *current_tie_breaker) => {}
+        _ => *weakest = Some((evidence_score, tie_breaker, section)),
+    }
 }
 
 fn record_truncation(truncated_sections: &mut Vec<ContextBudgetTruncation>, section: &str) {
@@ -953,11 +1137,13 @@ fn estimate_context_pack_tokens(
 }
 
 fn estimate_file_tokens(file: &ContextFile) -> usize {
-    3 + estimate_tokens(&file.path) + estimate_tokens(&file.citation_id)
+    4 + estimate_tokens(&file.path)
+        + estimate_tokens(&file.citation_id)
+        + estimate_tokens(&file.evidence_reason)
 }
 
 fn estimate_symbol_tokens(symbol: &ContextSymbol) -> usize {
-    8 + estimate_tokens(&symbol.path)
+    9 + estimate_tokens(&symbol.path)
         + symbol
             .language
             .as_ref()
@@ -967,23 +1153,26 @@ fn estimate_symbol_tokens(symbol: &ContextSymbol) -> usize {
         + estimate_tokens(&symbol.kind)
         + estimate_tokens(&symbol.signature)
         + estimate_tokens(&symbol.citation_id)
+        + estimate_tokens(&symbol.evidence_reason)
 }
 
 fn estimate_test_tokens(test: &ContextTest) -> usize {
-    3 + estimate_tokens(&test.path)
+    4 + estimate_tokens(&test.path)
         + estimate_tokens(&test.reason)
         + estimate_tokens(&test.citation_id)
+        + estimate_tokens(&test.evidence_reason)
 }
 
 fn estimate_memory_tokens(memory: &ContextMemory) -> usize {
-    5 + estimate_tokens(&memory.id)
+    6 + estimate_tokens(&memory.id)
         + estimate_tokens(&memory.kind)
         + estimate_tokens(&memory.text)
         + estimate_tokens(&memory.citation_id)
+        + estimate_tokens(&memory.evidence_reason)
 }
 
 fn estimate_stale_risk_tokens(risk: &ContextStaleMemoryRisk) -> usize {
-    10 + estimate_tokens(&risk.reason)
+    11 + estimate_tokens(&risk.reason)
         + estimate_tokens(&risk.signal)
         + risk
             .shared_terms
@@ -993,13 +1182,15 @@ fn estimate_stale_risk_tokens(risk: &ContextStaleMemoryRisk) -> usize {
         + estimate_memory_tokens(&risk.newer_memory)
         + estimate_memory_tokens(&risk.older_memory)
         + estimate_tokens(&risk.citation_id)
+        + estimate_tokens(&risk.evidence_reason)
 }
 
 fn estimate_session_tokens(fact: &ContextSessionFact) -> usize {
-    5 + estimate_tokens(&fact.session_id)
+    6 + estimate_tokens(&fact.session_id)
         + estimate_tokens(&fact.kind)
         + estimate_tokens(&fact.detail)
         + estimate_tokens(&fact.citation_id)
+        + estimate_tokens(&fact.evidence_reason)
 }
 
 fn estimate_branch_tokens(branch: &ContextBranchState) -> usize {
@@ -1099,6 +1290,7 @@ fn change_label(file: &ContextChangedFile) -> String {
 mod tests {
     use super::{ContextPack, json_string};
     use crate::code::CodeSymbol;
+    use crate::discovery::FileCandidate;
     use crate::store::{Memory, StaleMemoryCandidate};
     use crate::testmap::TestCandidate;
     use crate::worktree::{ChangedFile, WorktreeState};
@@ -1143,6 +1335,7 @@ mod tests {
             vec![TestCandidate {
                 path: "tests/plugin_hooks.rs".to_string(),
                 reason: "repository tests directory match".to_string(),
+                score: 50,
             }],
             None,
         );
@@ -1156,6 +1349,43 @@ mod tests {
         assert!(json.contains("\"line_end\":8"));
         assert!(markdown.contains("- tests/plugin_hooks.rs"));
         assert!(json.contains("\"affected_tests\""));
+    }
+
+    #[test]
+    fn evidence_ranking_orders_files_and_renders_scores() {
+        let pack = ContextPack::with_file_candidates_sessions_symbols_tests_branch_and_stale_risks(
+            "plugin hooks",
+            vec![
+                FileCandidate {
+                    path: "docs/hooks.md".to_string(),
+                    score: 1,
+                    language: Some("markdown".to_string()),
+                    size_bytes: Some(10),
+                },
+                FileCandidate {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    score: 8,
+                    language: Some("rust".to_string()),
+                    size_bytes: Some(10),
+                },
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(pack.relevant_files[0].path, "src/plugin_hooks.rs");
+        assert!(pack.relevant_files[0].evidence_score > pack.relevant_files[1].evidence_score);
+
+        let markdown = pack.render_markdown();
+        let json = pack.render_json();
+
+        assert!(markdown.contains("score"));
+        assert!(json.contains("\"evidence_score\""));
+        assert!(json.contains("\"evidence_reason\":\"file discovery score 8\""));
     }
 
     #[test]
