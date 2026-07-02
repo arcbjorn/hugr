@@ -1,4 +1,5 @@
 use crate::code::CodeSymbol;
+use crate::discovery::FileCandidate;
 use crate::store::{Memory, SessionFact, StaleMemoryCandidate};
 use crate::testmap::TestCandidate;
 use crate::worktree::WorktreeState;
@@ -38,6 +39,8 @@ pub struct ContextBudgetTruncation {
 pub struct ContextFile {
     pub path: String,
     pub citation_id: String,
+    pub evidence_score: usize,
+    pub evidence_reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +53,8 @@ pub struct ContextSymbol {
     pub line_end: Option<i64>,
     pub signature: String,
     pub citation_id: String,
+    pub evidence_score: usize,
+    pub evidence_reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +62,8 @@ pub struct ContextTest {
     pub path: String,
     pub reason: String,
     pub citation_id: String,
+    pub evidence_score: usize,
+    pub evidence_reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +73,8 @@ pub struct ContextMemory {
     pub kind: String,
     pub text: String,
     pub citation_id: String,
+    pub evidence_score: usize,
+    pub evidence_reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +85,8 @@ pub struct ContextStaleMemoryRisk {
     pub newer_memory: ContextMemory,
     pub older_memory: ContextMemory,
     pub citation_id: String,
+    pub evidence_score: usize,
+    pub evidence_reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +96,8 @@ pub struct ContextSessionFact {
     pub detail: String,
     pub created_at_ms: i64,
     pub citation_id: String,
+    pub evidence_score: usize,
+    pub evidence_reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,46 +181,104 @@ impl ContextPack {
         branch_state: Option<WorktreeState>,
         stale_candidates: Vec<StaleMemoryCandidate>,
     ) -> Self {
-        let relevant_files = files
+        let file_candidates = files
             .into_iter()
-            .map(|path| ContextFile {
-                citation_id: format!("file:{path}"),
+            .map(|path| FileCandidate {
                 path,
+                score: 0,
+                language: None,
+                size_bytes: None,
+            })
+            .collect::<Vec<_>>();
+        Self::with_file_candidates_sessions_symbols_tests_branch_and_stale_risks(
+            task,
+            file_candidates,
+            memories,
+            sessions,
+            symbols,
+            tests,
+            branch_state,
+            stale_candidates,
+        )
+    }
+
+    pub(crate) fn with_file_candidates_sessions_symbols_tests_branch_and_stale_risks(
+        task: &str,
+        file_candidates: Vec<FileCandidate>,
+        memories: Vec<Memory>,
+        sessions: Vec<SessionFact>,
+        symbols: Vec<CodeSymbol>,
+        tests: Vec<TestCandidate>,
+        branch_state: Option<WorktreeState>,
+        stale_candidates: Vec<StaleMemoryCandidate>,
+    ) -> Self {
+        let terms = context_query_terms(task);
+        let relevant_files = file_candidates
+            .into_iter()
+            .map(|candidate| {
+                let (evidence_score, evidence_reason) = file_evidence(&candidate, &terms);
+                ContextFile {
+                    citation_id: format!("file:{}", candidate.path),
+                    path: candidate.path,
+                    evidence_score,
+                    evidence_reason,
+                }
             })
             .collect::<Vec<_>>();
         let important_symbols = symbols
             .into_iter()
-            .map(|symbol| ContextSymbol {
-                citation_id: format!(
-                    "symbol:{}:{}:{}",
-                    symbol.path, symbol.line_start, symbol.name
-                ),
-                path: symbol.path,
-                language: symbol.language,
-                name: symbol.name,
-                kind: symbol.kind,
-                line_start: symbol.line_start,
-                line_end: symbol.line_end,
-                signature: symbol.signature,
+            .map(|symbol| {
+                let (evidence_score, evidence_reason) = symbol_evidence(&symbol, &terms);
+                ContextSymbol {
+                    citation_id: format!(
+                        "symbol:{}:{}:{}",
+                        symbol.path, symbol.line_start, symbol.name
+                    ),
+                    path: symbol.path,
+                    language: symbol.language,
+                    name: symbol.name,
+                    kind: symbol.kind,
+                    line_start: symbol.line_start,
+                    line_end: symbol.line_end,
+                    signature: symbol.signature,
+                    evidence_score,
+                    evidence_reason,
+                }
             })
             .collect::<Vec<_>>();
         let affected_tests = tests
             .into_iter()
             .map(|test| ContextTest {
                 citation_id: format!("test:{}", test.path),
+                evidence_score: 500 + test.score * 5,
+                evidence_reason: format!("test-map score {}: {}", test.score, test.reason),
                 path: test.path,
                 reason: test.reason,
             })
             .collect::<Vec<_>>();
+        let memory_count = memories.len();
         let relevant_memories = memories
             .into_iter()
-            .map(context_memory_from)
+            .enumerate()
+            .map(|(index, memory)| {
+                let (evidence_score, evidence_reason) =
+                    memory_evidence(&memory, &terms, Some((index, memory_count)));
+                context_memory_from(memory, evidence_score, evidence_reason)
+            })
             .collect::<Vec<_>>();
         let stale_memory_risks = stale_candidates
             .into_iter()
             .map(|candidate| {
-                let newer_memory = context_memory_from(candidate.newer_memory);
-                let older_memory = context_memory_from(candidate.older_memory);
+                let (newer_score, newer_reason) =
+                    memory_evidence(&candidate.newer_memory, &terms, None);
+                let (older_score, older_reason) =
+                    memory_evidence(&candidate.older_memory, &terms, None);
+                let newer_memory =
+                    context_memory_from(candidate.newer_memory, newer_score, newer_reason);
+                let older_memory =
+                    context_memory_from(candidate.older_memory, older_score, older_reason);
+                let (evidence_score, evidence_reason) =
+                    stale_memory_evidence(&candidate, &newer_memory, &older_memory, &terms);
                 ContextStaleMemoryRisk {
                     citation_id: format!("stale:{}:{}", older_memory.id, newer_memory.id),
                     reason: candidate.reason,
@@ -215,17 +286,27 @@ impl ContextPack {
                     shared_terms: candidate.shared_terms,
                     newer_memory,
                     older_memory,
+                    evidence_score,
+                    evidence_reason,
                 }
             })
             .collect::<Vec<_>>();
+        let session_count = sessions.len();
         let recent_sessions = sessions
             .into_iter()
-            .map(|fact| ContextSessionFact {
-                citation_id: format!("session:{}", fact.session_id),
-                session_id: fact.session_id,
-                kind: fact.kind,
-                detail: fact.detail,
-                created_at_ms: fact.created_at_ms,
+            .enumerate()
+            .map(|(index, fact)| {
+                let (evidence_score, evidence_reason) =
+                    session_evidence(&fact, &terms, index, session_count);
+                ContextSessionFact {
+                    citation_id: format!("session:{}", fact.session_id),
+                    session_id: fact.session_id,
+                    kind: fact.kind,
+                    detail: fact.detail,
+                    created_at_ms: fact.created_at_ms,
+                    evidence_score,
+                    evidence_reason,
+                }
             })
             .collect::<Vec<_>>();
         let branch_state = branch_state
@@ -269,6 +350,7 @@ impl ContextPack {
             ],
             citations: Vec::new(),
         };
+        pack.rank_context_sections();
         pack.apply_token_budget(DEFAULT_CONTEXT_TOKEN_BUDGET);
         pack
     }
@@ -306,7 +388,11 @@ impl ContextPack {
             rendered.push_str("No file candidates found yet.\n");
         } else {
             for file in &self.relevant_files {
-                let _ = writeln!(rendered, "- {} [{}]", file.path, file.citation_id);
+                let _ = writeln!(
+                    rendered,
+                    "- {} [{}] (score {}: {})",
+                    file.path, file.citation_id, file.evidence_score, file.evidence_reason
+                );
             }
         }
         rendered.push('\n');
@@ -318,11 +404,13 @@ impl ContextPack {
             for symbol in &self.important_symbols {
                 let _ = writeln!(
                     rendered,
-                    "- {} {} at {} [{}]",
+                    "- {} {} at {} [{}] (score {}: {})",
                     symbol.kind,
                     symbol.name,
                     symbol_location(symbol),
-                    symbol.citation_id
+                    symbol.citation_id,
+                    symbol.evidence_score,
+                    symbol.evidence_reason
                 );
             }
         }
@@ -335,8 +423,12 @@ impl ContextPack {
             for test in &self.affected_tests {
                 let _ = writeln!(
                     rendered,
-                    "- {} ({}) [{}]",
-                    test.path, test.reason, test.citation_id
+                    "- {} ({}) [{}] (score {}: {})",
+                    test.path,
+                    test.reason,
+                    test.citation_id,
+                    test.evidence_score,
+                    test.evidence_reason
                 );
             }
         }
@@ -349,8 +441,12 @@ impl ContextPack {
             for memory in &self.relevant_memories {
                 let _ = writeln!(
                     rendered,
-                    "- {} [{}]: {}",
-                    memory.id, memory.kind, memory.text
+                    "- {} [{}]: {} (score {}: {})",
+                    memory.id,
+                    memory.kind,
+                    memory.text,
+                    memory.evidence_score,
+                    memory.evidence_reason
                 );
             }
         }
@@ -363,12 +459,14 @@ impl ContextPack {
             for risk in &self.stale_memory_risks {
                 let _ = writeln!(
                     rendered,
-                    "- {} [{}]: older {} may be stale; newer {} shares {}",
+                    "- {} [{}]: older {} may be stale; newer {} shares {} (score {}: {})",
                     risk.signal,
                     risk.citation_id,
                     risk.older_memory.id,
                     risk.newer_memory.id,
-                    risk.shared_terms.join(",")
+                    risk.shared_terms.join(","),
+                    risk.evidence_score,
+                    risk.evidence_reason
                 );
                 let _ = writeln!(
                     rendered,
@@ -391,8 +489,12 @@ impl ContextPack {
             for fact in &self.recent_sessions {
                 let _ = writeln!(
                     rendered,
-                    "- {} [{}]: {}",
-                    fact.session_id, fact.kind, fact.detail
+                    "- {} [{}]: {} (score {}: {})",
+                    fact.session_id,
+                    fact.kind,
+                    fact.detail,
+                    fact.evidence_score,
+                    fact.evidence_reason
                 );
             }
         }
