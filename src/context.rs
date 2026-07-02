@@ -4,9 +4,12 @@ use crate::testmap::TestCandidate;
 use crate::worktree::WorktreeState;
 use std::fmt::Write;
 
+const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 4000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextPack {
     pub task: String,
+    pub budget: ContextBudget,
     pub relevant_files: Vec<ContextFile>,
     pub important_symbols: Vec<ContextSymbol>,
     pub affected_tests: Vec<ContextTest>,
@@ -16,6 +19,19 @@ pub struct ContextPack {
     pub branch_state: Option<ContextBranchState>,
     pub suggested_path: Vec<String>,
     pub citations: Vec<Citation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextBudget {
+    pub max_tokens: usize,
+    pub estimated_tokens: usize,
+    pub truncated_sections: Vec<ContextBudgetTruncation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextBudgetTruncation {
+    pub section: String,
+    pub removed_items: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,48 +247,13 @@ impl ContextPack {
                     })
                     .collect(),
             });
-        let mut citations = relevant_files
-            .iter()
-            .map(|file| Citation {
-                id: file.citation_id.clone(),
-                source_type: "file".to_string(),
-                label: file.path.clone(),
-            })
-            .collect::<Vec<_>>();
-        citations.extend(important_symbols.iter().map(|symbol| Citation {
-            id: symbol.citation_id.clone(),
-            source_type: "symbol".to_string(),
-            label: format!(
-                "{} {} at {}:{}",
-                symbol.kind, symbol.name, symbol.path, symbol.line_start
-            ),
-        }));
-        citations.extend(affected_tests.iter().map(|test| Citation {
-            id: test.citation_id.clone(),
-            source_type: "test".to_string(),
-            label: test.path.clone(),
-        }));
-        citations.extend(relevant_memories.iter().map(|memory| Citation {
-            id: memory.citation_id.clone(),
-            source_type: "memory".to_string(),
-            label: memory.text.clone(),
-        }));
-        citations.extend(stale_memory_risks.iter().map(|risk| Citation {
-            id: risk.citation_id.clone(),
-            source_type: "stale_memory".to_string(),
-            label: format!(
-                "{}: older {} conflicts with newer {}",
-                risk.signal, risk.older_memory.id, risk.newer_memory.id
-            ),
-        }));
-        citations.extend(recent_sessions.iter().map(|fact| Citation {
-            id: fact.citation_id.clone(),
-            source_type: "session".to_string(),
-            label: fact.detail.clone(),
-        }));
-
-        Self {
+        let mut pack = Self {
             task: task.to_string(),
+            budget: ContextBudget {
+                max_tokens: DEFAULT_CONTEXT_TOKEN_BUDGET,
+                estimated_tokens: 0,
+                truncated_sections: Vec::new(),
+            },
             relevant_files,
             important_symbols,
             affected_tests,
@@ -286,8 +267,10 @@ impl ContextPack {
                 "Make the smallest change that satisfies the task.".to_string(),
                 "Run the narrowest useful tests, then broaden if risk is unclear.".to_string(),
             ],
-            citations,
-        }
+            citations: Vec::new(),
+        };
+        pack.apply_token_budget(DEFAULT_CONTEXT_TOKEN_BUDGET);
+        pack
     }
 
     pub fn render_markdown(&self) -> String {
@@ -297,6 +280,26 @@ impl ContextPack {
         rendered.push_str("## Task\n");
         rendered.push_str(&self.task);
         rendered.push_str("\n\n");
+
+        rendered.push_str("## Budget\n");
+        let _ = writeln!(rendered, "- max_tokens: {}", self.budget.max_tokens);
+        let _ = writeln!(
+            rendered,
+            "- estimated_tokens: {}",
+            self.budget.estimated_tokens
+        );
+        if self.budget.truncated_sections.is_empty() {
+            rendered.push_str("- truncated: none\n");
+        } else {
+            for truncation in &self.budget.truncated_sections {
+                let _ = writeln!(
+                    rendered,
+                    "- truncated {}: {} item(s)",
+                    truncation.section, truncation.removed_items
+                );
+            }
+        }
+        rendered.push('\n');
 
         rendered.push_str("## Relevant Files\n");
         if self.relevant_files.is_empty() {
@@ -418,8 +421,12 @@ impl ContextPack {
         rendered.push('\n');
 
         rendered.push_str("## Suggested Path\n");
-        for (index, step) in self.suggested_path.iter().enumerate() {
-            let _ = writeln!(rendered, "{}. {}", index + 1, step);
+        if self.suggested_path.is_empty() {
+            rendered.push_str("No suggested path within budget.\n");
+        } else {
+            for (index, step) in self.suggested_path.iter().enumerate() {
+                let _ = writeln!(rendered, "{}. {}", index + 1, step);
+            }
         }
         rendered.push('\n');
 
@@ -444,6 +451,25 @@ impl ContextPack {
 
         rendered.push('{');
         let _ = write!(rendered, "\"task\":{},", json_string(&self.task));
+
+        rendered.push_str("\"budget\":{");
+        let _ = write!(
+            rendered,
+            "\"max_tokens\":{},\"estimated_tokens\":{},\"truncated_sections\":[",
+            self.budget.max_tokens, self.budget.estimated_tokens
+        );
+        for (index, truncation) in self.budget.truncated_sections.iter().enumerate() {
+            if index > 0 {
+                rendered.push(',');
+            }
+            let _ = write!(
+                rendered,
+                "{{\"section\":{},\"removed_items\":{}}}",
+                json_string(&truncation.section),
+                truncation.removed_items
+            );
+        }
+        rendered.push_str("]},");
 
         rendered.push_str("\"relevant_files\":[");
         for (index, file) in self.relevant_files.iter().enumerate() {
@@ -608,6 +634,25 @@ impl ContextPack {
 
         rendered
     }
+
+    fn apply_token_budget(&mut self, max_tokens: usize) {
+        let mut truncated_sections = Vec::new();
+
+        loop {
+            self.citations = build_citations(self);
+            let estimated_tokens = estimate_context_pack_tokens(self, &truncated_sections);
+            if estimated_tokens <= max_tokens
+                || !remove_lowest_priority_context_item(self, &mut truncated_sections)
+            {
+                self.budget = ContextBudget {
+                    max_tokens,
+                    estimated_tokens,
+                    truncated_sections,
+                };
+                return;
+            }
+        }
+    }
 }
 
 fn context_memory_from(memory: Memory) -> ContextMemory {
@@ -629,6 +674,255 @@ fn render_context_memory_json(memory: &ContextMemory) -> String {
         json_string(&memory.text),
         json_string(&memory.citation_id)
     )
+}
+
+fn build_citations(pack: &ContextPack) -> Vec<Citation> {
+    let mut citations = pack
+        .relevant_files
+        .iter()
+        .map(|file| Citation {
+            id: file.citation_id.clone(),
+            source_type: "file".to_string(),
+            label: file.path.clone(),
+        })
+        .collect::<Vec<_>>();
+    citations.extend(pack.important_symbols.iter().map(|symbol| Citation {
+        id: symbol.citation_id.clone(),
+        source_type: "symbol".to_string(),
+        label: format!(
+            "{} {} at {}:{}",
+            symbol.kind, symbol.name, symbol.path, symbol.line_start
+        ),
+    }));
+    citations.extend(pack.affected_tests.iter().map(|test| Citation {
+        id: test.citation_id.clone(),
+        source_type: "test".to_string(),
+        label: test.path.clone(),
+    }));
+    citations.extend(pack.relevant_memories.iter().map(|memory| Citation {
+        id: memory.citation_id.clone(),
+        source_type: "memory".to_string(),
+        label: memory.text.clone(),
+    }));
+    citations.extend(pack.stale_memory_risks.iter().map(|risk| Citation {
+        id: risk.citation_id.clone(),
+        source_type: "stale_memory".to_string(),
+        label: format!(
+            "{}: older {} conflicts with newer {}",
+            risk.signal, risk.older_memory.id, risk.newer_memory.id
+        ),
+    }));
+    citations.extend(pack.recent_sessions.iter().map(|fact| Citation {
+        id: fact.citation_id.clone(),
+        source_type: "session".to_string(),
+        label: fact.detail.clone(),
+    }));
+    citations
+}
+
+fn remove_lowest_priority_context_item(
+    pack: &mut ContextPack,
+    truncated_sections: &mut Vec<ContextBudgetTruncation>,
+) -> bool {
+    if let Some(branch) = &mut pack.branch_state {
+        if branch.changed_files.pop().is_some() {
+            record_truncation(truncated_sections, "branch_state.changed_files");
+            return true;
+        }
+    }
+    if pack.suggested_path.pop().is_some() {
+        record_truncation(truncated_sections, "suggested_path");
+        return true;
+    }
+    if pack.recent_sessions.pop().is_some() {
+        record_truncation(truncated_sections, "recent_sessions");
+        return true;
+    }
+    if pack.affected_tests.pop().is_some() {
+        record_truncation(truncated_sections, "affected_tests");
+        return true;
+    }
+    if pack.relevant_files.pop().is_some() {
+        record_truncation(truncated_sections, "relevant_files");
+        return true;
+    }
+    if pack.important_symbols.pop().is_some() {
+        record_truncation(truncated_sections, "important_symbols");
+        return true;
+    }
+    if pack.stale_memory_risks.pop().is_some() {
+        record_truncation(truncated_sections, "stale_memory_risks");
+        return true;
+    }
+    if pack.relevant_memories.pop().is_some() {
+        record_truncation(truncated_sections, "relevant_memories");
+        return true;
+    }
+    false
+}
+
+fn record_truncation(truncated_sections: &mut Vec<ContextBudgetTruncation>, section: &str) {
+    if let Some(truncation) = truncated_sections
+        .iter_mut()
+        .find(|truncation| truncation.section == section)
+    {
+        truncation.removed_items += 1;
+    } else {
+        truncated_sections.push(ContextBudgetTruncation {
+            section: section.to_string(),
+            removed_items: 1,
+        });
+    }
+}
+
+fn estimate_context_pack_tokens(
+    pack: &ContextPack,
+    truncated_sections: &[ContextBudgetTruncation],
+) -> usize {
+    let mut total = 24 + estimate_tokens(&pack.task);
+    total += pack
+        .relevant_files
+        .iter()
+        .map(estimate_file_tokens)
+        .sum::<usize>();
+    total += pack
+        .important_symbols
+        .iter()
+        .map(estimate_symbol_tokens)
+        .sum::<usize>();
+    total += pack
+        .affected_tests
+        .iter()
+        .map(estimate_test_tokens)
+        .sum::<usize>();
+    total += pack
+        .relevant_memories
+        .iter()
+        .map(estimate_memory_tokens)
+        .sum::<usize>();
+    total += pack
+        .stale_memory_risks
+        .iter()
+        .map(estimate_stale_risk_tokens)
+        .sum::<usize>();
+    total += pack
+        .recent_sessions
+        .iter()
+        .map(estimate_session_tokens)
+        .sum::<usize>();
+    if let Some(branch) = &pack.branch_state {
+        total += estimate_branch_tokens(branch);
+    }
+    total += pack
+        .suggested_path
+        .iter()
+        .map(|step| 2 + estimate_tokens(step))
+        .sum::<usize>();
+    total += pack
+        .citations
+        .iter()
+        .map(|citation| {
+            3 + estimate_tokens(&citation.id)
+                + estimate_tokens(&citation.source_type)
+                + estimate_tokens(&citation.label)
+        })
+        .sum::<usize>();
+    total + 12 + truncated_sections.len() * 8
+}
+
+fn estimate_file_tokens(file: &ContextFile) -> usize {
+    3 + estimate_tokens(&file.path) + estimate_tokens(&file.citation_id)
+}
+
+fn estimate_symbol_tokens(symbol: &ContextSymbol) -> usize {
+    8 + estimate_tokens(&symbol.path)
+        + symbol
+            .language
+            .as_ref()
+            .map(|language| estimate_tokens(language))
+            .unwrap_or(0)
+        + estimate_tokens(&symbol.name)
+        + estimate_tokens(&symbol.kind)
+        + estimate_tokens(&symbol.signature)
+        + estimate_tokens(&symbol.citation_id)
+}
+
+fn estimate_test_tokens(test: &ContextTest) -> usize {
+    3 + estimate_tokens(&test.path)
+        + estimate_tokens(&test.reason)
+        + estimate_tokens(&test.citation_id)
+}
+
+fn estimate_memory_tokens(memory: &ContextMemory) -> usize {
+    5 + estimate_tokens(&memory.id)
+        + estimate_tokens(&memory.kind)
+        + estimate_tokens(&memory.text)
+        + estimate_tokens(&memory.citation_id)
+}
+
+fn estimate_stale_risk_tokens(risk: &ContextStaleMemoryRisk) -> usize {
+    10 + estimate_tokens(&risk.reason)
+        + estimate_tokens(&risk.signal)
+        + risk
+            .shared_terms
+            .iter()
+            .map(|term| estimate_tokens(term))
+            .sum::<usize>()
+        + estimate_memory_tokens(&risk.newer_memory)
+        + estimate_memory_tokens(&risk.older_memory)
+        + estimate_tokens(&risk.citation_id)
+}
+
+fn estimate_session_tokens(fact: &ContextSessionFact) -> usize {
+    5 + estimate_tokens(&fact.session_id)
+        + estimate_tokens(&fact.kind)
+        + estimate_tokens(&fact.detail)
+        + estimate_tokens(&fact.citation_id)
+}
+
+fn estimate_branch_tokens(branch: &ContextBranchState) -> usize {
+    let mut total = 8;
+    if let Some(root_path) = &branch.root_path {
+        total += estimate_tokens(root_path);
+    }
+    if let Some(branch_name) = &branch.branch {
+        total += estimate_tokens(branch_name);
+    }
+    if let Some(upstream) = &branch.upstream {
+        total += estimate_tokens(upstream);
+    }
+    total
+        + branch
+            .changed_files
+            .iter()
+            .map(|file| {
+                4 + estimate_tokens(&file.path)
+                    + file
+                        .original_path
+                        .as_ref()
+                        .map(|path| estimate_tokens(path))
+                        .unwrap_or(0)
+                    + file
+                        .staged_status
+                        .as_ref()
+                        .map(|status| estimate_tokens(status))
+                        .unwrap_or(0)
+                    + file
+                        .unstaged_status
+                        .as_ref()
+                        .map(|status| estimate_tokens(status))
+                        .unwrap_or(0)
+            })
+            .sum::<usize>()
+}
+
+fn estimate_tokens(value: &str) -> usize {
+    if value.is_empty() {
+        return 0;
+    }
+    let word_estimate = value.split_whitespace().count();
+    let char_estimate = (value.chars().count() + 3) / 4;
+    word_estimate.max(char_estimate).max(1)
 }
 
 pub(crate) fn json_string(value: &str) -> String {
@@ -785,6 +1079,63 @@ mod tests {
         assert!(json.contains("\"branch_state\""));
         assert!(json.contains("\"ahead\":2"));
         assert!(json.contains("\"unstaged_status\":\"modified\""));
+    }
+
+    #[test]
+    fn token_budget_reports_truncation_and_rebuilds_citations() {
+        let mut pack = ContextPack::new(
+            "tiny budget",
+            vec![
+                "src/first_large_file.rs".to_string(),
+                "src/second_large_file.rs".to_string(),
+            ],
+            vec![
+                Memory {
+                    id: "mem_1".to_string(),
+                    created_at_ms: 10,
+                    kind: "fact".to_string(),
+                    text: "plugin hooks run after configuration is loaded".to_string(),
+                },
+                Memory {
+                    id: "mem_2".to_string(),
+                    created_at_ms: 20,
+                    kind: "fact".to_string(),
+                    text: "plugin hooks now run before configuration is loaded".to_string(),
+                },
+            ],
+        );
+
+        pack.apply_token_budget(1);
+
+        assert_eq!(pack.budget.max_tokens, 1);
+        assert!(
+            pack.budget
+                .truncated_sections
+                .iter()
+                .any(|truncation| truncation.section == "relevant_files")
+        );
+        assert!(
+            pack.budget
+                .truncated_sections
+                .iter()
+                .any(|truncation| truncation.section == "relevant_memories")
+        );
+        assert!(pack.relevant_files.is_empty());
+        assert!(pack.relevant_memories.is_empty());
+        assert!(
+            !pack
+                .citations
+                .iter()
+                .any(|citation| citation.id.starts_with("file:src/"))
+        );
+
+        let markdown = pack.render_markdown();
+        let json = pack.render_json();
+
+        assert!(markdown.contains("## Budget"));
+        assert!(markdown.contains("- truncated relevant_files: 2 item(s)"));
+        assert!(json.contains("\"budget\""));
+        assert!(json.contains("\"section\":\"relevant_files\""));
     }
 
     #[test]
