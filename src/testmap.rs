@@ -4,6 +4,7 @@ use std::collections::HashMap;
 pub(crate) struct TestCandidate {
     pub path: String,
     pub reason: String,
+    pub score: usize,
 }
 
 pub(crate) fn likely_tests_for_files(
@@ -48,7 +49,16 @@ pub(crate) fn likely_tests_for_files(
 
     let mut ranked = candidates
         .into_iter()
-        .map(|(path, (score, reason))| (score, TestCandidate { path, reason }))
+        .map(|(path, (score, reason))| {
+            (
+                score,
+                TestCandidate {
+                    path,
+                    reason,
+                    score,
+                },
+            )
+        })
         .collect::<Vec<_>>();
     ranked.sort_by(|left, right| {
         right
@@ -167,5 +177,6 @@ mod tests {
 
         assert_eq!(tests[0].path, "src/plugin_hooks_test.rs");
         assert_eq!(tests[0].reason, "target is already a test file");
+        assert_eq!(tests[0].score, 100);
     }
 }
