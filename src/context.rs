@@ -580,9 +580,11 @@ impl ContextPack {
             }
             let _ = write!(
                 rendered,
-                "{{\"path\":{},\"citation_id\":{}}}",
+                "{{\"path\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
                 json_string(&file.path),
-                json_string(&file.citation_id)
+                json_string(&file.citation_id),
+                file.evidence_score,
+                json_string(&file.evidence_reason)
             );
         }
         rendered.push_str("],");
@@ -594,7 +596,7 @@ impl ContextPack {
             }
             let _ = write!(
                 rendered,
-                "{{\"path\":{},\"language\":{},\"name\":{},\"kind\":{},\"line_start\":{},\"line_end\":{},\"signature\":{},\"citation_id\":{}}}",
+                "{{\"path\":{},\"language\":{},\"name\":{},\"kind\":{},\"line_start\":{},\"line_end\":{},\"signature\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
                 json_string(&symbol.path),
                 json_option_string(symbol.language.as_deref()),
                 json_string(&symbol.name),
@@ -602,7 +604,9 @@ impl ContextPack {
                 symbol.line_start,
                 json_optional_i64(symbol.line_end),
                 json_string(&symbol.signature),
-                json_string(&symbol.citation_id)
+                json_string(&symbol.citation_id),
+                symbol.evidence_score,
+                json_string(&symbol.evidence_reason)
             );
         }
         rendered.push_str("],");
@@ -614,10 +618,12 @@ impl ContextPack {
             }
             let _ = write!(
                 rendered,
-                "{{\"path\":{},\"reason\":{},\"citation_id\":{}}}",
+                "{{\"path\":{},\"reason\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
                 json_string(&test.path),
                 json_string(&test.reason),
-                json_string(&test.citation_id)
+                json_string(&test.citation_id),
+                test.evidence_score,
+                json_string(&test.evidence_reason)
             );
         }
         rendered.push_str("],");
@@ -629,12 +635,14 @@ impl ContextPack {
             }
             let _ = write!(
                 rendered,
-                "{{\"id\":{},\"created_at_ms\":{},\"kind\":{},\"text\":{},\"citation_id\":{}}}",
+                "{{\"id\":{},\"created_at_ms\":{},\"kind\":{},\"text\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
                 json_string(&memory.id),
                 memory.created_at_ms,
                 json_string(&memory.kind),
                 json_string(&memory.text),
-                json_string(&memory.citation_id)
+                json_string(&memory.citation_id),
+                memory.evidence_score,
+                json_string(&memory.evidence_reason)
             );
         }
         rendered.push_str("],");
@@ -652,13 +660,15 @@ impl ContextPack {
                 .join(",");
             let _ = write!(
                 rendered,
-                "{{\"reason\":{},\"signal\":{},\"shared_terms\":[{}],\"newer_memory\":{},\"older_memory\":{},\"citation_id\":{}}}",
+                "{{\"reason\":{},\"signal\":{},\"shared_terms\":[{}],\"newer_memory\":{},\"older_memory\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
                 json_string(&risk.reason),
                 json_string(&risk.signal),
                 shared_terms,
                 render_context_memory_json(&risk.newer_memory),
                 render_context_memory_json(&risk.older_memory),
-                json_string(&risk.citation_id)
+                json_string(&risk.citation_id),
+                risk.evidence_score,
+                json_string(&risk.evidence_reason)
             );
         }
         rendered.push_str("],");
