@@ -105,7 +105,7 @@ pub(crate) fn extract_references(
             }
 
             for target in &targets {
-                if is_declaration_line(&targets, &file.path, line_number, &target.name) {
+                if is_declaration_line(&targets, &file.path, line_number, target) {
                     continue;
                 }
                 if !contains_identifier(trimmed, &target.name) {
@@ -881,6 +881,16 @@ fn assign_symbol_ranges(symbols: &mut [CodeSymbol], line_count: i64) {
 fn reference_kind(line: &str, target: &CodeSymbol) -> String {
     if is_import_line(line) {
         "import".to_string()
+    } else if is_implementation_line(line, target) {
+        "implementation".to_string()
+    } else if is_inheritance_line(line, target) {
+        "inheritance".to_string()
+    } else if is_type_reference_line(line, target) {
+        "type_reference".to_string()
+    } else if is_instantiation_line(line, target) {
+        "instantiation".to_string()
+    } else if target.kind == "function" && contains_member_call(line, &target.name) {
+        "method_call".to_string()
     } else if target.kind == "function" && contains_call(line, &target.name) {
         "call".to_string()
     } else {
@@ -892,10 +902,13 @@ fn is_declaration_line(
     symbols: &[CodeSymbol],
     path: &str,
     line_number: i64,
-    target_name: &str,
+    target: &CodeSymbol,
 ) -> bool {
     symbols.iter().any(|symbol| {
-        symbol.path == path && symbol.name == target_name && symbol.line_start == line_number
+        symbol.path == path
+            && symbol.name == target.name
+            && symbol.kind == target.kind
+            && symbol.line_start == line_number
     })
 }
 
@@ -916,6 +929,101 @@ fn contains_call(line: &str, name: &str) -> bool {
     })
 }
 
+fn contains_member_call(line: &str, name: &str) -> bool {
+    line.match_indices(name).any(|(index, _)| {
+        if !has_identifier_boundaries(line, index, name) {
+            return false;
+        }
+        if !line[index + name.len()..]
+            .trim_start_matches(char::is_whitespace)
+            .starts_with('(')
+        {
+            return false;
+        }
+
+        let prefix = line[..index].trim_end();
+        prefix.ends_with('.') || prefix.ends_with("::") || prefix.ends_with("->")
+    })
+}
+
+fn is_implementation_line(line: &str, target: &CodeSymbol) -> bool {
+    if !is_type_like_symbol(target) || !contains_identifier(line, &target.name) {
+        return false;
+    }
+
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_lowercase();
+    lower.starts_with("impl ")
+        || lower.starts_with("impl<")
+        || lower.contains(" implements ")
+        || lower.contains(": implements ")
+}
+
+fn is_inheritance_line(line: &str, target: &CodeSymbol) -> bool {
+    if !is_type_like_symbol(target) || !contains_identifier(line, &target.name) {
+        return false;
+    }
+
+    let lower = line.to_lowercase();
+    lower.contains(" extends ") || is_python_base_class_line(line, &target.name)
+}
+
+fn is_python_base_class_line(line: &str, name: &str) -> bool {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with("class ") || !trimmed.ends_with(':') {
+        return false;
+    }
+
+    let Some((_, bases)) = trimmed.split_once('(') else {
+        return false;
+    };
+    let Some((bases, _)) = bases.rsplit_once(')') else {
+        return false;
+    };
+    contains_identifier(bases, name)
+}
+
+fn is_instantiation_line(line: &str, target: &CodeSymbol) -> bool {
+    if !is_type_like_symbol(target) {
+        return false;
+    }
+
+    line.match_indices(&target.name).any(|(index, _)| {
+        if !has_identifier_boundaries(line, index, &target.name) {
+            return false;
+        }
+
+        let prefix = line[..index].trim_end();
+        let suffix = line[index + target.name.len()..].trim_start_matches(char::is_whitespace);
+        prefix.ends_with("new")
+            || prefix.ends_with("new ")
+            || suffix.starts_with('{')
+            || suffix.starts_with('(')
+    })
+}
+
+fn is_type_reference_line(line: &str, target: &CodeSymbol) -> bool {
+    if !is_type_like_symbol(target) || !contains_identifier(line, &target.name) {
+        return false;
+    }
+
+    line.contains(':')
+        || line.contains("->")
+        || line.contains("=>")
+        || line.contains('<')
+        || line.contains('>')
+        || line.contains('&')
+        || line.contains('*')
+        || line.contains(" as ")
+}
+
+fn is_type_like_symbol(symbol: &CodeSymbol) -> bool {
+    matches!(
+        symbol.kind.as_str(),
+        "class" | "struct" | "interface" | "trait" | "type" | "enum" | "impl"
+    )
+}
+
 fn contains_identifier(line: &str, name: &str) -> bool {
     line.match_indices(name)
         .any(|(index, _)| has_identifier_boundaries(line, index, name))
@@ -933,7 +1041,10 @@ fn is_identifier_char(char: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CodeSymbol, contains_identifier, extract_references, extract_symbols};
+    use super::{
+        CodeReference, CodeSymbol, contains_identifier, extract_references, extract_symbols,
+        index_files,
+    };
     use crate::discovery::FileCandidate;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1231,6 +1342,69 @@ fn main() {
                 && reference.target_name == "run_after_config"
                 && reference.kind == "call"
         }));
+    }
+
+    #[test]
+    fn extracts_richer_symbol_graph_edge_kinds() {
+        let project = TempProject::new("richer_edges");
+        project.write(
+            "src/plugin.rs",
+            r#"
+pub trait PluginHook {
+    fn run_plugin_hooks(&self);
+}
+
+pub struct PluginRegistry {}
+
+impl PluginHook for PluginRegistry {
+    fn run_plugin_hooks(&self) {}
+}
+
+pub fn build_registry() -> PluginRegistry {
+    PluginRegistry {}
+}
+
+pub fn execute(registry: &PluginRegistry) {
+    registry.run_plugin_hooks();
+}
+"#,
+        );
+
+        let files = vec![candidate("src/plugin.rs")];
+        let symbols = index_files(project.root(), &files).unwrap();
+        let references = extract_references(project.root(), &files, &symbols).unwrap();
+
+        assert!(has_reference_kind(
+            &references,
+            "PluginHook",
+            "implementation"
+        ));
+        assert!(has_reference_kind(
+            &references,
+            "PluginRegistry",
+            "implementation"
+        ));
+        assert!(has_reference_kind(
+            &references,
+            "PluginRegistry",
+            "type_reference"
+        ));
+        assert!(has_reference_kind(
+            &references,
+            "PluginRegistry",
+            "instantiation"
+        ));
+        assert!(has_reference_kind(
+            &references,
+            "run_plugin_hooks",
+            "method_call"
+        ));
+    }
+
+    fn has_reference_kind(references: &[CodeReference], target_name: &str, kind: &str) -> bool {
+        references
+            .iter()
+            .any(|reference| reference.target_name == target_name && reference.kind == kind)
     }
 
     fn candidate(path: &str) -> FileCandidate {
