@@ -38,7 +38,7 @@ Implemented:
 - `hugr index` for explicit project indexing
 - best-effort code symbol extraction stored in `code_symbols`
 - best-effort direct reference/call/import extraction stored in `code_references`
-- tree-sitter-backed Rust, Python, TypeScript, JavaScript/JSX, Go, and Java symbol extraction with line ranges
+- tree-sitter-backed Rust, Python, TypeScript, JavaScript/JSX, Go, Java, and Swift symbol extraction with line ranges
 - important symbol citations in context packs
 - `hugr impact <file-or-symbol>` for direct indexed impact reports
 - local branch, upstream, ahead/behind, and worktree changes in context packs
@@ -61,7 +61,7 @@ Implemented:
 
 Not implemented yet:
 
-- tree-sitter-backed parsing for additional languages beyond Rust, Python, TypeScript, JavaScript/JSX, Go, and Java
+- tree-sitter-backed Kotlin parsing; the current published `tree-sitter-kotlin` crate resolves to `tree-sitter <0.23` and conflicts with Hugr's `tree-sitter 0.26` parser stack
 - remote-only storage execution and the Hugr API sync backend
 
 ## Completion Gap Review
@@ -332,7 +332,7 @@ Implemented first slice:
 - Impact reports include inbound references and outbound references from matched symbol or file scope.
 - Likely test files are mapped from discovered project paths and surfaced in context and impact output.
 - Context packs include local branch, upstream, ahead/behind counts, and worktree changes.
-- Rust, Python, TypeScript, JavaScript/JSX, Go, and Java symbol extraction use tree-sitter when parsing succeeds, with line-scanner fallback.
+- Rust, Python, TypeScript, JavaScript/JSX, Go, Java, and Swift symbol extraction use tree-sitter when parsing succeeds, with line-scanner fallback.
 
 Open questions:
 
@@ -476,6 +476,7 @@ Recommended next commits:
 33. Done: `feat(graph): classify richer symbol edges`
 34. Done: `feat(parser): use tree-sitter javascript`
 35. Done: `feat(parser): use tree-sitter java`
+36. Done: `feat(parser): use tree-sitter swift`
 
 Each commit should leave the CLI usable.
 
@@ -492,6 +493,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add tree-sitter-backed parsing for Kotlin or Swift.
+Start the daemon/runtime service skeleton.
 
-That is the right next step because Java now has tree-sitter-backed symbol ranges. The next useful local parser target should be Kotlin or Swift because both are already language-detected and currently rely on the line-scanner fallback.
+That is the right next step because Swift now has tree-sitter-backed symbol ranges, while Kotlin should wait for a parser crate that is compatible with the current `tree-sitter 0.26` dependency graph. The first broader completion gap is the runtime service: `hugr daemon`, a local transport, file watching, background indexing, and background memory jobs.
