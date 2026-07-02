@@ -177,6 +177,12 @@ fn extract_symbols(
             return Ok(symbols);
         }
     }
+    if matches!(language, Some("java")) {
+        let symbols = extract_java_symbols_with_tree_sitter(path, contents)?;
+        if !symbols.is_empty() {
+            return Ok(symbols);
+        }
+    }
 
     extract_symbols_from_lines(path, language, contents)
 }
@@ -627,6 +633,81 @@ fn go_type_spec_kind(node: Node<'_>) -> &'static str {
         Some("interface_type") => "interface",
         _ => "type",
     }
+}
+
+fn extract_java_symbols_with_tree_sitter(
+    path: &str,
+    contents: &str,
+) -> Result<Vec<CodeSymbol>, String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .map_err(|error| error.to_string())?;
+    let Some(tree) = parser.parse(contents, None) else {
+        return Ok(Vec::new());
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return Ok(Vec::new());
+    }
+
+    let mut symbols = Vec::new();
+    collect_java_symbols(path, contents, root, &mut symbols)?;
+    symbols.sort_by(|left, right| {
+        left.line_start
+            .cmp(&right.line_start)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(symbols)
+}
+
+fn collect_java_symbols(
+    path: &str,
+    contents: &str,
+    node: Node<'_>,
+    symbols: &mut Vec<CodeSymbol>,
+) -> Result<(), String> {
+    if let Some(symbol) = java_symbol_from_node(path, contents, node)? {
+        symbols.push(symbol);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_java_symbols(path, contents, child, symbols)?;
+    }
+
+    Ok(())
+}
+
+fn java_symbol_from_node(
+    path: &str,
+    contents: &str,
+    node: Node<'_>,
+) -> Result<Option<CodeSymbol>, String> {
+    let (kind, name_node) = match node.kind() {
+        "annotation_type_declaration" => ("annotation", node.child_by_field_name("name")),
+        "class_declaration" => ("class", node.child_by_field_name("name")),
+        "constructor_declaration" => ("function", node.child_by_field_name("name")),
+        "enum_declaration" => ("enum", node.child_by_field_name("name")),
+        "interface_declaration" => ("interface", node.child_by_field_name("name")),
+        "method_declaration" => ("function", node.child_by_field_name("name")),
+        "record_declaration" => ("record", node.child_by_field_name("name")),
+        _ => return Ok(None),
+    };
+    let Some(name_node) = name_node else {
+        return Ok(None);
+    };
+    let name = node_text(name_node, contents)?;
+
+    Ok(Some(CodeSymbol {
+        path: path.to_string(),
+        language: Some("java".to_string()),
+        name,
+        kind: kind.to_string(),
+        line_start: line_number(node.start_position().row),
+        line_end: Some(line_number(node.end_position().row)),
+        signature: line_signature(node, contents),
+    }))
 }
 
 fn extract_rust_symbol(line: &str) -> Option<(String, String)> {
@@ -1448,6 +1529,83 @@ func (r *PluginRegistry) RunPluginHooks() bool {
         assert_eq!(method.line_start, 16);
         assert_eq!(method.line_end, Some(18));
         assert!(method.signature.contains("RunPluginHooks"));
+    }
+
+    #[test]
+    fn tree_sitter_java_extracts_multiline_ranges() {
+        let symbols = extract_symbols(
+            "src/main/java/plugin/PluginRegistry.java",
+            Some("java"),
+            r#"
+package plugin;
+
+public interface PluginHook {
+    boolean runPluginHooks();
+}
+
+public record HookResult(boolean loaded) {}
+
+public enum HookState {
+    ENABLED,
+    DISABLED
+}
+
+public class PluginRegistry implements PluginHook {
+    public PluginRegistry() {
+    }
+
+    @Override
+    public boolean runPluginHooks() {
+        return true;
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let interface = symbols
+            .iter()
+            .find(|symbol| symbol.name == "PluginHook")
+            .unwrap();
+        let record = symbols
+            .iter()
+            .find(|symbol| symbol.name == "HookResult")
+            .unwrap();
+        let state = symbols
+            .iter()
+            .find(|symbol| symbol.name == "HookState")
+            .unwrap();
+        let class = symbols
+            .iter()
+            .find(|symbol| symbol.name == "PluginRegistry" && symbol.kind == "class")
+            .unwrap();
+        let constructor = symbols
+            .iter()
+            .find(|symbol| symbol.name == "PluginRegistry" && symbol.kind == "function")
+            .unwrap();
+        let method = symbols
+            .iter()
+            .filter(|symbol| symbol.name == "runPluginHooks")
+            .max_by_key(|symbol| symbol.line_start)
+            .unwrap();
+
+        assert_eq!(interface.kind, "interface");
+        assert_eq!(interface.line_start, 4);
+        assert_eq!(interface.line_end, Some(6));
+        assert_eq!(record.kind, "record");
+        assert_eq!(record.line_start, 8);
+        assert_eq!(record.line_end, Some(8));
+        assert_eq!(state.kind, "enum");
+        assert_eq!(state.line_start, 10);
+        assert_eq!(state.line_end, Some(13));
+        assert_eq!(class.language.as_deref(), Some("java"));
+        assert_eq!(class.line_start, 15);
+        assert_eq!(class.line_end, Some(23));
+        assert_eq!(constructor.line_start, 16);
+        assert_eq!(constructor.line_end, Some(17));
+        assert_eq!(method.kind, "function");
+        assert_eq!(method.line_start, 19);
+        assert_eq!(method.line_end, Some(22));
     }
 
     fn has_symbol(symbols: &[CodeSymbol], kind: &str, name: &str, line_start: i64) -> bool {
