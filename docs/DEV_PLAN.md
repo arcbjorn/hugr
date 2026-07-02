@@ -64,6 +64,21 @@ Not implemented yet:
 - tree-sitter-backed parsing for additional languages beyond Rust, Python, TypeScript, and Go
 - remote-only storage execution and the Hugr API sync backend
 
+## Completion Gap Review
+
+The near-term plan is close to complete, but the broader vision and technical blueprint still require several product systems before Hugr is complete:
+
+- Daemon/runtime service: `hugr daemon`, local socket or HTTP transport, file watching, background indexing, and background memory jobs.
+- Remote/cloud execution: remote-only storage mode, hosted Hugr API backend, auth boundary, and API-backed sync.
+- Context pack persistence: durable `context_packs` storage and real sync behavior for the `context_packs` sync class.
+- Context graph expansion: use code/source/entity graph neighborhoods during `hugr context`, not only direct file/symbol/memory retrieval.
+- Structured memory provenance: CLI/MCP support for source attachments, structured payloads, confidence, sensitivity, validity hints, and project scoping beyond raw text.
+- Automatic session observation: capture file edits, shell commands, git operations, test outcomes, failures, and discoveries without requiring manual `session event` calls.
+- Session summarization and memory promotion: summarize session events and promote durable discoveries into long-term memory.
+- Risk and health signals: complexity, coupling, dead code, diagnostics, risky paths, stale-after-edit detection, and richer risk sections in context packs.
+- Semantic operations: symbol lookup/edit helpers, diagnostics integration, and safe structural operations where they reduce brittle text edits.
+- Incremental freshness: watcher-driven invalidation and refresh for file discovery, symbols, graph edges, tests, and context evidence.
+
 ## Runtime Decision
 
 Tokio is the right default runtime for the current architecture.
