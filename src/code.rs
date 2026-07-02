@@ -183,6 +183,12 @@ fn extract_symbols(
             return Ok(symbols);
         }
     }
+    if matches!(language, Some("swift")) {
+        let symbols = extract_swift_symbols_with_tree_sitter(path, contents)?;
+        if !symbols.is_empty() {
+            return Ok(symbols);
+        }
+    }
 
     extract_symbols_from_lines(path, language, contents)
 }
@@ -710,6 +716,125 @@ fn java_symbol_from_node(
     }))
 }
 
+fn extract_swift_symbols_with_tree_sitter(
+    path: &str,
+    contents: &str,
+) -> Result<Vec<CodeSymbol>, String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_swift::LANGUAGE.into())
+        .map_err(|error| error.to_string())?;
+    let Some(tree) = parser.parse(contents, None) else {
+        return Ok(Vec::new());
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return Ok(Vec::new());
+    }
+
+    let mut symbols = Vec::new();
+    collect_swift_symbols(path, contents, root, &mut symbols)?;
+    symbols.sort_by(|left, right| {
+        left.line_start
+            .cmp(&right.line_start)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(symbols)
+}
+
+fn collect_swift_symbols(
+    path: &str,
+    contents: &str,
+    node: Node<'_>,
+    symbols: &mut Vec<CodeSymbol>,
+) -> Result<(), String> {
+    if let Some(symbol) = swift_symbol_from_node(path, contents, node)? {
+        symbols.push(symbol);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_swift_symbols(path, contents, child, symbols)?;
+    }
+
+    Ok(())
+}
+
+fn swift_symbol_from_node(
+    path: &str,
+    contents: &str,
+    node: Node<'_>,
+) -> Result<Option<CodeSymbol>, String> {
+    let (kind, name) = match node.kind() {
+        "associatedtype_declaration" | "typealias_declaration" => {
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return Ok(None);
+            };
+            ("type", node_text(name_node, contents)?)
+        }
+        "class_declaration" => {
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return Ok(None);
+            };
+            (
+                swift_type_declaration_kind(node, contents),
+                node_text(name_node, contents)?,
+            )
+        }
+        "deinit_declaration" => ("function", "deinit".to_string()),
+        "function_declaration" | "protocol_function_declaration" => {
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return Ok(None);
+            };
+            ("function", node_text(name_node, contents)?)
+        }
+        "init_declaration" => ("function", "init".to_string()),
+        "protocol_declaration" => {
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return Ok(None);
+            };
+            ("protocol", node_text(name_node, contents)?)
+        }
+        _ => return Ok(None),
+    };
+
+    Ok(Some(CodeSymbol {
+        path: path.to_string(),
+        language: Some("swift".to_string()),
+        name,
+        kind: kind.to_string(),
+        line_start: line_number(node.start_position().row),
+        line_end: Some(line_number(node.end_position().row)),
+        signature: line_signature(node, contents),
+    }))
+}
+
+fn swift_type_declaration_kind(node: Node<'_>, contents: &str) -> &'static str {
+    if let Some(kind_node) = node.child_by_field_name("declaration_kind") {
+        return match kind_node.kind() {
+            "actor" => "actor",
+            "enum" => "enum",
+            "extension" => "extension",
+            "struct" => "struct",
+            _ => "class",
+        };
+    }
+
+    let signature = line_signature(node, contents);
+    let declaration = strip_leading_modifiers(&signature);
+    if keyword_remainder(declaration, "actor").is_some() {
+        "actor"
+    } else if keyword_remainder(declaration, "enum").is_some() {
+        "enum"
+    } else if keyword_remainder(declaration, "extension").is_some() {
+        "extension"
+    } else if keyword_remainder(declaration, "struct").is_some() {
+        "struct"
+    } else {
+        "class"
+    }
+}
+
 fn extract_rust_symbol(line: &str) -> Option<(String, String)> {
     let line = strip_prefix_words(
         line,
@@ -1038,14 +1163,21 @@ fn line_declares_target(line: &str, target: &CodeSymbol) -> bool {
             starts_with_keyword_name(declaration, "fn", &target.name)
                 || starts_with_keyword_name(declaration, "def", &target.name)
                 || starts_with_keyword_name(declaration, "func", &target.name)
+                || starts_with_keyword_name(declaration, "fun", &target.name)
                 || starts_with_keyword_name(declaration, "function", &target.name)
         }
+        "actor" => starts_with_keyword_name(declaration, "actor", &target.name),
+        "annotation" => starts_with_keyword_name(declaration, "annotation", &target.name),
         "struct" => {
             starts_with_keyword_name(declaration, "struct", &target.name)
                 || starts_with_keyword_name(declaration, "type", &target.name)
         }
         "class" => starts_with_keyword_name(declaration, "class", &target.name),
+        "extension" => starts_with_keyword_name(declaration, "extension", &target.name),
         "interface" => starts_with_keyword_name(declaration, "interface", &target.name),
+        "object" => starts_with_keyword_name(declaration, "object", &target.name),
+        "protocol" => starts_with_keyword_name(declaration, "protocol", &target.name),
+        "record" => starts_with_keyword_name(declaration, "record", &target.name),
         "trait" => starts_with_keyword_name(declaration, "trait", &target.name),
         "enum" => starts_with_keyword_name(declaration, "enum", &target.name),
         "type" => starts_with_keyword_name(declaration, "type", &target.name),
@@ -1214,7 +1346,19 @@ fn is_type_reference_line(line: &str, target: &CodeSymbol) -> bool {
 fn is_type_like_symbol(symbol: &CodeSymbol) -> bool {
     matches!(
         symbol.kind.as_str(),
-        "class" | "struct" | "interface" | "trait" | "type" | "enum" | "impl"
+        "actor"
+            | "annotation"
+            | "class"
+            | "enum"
+            | "extension"
+            | "impl"
+            | "interface"
+            | "object"
+            | "protocol"
+            | "record"
+            | "struct"
+            | "trait"
+            | "type"
     )
 }
 
@@ -1606,6 +1750,113 @@ public class PluginRegistry implements PluginHook {
         assert_eq!(method.kind, "function");
         assert_eq!(method.line_start, 19);
         assert_eq!(method.line_end, Some(22));
+    }
+
+    #[test]
+    fn tree_sitter_swift_extracts_multiline_ranges() {
+        let symbols = extract_symbols(
+            "Sources/Plugin/PluginRegistry.swift",
+            Some("swift"),
+            r#"
+public protocol PluginHook {
+    func runPluginHooks() -> Bool
+}
+
+public struct HookResult {
+    let loaded: Bool
+}
+
+public enum HookState {
+    case enabled
+    case disabled
+}
+
+public actor PluginRegistry: PluginHook {
+    public init() {
+    }
+
+    public func runPluginHooks() -> Bool {
+        return true
+    }
+}
+
+extension PluginRegistry {
+    public func resetHooks() {
+    }
+}
+
+public typealias HookCallback = () -> Bool
+"#,
+        )
+        .unwrap();
+
+        let protocol = symbols
+            .iter()
+            .find(|symbol| symbol.name == "PluginHook")
+            .unwrap();
+        let protocol_method = symbols
+            .iter()
+            .find(|symbol| symbol.name == "runPluginHooks" && symbol.line_start == 3)
+            .unwrap();
+        let result = symbols
+            .iter()
+            .find(|symbol| symbol.name == "HookResult")
+            .unwrap();
+        let state = symbols
+            .iter()
+            .find(|symbol| symbol.name == "HookState")
+            .unwrap();
+        let registry = symbols
+            .iter()
+            .find(|symbol| symbol.name == "PluginRegistry" && symbol.kind == "actor")
+            .unwrap();
+        let initializer = symbols.iter().find(|symbol| symbol.name == "init").unwrap();
+        let method = symbols
+            .iter()
+            .filter(|symbol| symbol.name == "runPluginHooks")
+            .max_by_key(|symbol| symbol.line_start)
+            .unwrap();
+        let extension = symbols
+            .iter()
+            .find(|symbol| symbol.name == "PluginRegistry" && symbol.kind == "extension")
+            .unwrap();
+        let reset = symbols
+            .iter()
+            .find(|symbol| symbol.name == "resetHooks")
+            .unwrap();
+        let callback = symbols
+            .iter()
+            .find(|symbol| symbol.name == "HookCallback")
+            .unwrap();
+
+        assert_eq!(protocol.kind, "protocol");
+        assert_eq!(protocol.line_start, 2);
+        assert_eq!(protocol.line_end, Some(4));
+        assert_eq!(protocol_method.kind, "function");
+        assert_eq!(protocol_method.line_end, Some(3));
+        assert_eq!(result.kind, "struct");
+        assert_eq!(result.line_start, 6);
+        assert_eq!(result.line_end, Some(8));
+        assert_eq!(state.kind, "enum");
+        assert_eq!(state.line_start, 10);
+        assert_eq!(state.line_end, Some(13));
+        assert_eq!(registry.language.as_deref(), Some("swift"));
+        assert_eq!(registry.line_start, 15);
+        assert_eq!(registry.line_end, Some(22));
+        assert_eq!(initializer.kind, "function");
+        assert_eq!(initializer.line_start, 16);
+        assert_eq!(initializer.line_end, Some(17));
+        assert_eq!(method.kind, "function");
+        assert_eq!(method.line_start, 19);
+        assert_eq!(method.line_end, Some(21));
+        assert_eq!(extension.kind, "extension");
+        assert_eq!(extension.line_start, 24);
+        assert_eq!(extension.line_end, Some(27));
+        assert_eq!(reset.line_start, 25);
+        assert_eq!(reset.line_end, Some(26));
+        assert_eq!(callback.kind, "type");
+        assert_eq!(callback.line_start, 29);
+        assert_eq!(callback.line_end, Some(29));
     }
 
     fn has_symbol(symbols: &[CodeSymbol], kind: &str, name: &str, line_start: i64) -> bool {
