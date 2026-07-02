@@ -1,5 +1,6 @@
 use crate::cli::{Command, OutputFormat, help_text};
 use crate::context::{ContextPack, json_string};
+use crate::daemon;
 use crate::discovery;
 use crate::impact as impact_analysis;
 use crate::indexer;
@@ -32,6 +33,7 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::SyncPull { dry_run, format } => sync_pull(dry_run, format).await,
         Command::SyncHistory { format } => sync_history(format).await,
         Command::Mcp => mcp::serve_stdio().await,
+        Command::Daemon { addr } => daemon::serve(daemon::DaemonConfig { addr }).await,
         Command::Improve {
             execute,
             duplicates,
