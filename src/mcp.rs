@@ -134,14 +134,14 @@ async fn tool_context(arguments: &Value) -> Result<Value, String> {
     indexer::index_candidates(&store, Path::new("."), &file_candidates).await?;
     let symbols = store.recall_symbols(&task, 8).await?;
     let files = file_candidates
-        .into_iter()
-        .map(|candidate| candidate.path)
+        .iter()
+        .map(|candidate| candidate.path.clone())
         .collect::<Vec<_>>();
     let affected_tests = store.likely_tests_for_files(&files, 5).await?;
     let branch_state = worktree::inspect(Path::new("."));
-    let pack = ContextPack::with_sessions_symbols_tests_branch_and_stale_risks(
+    let pack = ContextPack::with_file_candidates_sessions_symbols_tests_branch_and_stale_risks(
         &task,
-        files,
+        file_candidates,
         memories,
         sessions,
         symbols,
