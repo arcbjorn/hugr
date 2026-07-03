@@ -7,13 +7,15 @@ use crate::indexer;
 use crate::mcp;
 use crate::store::{
     ForgetResult, Memory, MemoryConsolidationResult, MemoryMaintenanceReport,
-    StaleRetirementResult, Store, SyncConflictSummary, SyncExecutionPlan, SyncPullResult,
-    SyncPushResult, SyncRunHistory, SyncTableResult,
+    SessionPromotionResult, StaleRetirementResult, Store, SyncConflictSummary, SyncExecutionPlan,
+    SyncPullResult, SyncPushResult, SyncRunHistory, SyncTableResult,
 };
 use crate::worktree;
 use std::collections::HashSet;
 use std::fmt::Write;
+use std::io::{self, Write as IoWrite};
 use std::path::Path;
+use std::process::Command as ProcessCommand;
 
 pub async fn execute(command: Command) -> Result<(), String> {
     match command {
@@ -28,12 +30,18 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::SessionStart { task } => session_start(&task).await,
         Command::SessionEvent { kind, detail } => session_event(&kind, &detail).await,
         Command::SessionEnd { summary } => session_end(summary.as_deref()).await,
+        Command::SessionPromote { format } => session_promote(format).await,
         Command::SyncStatus { format } => sync_status(format).await,
         Command::SyncPush { dry_run, format } => sync_push(dry_run, format).await,
         Command::SyncPull { dry_run, format } => sync_pull(dry_run, format).await,
         Command::SyncHistory { format } => sync_history(format).await,
         Command::Mcp => mcp::serve_stdio().await,
         Command::Daemon { addr } => daemon::serve(daemon::DaemonConfig { addr }).await,
+        Command::Run { command } => run_observed_command(&command).await,
+        Command::ObserveCommand { status, command } => {
+            observe_shell_command(status, &command).await
+        }
+        Command::ShellHook { shell } => shell_hook(&shell),
         Command::Improve {
             execute,
             duplicates,
@@ -237,6 +245,157 @@ async fn session_end(summary: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+async fn session_promote(format: OutputFormat) -> Result<(), String> {
+    let result = Store::open_current().promote_latest_session().await?;
+
+    if format == OutputFormat::Json {
+        println!("{}", render_session_promotion_json(&result));
+    } else {
+        print!("{}", render_session_promotion_text(&result));
+    }
+
+    Ok(())
+}
+
+async fn run_observed_command(command: &[String]) -> Result<(), String> {
+    let Some(program) = command.first() else {
+        return Err("hugr run requires a command".to_string());
+    };
+
+    let output = ProcessCommand::new(program)
+        .args(command.iter().skip(1))
+        .output()
+        .map_err(|error| format!("failed to run '{}': {error}", command.join(" ")))?;
+
+    io::stdout()
+        .write_all(&output.stdout)
+        .map_err(|error| error.to_string())?;
+    io::stderr()
+        .write_all(&output.stderr)
+        .map_err(|error| error.to_string())?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = command_observation_detail(command, output.status.code(), &stdout, &stderr);
+    let _ = Store::open_current()
+        .record_session_event_if_active("command", &detail)
+        .await?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "observed command exited with status {}",
+            output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_string())
+        ))
+    }
+}
+
+async fn observe_shell_command(status: i32, command: &[String]) -> Result<(), String> {
+    if command.is_empty() {
+        return Err("hugr observe command requires a command".to_string());
+    }
+
+    let detail = command_observation_detail(command, Some(status), "", "");
+    let _ = Store::open_current()
+        .record_session_event_if_active("command", &detail)
+        .await?;
+    Ok(())
+}
+
+fn shell_hook(shell: &str) -> Result<(), String> {
+    print!("{}", shell_hook_text(shell)?);
+    Ok(())
+}
+
+fn shell_hook_text(shell: &str) -> Result<&'static str, String> {
+    match shell {
+        "zsh" => Ok(ZSH_SHELL_HOOK),
+        "bash" => Ok(BASH_SHELL_HOOK),
+        _ => Err("hugr shell-hook supports bash or zsh".to_string()),
+    }
+}
+
+const ZSH_SHELL_HOOK: &str = r#"# Hugr shell observation hook for zsh.
+# Source with: eval "$(hugr shell-hook zsh)"
+if [[ -z "${HUGR_SHELL_HOOK_LOADED:-}" ]]; then
+  HUGR_SHELL_HOOK_LOADED=1
+  autoload -Uz add-zsh-hook
+  _hugr_preexec() {
+    HUGR_LAST_COMMAND="$1"
+  }
+  _hugr_precmd() {
+    local status=$?
+    if [[ -n "${HUGR_LAST_COMMAND:-}" ]]; then
+      command "${HUGR_BIN:-hugr}" observe command --status "$status" -- "$HUGR_LAST_COMMAND" >/dev/null 2>&1 || true
+      unset HUGR_LAST_COMMAND
+    fi
+  }
+  add-zsh-hook preexec _hugr_preexec
+  add-zsh-hook precmd _hugr_precmd
+fi
+"#;
+
+const BASH_SHELL_HOOK: &str = r#"# Hugr shell observation hook for bash.
+# Source with: eval "$(hugr shell-hook bash)"
+if [[ -z "${HUGR_SHELL_HOOK_LOADED:-}" ]]; then
+  HUGR_SHELL_HOOK_LOADED=1
+  _hugr_debug_trap() {
+    local command_line="$BASH_COMMAND"
+    case "$command_line" in
+      _hugr_*|*"hugr observe command"*) return ;;
+    esac
+    HUGR_LAST_COMMAND="$command_line"
+  }
+  _hugr_prompt_command() {
+    local status=$?
+    if [[ -n "${HUGR_LAST_COMMAND:-}" ]]; then
+      command "${HUGR_BIN:-hugr}" observe command --status "$status" -- "$HUGR_LAST_COMMAND" >/dev/null 2>&1 || true
+      unset HUGR_LAST_COMMAND
+    fi
+  }
+  trap _hugr_debug_trap DEBUG
+  PROMPT_COMMAND="_hugr_prompt_command${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+fi
+"#;
+
+fn command_observation_detail(
+    command: &[String],
+    status_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    let mut detail = format!(
+        "command: {}; status: {}",
+        command.join(" "),
+        status_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "signal".to_string())
+    );
+    if let Some(stdout_tail) = output_tail(stdout) {
+        let _ = write!(detail, "; stdout_tail: {stdout_tail}");
+    }
+    if let Some(stderr_tail) = output_tail(stderr) {
+        let _ = write!(detail, "; stderr_tail: {stderr_tail}");
+    }
+    detail
+}
+
+fn output_tail(output: &str) -> Option<String> {
+    let output = output.trim();
+    if output.is_empty() {
+        return None;
+    }
+
+    let mut chars = output.chars().rev().take(300).collect::<Vec<_>>();
+    chars.reverse();
+    Some(chars.into_iter().collect::<String>())
+}
+
 async fn sync_status(format: OutputFormat) -> Result<(), String> {
     let plan = Store::open_current().sync_execution_plan()?;
 
@@ -396,6 +555,23 @@ fn render_memory_list_json(memories: &[Memory]) -> String {
     }
     rendered.push(']');
     rendered
+}
+
+fn render_session_promotion_text(result: &SessionPromotionResult) -> String {
+    format!(
+        "Hugr session promotion\n  session: {}\n  task: {}\n  facts: {}\n  memory: {}\n",
+        result.session_id, result.task, result.fact_count, result.memory.id
+    )
+}
+
+fn render_session_promotion_json(result: &SessionPromotionResult) -> String {
+    format!(
+        "{{\"session_id\":{},\"task\":{},\"fact_count\":{},\"memory\":{}}}",
+        json_string(&result.session_id),
+        json_string(&result.task),
+        result.fact_count,
+        render_memory_json(&result.memory)
+    )
 }
 
 fn render_forget_text(result: &ForgetResult) -> String {
@@ -840,18 +1016,73 @@ fn render_sync_history_json(history: &[SyncRunHistory]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        render_consolidation_json, render_consolidation_text, render_forget_json,
-        render_forget_text, render_improve_json, render_improve_text, render_recall_json,
-        render_stale_retirement_json, render_stale_retirement_text, render_sync_history_json,
-        render_sync_history_text, render_sync_pull_json, render_sync_pull_text,
-        render_sync_push_json, render_sync_push_text, render_sync_status_json,
-        render_sync_status_text,
+        command_observation_detail, output_tail, render_consolidation_json,
+        render_consolidation_text, render_forget_json, render_forget_text, render_improve_json,
+        render_improve_text, render_recall_json, render_session_promotion_json,
+        render_session_promotion_text, render_stale_retirement_json, render_stale_retirement_text,
+        render_sync_history_json, render_sync_history_text, render_sync_pull_json,
+        render_sync_pull_text, render_sync_push_json, render_sync_push_text,
+        render_sync_status_json, render_sync_status_text, shell_hook_text,
     };
     use crate::store::{
         DuplicateMemoryGroup, ForgetResult, Memory, MemoryConsolidationResult,
-        MemoryMaintenanceReport, StaleMemoryCandidate, StaleRetirementResult, SyncConflictSummary,
-        SyncExecutionPlan, SyncPullResult, SyncPushResult, SyncRunHistory, SyncTableResult,
+        MemoryMaintenanceReport, SessionPromotionResult, StaleMemoryCandidate,
+        StaleRetirementResult, SyncConflictSummary, SyncExecutionPlan, SyncPullResult,
+        SyncPushResult, SyncRunHistory, SyncTableResult,
     };
+
+    #[test]
+    fn command_observation_detail_records_status_and_output_tails() {
+        let detail = command_observation_detail(
+            &["cargo".to_string(), "test".to_string()],
+            Some(0),
+            "tests passed\n",
+            "",
+        );
+
+        assert!(detail.contains("command: cargo test"));
+        assert!(detail.contains("status: 0"));
+        assert!(detail.contains("stdout_tail: tests passed"));
+        assert!(!detail.contains("stderr_tail"));
+
+        let long = "x".repeat(400);
+        assert_eq!(output_tail(&long).unwrap().len(), 300);
+    }
+
+    #[test]
+    fn shell_hooks_call_quiet_observe_endpoint() {
+        let zsh = shell_hook_text("zsh").unwrap();
+        let bash = shell_hook_text("bash").unwrap();
+
+        assert!(zsh.contains("add-zsh-hook preexec"));
+        assert!(zsh.contains("observe command --status"));
+        assert!(bash.contains("trap _hugr_debug_trap DEBUG"));
+        assert!(bash.contains("observe command --status"));
+        assert!(shell_hook_text("fish").is_err());
+    }
+
+    #[test]
+    fn session_promotion_renderers_include_memory() {
+        let result = SessionPromotionResult {
+            session_id: "ses_1".to_string(),
+            task: "stabilize plugin registry".to_string(),
+            fact_count: 2,
+            memory: Memory {
+                id: "mem_1".to_string(),
+                created_at_ms: 7,
+                kind: "fact".to_string(),
+                text: "Session promoted finding".to_string(),
+            },
+        };
+
+        let text = render_session_promotion_text(&result);
+        let json = render_session_promotion_json(&result);
+
+        assert!(text.contains("session: ses_1"));
+        assert!(text.contains("memory: mem_1"));
+        assert!(json.contains("\"session_id\":\"ses_1\""));
+        assert!(json.contains("\"memory\""));
+    }
 
     #[test]
     fn recall_json_includes_query_and_memories() {
