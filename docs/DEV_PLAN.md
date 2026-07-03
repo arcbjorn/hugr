@@ -34,9 +34,14 @@ Implemented:
 - `discovered_files` table populated by `hugr context`
 - durable session tables and CLI workflow
 - daemon-observed file-change and git/worktree session events for active sessions
+- `hugr run <command>` records shell/test command outcomes for active sessions
+- `hugr shell-hook <bash|zsh>` emits shell integration for automatic command-status observation
+- `hugr session promote [--json]` summarizes latest session facts into a durable memory
+- daemon background promotion turns ended, unpromoted sessions into durable memories
 - recent session facts in context packs
 - stdio MCP server with core Hugr tools
 - `hugr daemon` local HTTP runtime with `/health`, `/status`, file watching, debounced background indexing, and periodic memory-maintenance audits
+- daemon background indexing records discovery session events with indexed file/symbol summaries
 - `hugr index` for explicit project indexing
 - best-effort code symbol extraction stored in `code_symbols`
 - best-effort direct reference/call/import extraction stored in `code_references`
@@ -64,7 +69,7 @@ Implemented:
 Not implemented yet:
 
 - tree-sitter-backed Kotlin parsing; the current published `tree-sitter-kotlin` crate resolves to `tree-sitter <0.23` and conflicts with Hugr's `tree-sitter 0.26` parser stack
-- shell/test outcome observation and memory promotion jobs
+- richer discovery classification and structured provenance attachment
 - remote-only storage execution and the Hugr API sync backend
 
 ## Completion Gap Review
@@ -76,8 +81,8 @@ The near-term plan is close to complete, but the broader vision and technical bl
 - Context pack persistence: durable `context_packs` storage and real sync behavior for the `context_packs` sync class.
 - Context graph expansion: use code/source/entity graph neighborhoods during `hugr context`, not only direct file/symbol/memory retrieval.
 - Structured memory provenance: CLI/MCP support for source attachments, structured payloads, confidence, sensitivity, validity hints, and project scoping beyond raw text.
-- Automatic session observation: daemon captures file-change and git/worktree events for active sessions; shell commands, test outcomes, failures, and discoveries still need observation hooks.
-- Session summarization and memory promotion: summarize session events and promote durable discoveries into long-term memory.
+- Automatic session observation: daemon captures file-change and git/worktree events for active sessions, `hugr run <command>` captures command/test outcomes, `hugr shell-hook <bash|zsh>` can observe ordinary shell command statuses, and daemon indexing captures discovery summaries; richer discovery classification still needs implementation.
+- Session summarization and memory promotion: manual `hugr session promote` summarizes latest session facts into long-term memory, and the daemon periodically promotes ended, unpromoted sessions.
 - Risk and health signals: complexity, coupling, dead code, diagnostics, risky paths, stale-after-edit detection, and richer risk sections in context packs.
 - Semantic operations: symbol lookup/edit helpers, diagnostics integration, and safe structural operations where they reduce brittle text edits.
 - Incremental freshness: watcher-driven invalidation and refresh for file discovery, symbols, graph edges, tests, and context evidence.
@@ -484,6 +489,11 @@ Recommended next commits:
 38. Done: `feat(daemon): index on file changes`
 39. Done: `feat(daemon): audit memory in background`
 40. Done: `feat(session): observe daemon file changes`
+41. Done: `feat(session): observe command outcomes`
+42. Done: `feat(session): add shell observation hooks`
+43. Done: `feat(session): promote session memory`
+44. Done: `feat(session): auto-promote ended sessions`
+45. Done: `feat(session): capture indexing discoveries`
 
 Each commit should leave the CLI usable.
 
@@ -500,6 +510,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add shell/test outcome observation.
+Add structured provenance for promoted session and discovery memories.
 
-That is the right next step because `hugr daemon` now records file-change and git/worktree observations into the active session without manual `session event` calls. The remaining automatic observation gap is capturing shell commands, test outcomes, failures, and discoveries.
+That is the right next step because Hugr can now collect session facts from daemon file changes, explicit `hugr run` command outcomes, bash/zsh shell hooks, daemon indexing discoveries, manual session promotion, and daemon background promotion for ended sessions. The remaining memory quality gap is preserving structured provenance instead of promoting everything as raw text.
