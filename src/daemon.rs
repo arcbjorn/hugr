@@ -18,6 +18,7 @@ pub(crate) const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:5874";
 const INDEX_DEBOUNCE: Duration = Duration::from_millis(750);
 const IDLE_DEBOUNCE: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 const MEMORY_JOB_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const SESSION_PROMOTION_JOB_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DaemonConfig {
@@ -43,6 +44,8 @@ pub(crate) async fn serve(config: DaemonConfig) -> Result<(), String> {
     tokio::pin!(debounce);
     let mut memory_jobs = tokio::time::interval(MEMORY_JOB_INTERVAL);
     memory_jobs.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut session_promotion_jobs = tokio::time::interval(SESSION_PROMOTION_JOB_INTERVAL);
+    session_promotion_jobs.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut index_pending = false;
     let mut pending_paths = BTreeSet::new();
 
@@ -80,6 +83,12 @@ pub(crate) async fn serve(config: DaemonConfig) -> Result<(), String> {
                 let state = state.clone();
                 tokio::spawn(async move {
                     run_memory_maintenance_job(state).await;
+                });
+            }
+            _ = session_promotion_jobs.tick() => {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    run_session_promotion_job(state).await;
                 });
             }
             signal = tokio::signal::ctrl_c() => {
@@ -122,14 +131,51 @@ async fn run_background_index(state: Arc<DaemonState>) {
 
     state.set_last_index_status("running");
     let status = match indexer::index_project(5000).await {
-        Ok(summary) => format!(
-            "ok files={} symbols={}",
-            summary.file_count, summary.symbol_count
-        ),
+        Ok(summary) => {
+            let base_status = format!(
+                "ok files={} symbols={}",
+                summary.file_count, summary.symbol_count
+            );
+            match record_discovery_capture(&summary).await {
+                Ok(Some(event_id)) => format!("{base_status} discovery_event={event_id}"),
+                Ok(None) => format!("{base_status} discovery=skipped"),
+                Err(error) => format!("{base_status} discovery_error={error}"),
+            }
+        }
         Err(error) => format!("error: {error}"),
     };
     state.set_last_index_status(&status);
     state.indexing.store(false, Ordering::SeqCst);
+}
+
+async fn record_discovery_capture(
+    summary: &indexer::IndexSummary,
+) -> Result<Option<String>, String> {
+    Store::open_current()
+        .record_session_event_if_active("discovery", &render_discovery_capture_detail(summary))
+        .await
+        .map(|event| event.map(|event| event.id))
+}
+
+fn render_discovery_capture_detail(summary: &indexer::IndexSummary) -> String {
+    let sample_files = if summary.sample_files.is_empty() {
+        "none".to_string()
+    } else {
+        summary.sample_files.join(", ")
+    };
+    let extra_files = summary
+        .file_count
+        .saturating_sub(summary.sample_files.len());
+    let sample_files = if extra_files == 0 {
+        sample_files
+    } else {
+        format!("{sample_files}, +{extra_files} more")
+    };
+
+    format!(
+        "indexed files={} symbols={}; sample_files={sample_files}",
+        summary.file_count, summary.symbol_count
+    )
 }
 
 async fn run_memory_maintenance_job(state: Arc<DaemonState>) {
@@ -156,6 +202,32 @@ async fn run_memory_maintenance_job(state: Arc<DaemonState>) {
     };
     state.set_last_memory_job_status(&status);
     state.memory_job_running.store(false, Ordering::SeqCst);
+}
+
+async fn run_session_promotion_job(state: Arc<DaemonState>) {
+    if state.session_promotion_running.swap(true, Ordering::SeqCst) {
+        state.set_last_session_promotion_status("already_running");
+        return;
+    }
+
+    state.set_last_session_promotion_status("running");
+    let store = Store::open_current();
+    let status = if store.exists() {
+        match store.promote_next_unpromoted_session().await {
+            Ok(Some(result)) => format!(
+                "ok session={} memory={} facts={}",
+                result.session_id, result.memory.id, result.fact_count
+            ),
+            Ok(None) => "skipped no_unpromoted_session".to_string(),
+            Err(error) => format!("error: {error}"),
+        }
+    } else {
+        "skipped store_missing".to_string()
+    };
+    state.set_last_session_promotion_status(&status);
+    state
+        .session_promotion_running
+        .store(false, Ordering::SeqCst);
 }
 
 async fn run_session_observation(state: Arc<DaemonState>, changed_paths: Vec<String>) {
@@ -322,7 +394,7 @@ fn render_status_json(peer_addr: SocketAddr, state: &DaemonState) -> String {
         .unwrap_or_else(|_| "unknown".to_string());
 
     format!(
-        "{{\"status\":\"running\",\"service\":\"hugr-daemon\",\"peer_addr\":{},\"current_dir\":{},\"store_exists\":{},\"store_root\":{},\"storage\":{},\"watcher_enabled\":{},\"indexing\":{},\"last_index_status\":{},\"memory_job_running\":{},\"last_memory_job_status\":{},\"session_observation_running\":{},\"last_session_observation_status\":{}}}",
+        "{{\"status\":\"running\",\"service\":\"hugr-daemon\",\"peer_addr\":{},\"current_dir\":{},\"store_exists\":{},\"store_root\":{},\"storage\":{},\"watcher_enabled\":{},\"indexing\":{},\"last_index_status\":{},\"memory_job_running\":{},\"last_memory_job_status\":{},\"session_observation_running\":{},\"last_session_observation_status\":{},\"session_promotion_running\":{},\"last_session_promotion_status\":{}}}",
         json_string(&peer_addr.to_string()),
         json_string(&current_dir),
         store.exists(),
@@ -334,7 +406,9 @@ fn render_status_json(peer_addr: SocketAddr, state: &DaemonState) -> String {
         state.memory_job_running.load(Ordering::SeqCst),
         json_string(&state.last_memory_job_status()),
         state.session_observation_running.load(Ordering::SeqCst),
-        json_string(&state.last_session_observation_status())
+        json_string(&state.last_session_observation_status()),
+        state.session_promotion_running.load(Ordering::SeqCst),
+        json_string(&state.last_session_promotion_status())
     )
 }
 
@@ -359,9 +433,11 @@ struct DaemonState {
     indexing: AtomicBool,
     memory_job_running: AtomicBool,
     session_observation_running: AtomicBool,
+    session_promotion_running: AtomicBool,
     last_index_status: Mutex<String>,
     last_memory_job_status: Mutex<String>,
     last_session_observation_status: Mutex<String>,
+    last_session_promotion_status: Mutex<String>,
 }
 
 impl Default for DaemonState {
@@ -371,9 +447,11 @@ impl Default for DaemonState {
             indexing: AtomicBool::new(false),
             memory_job_running: AtomicBool::new(false),
             session_observation_running: AtomicBool::new(false),
+            session_promotion_running: AtomicBool::new(false),
             last_index_status: Mutex::new("not_started".to_string()),
             last_memory_job_status: Mutex::new("not_started".to_string()),
             last_session_observation_status: Mutex::new("not_started".to_string()),
+            last_session_promotion_status: Mutex::new("not_started".to_string()),
         }
     }
 }
@@ -417,14 +495,28 @@ impl DaemonState {
             .map(|status| status.clone())
             .unwrap_or_else(|_| "unavailable".to_string())
     }
+
+    fn set_last_session_promotion_status(&self, status: &str) {
+        if let Ok(mut value) = self.last_session_promotion_status.lock() {
+            *value = status.to_string();
+        }
+    }
+
+    fn last_session_promotion_status(&self) -> String {
+        self.last_session_promotion_status
+            .lock()
+            .map(|status| status.clone())
+            .unwrap_or_else(|_| "unavailable".to_string())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonState, is_ignored_watch_path, render_session_observation_detail, request_line_parts,
-        response_for_request,
+        DaemonState, is_ignored_watch_path, render_discovery_capture_detail,
+        render_session_observation_detail, request_line_parts, response_for_request,
     };
+    use crate::indexer::IndexSummary;
     use crate::worktree::{ChangedFile, WorktreeState};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::Path;
@@ -471,6 +563,7 @@ mod tests {
             "ok active=1 retired=0 duplicate_groups=0 stale_candidates=0",
         );
         state.set_last_session_observation_status("ok event=evt_1_0");
+        state.set_last_session_promotion_status("ok session=ses_1 memory=mem_1 facts=2");
 
         let response = response_for_request(
             "GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -485,6 +578,10 @@ mod tests {
         assert!(response.contains(r#""last_memory_job_status":"ok active=1 retired=0 duplicate_groups=0 stale_candidates=0""#));
         assert!(response.contains(r#""session_observation_running":false"#));
         assert!(response.contains(r#""last_session_observation_status":"ok event=evt_1_0""#));
+        assert!(response.contains(r#""session_promotion_running":false"#));
+        assert!(response.contains(
+            r#""last_session_promotion_status":"ok session=ses_1 memory=mem_1 facts=2""#
+        ));
     }
 
     #[test]
@@ -515,6 +612,18 @@ mod tests {
         assert!(detail.contains("files changed: src/lib.rs"));
         assert!(detail.contains("Sources/Plugin/PluginRegistry.swift"));
         assert!(detail.contains("git branch=feature ahead=2 behind=1 changed_files=1"));
+    }
+
+    #[test]
+    fn discovery_capture_detail_includes_index_summary() {
+        let detail = render_discovery_capture_detail(&IndexSummary {
+            file_count: 14,
+            symbol_count: 7,
+            sample_files: vec!["src/lib.rs".to_string(), "src/store.rs".to_string()],
+        });
+
+        assert!(detail.contains("indexed files=14 symbols=7"));
+        assert!(detail.contains("sample_files=src/lib.rs, src/store.rs, +12 more"));
     }
 
     #[test]
