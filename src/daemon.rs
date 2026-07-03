@@ -1,7 +1,9 @@
 use crate::context::json_string;
 use crate::indexer;
 use crate::store::Store;
+use crate::worktree;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Component, Path};
 use std::sync::Arc;
@@ -42,6 +44,7 @@ pub(crate) async fn serve(config: DaemonConfig) -> Result<(), String> {
     let mut memory_jobs = tokio::time::interval(MEMORY_JOB_INTERVAL);
     memory_jobs.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut index_pending = false;
+    let mut pending_paths = BTreeSet::new();
 
     println!("Hugr daemon listening on http://{local_addr}");
 
@@ -56,8 +59,9 @@ pub(crate) async fn serve(config: DaemonConfig) -> Result<(), String> {
                     }
                 });
             }
-            Some(()) = watcher_events.recv() => {
+            Some(paths) = watcher_events.recv() => {
                 index_pending = true;
+                pending_paths.extend(paths);
                 state.set_last_index_status("pending");
                 debounce.as_mut().reset(Instant::now() + INDEX_DEBOUNCE);
             }
@@ -65,8 +69,11 @@ pub(crate) async fn serve(config: DaemonConfig) -> Result<(), String> {
                 index_pending = false;
                 debounce.as_mut().reset(Instant::now() + IDLE_DEBOUNCE);
                 let state = state.clone();
+                let observed_paths = pending_paths.iter().cloned().collect::<Vec<_>>();
+                pending_paths.clear();
                 tokio::spawn(async move {
-                    run_background_index(state).await;
+                    run_background_index(state.clone()).await;
+                    run_session_observation(state, observed_paths).await;
                 });
             }
             _ = memory_jobs.tick() => {
@@ -151,17 +158,74 @@ async fn run_memory_maintenance_job(state: Arc<DaemonState>) {
     state.memory_job_running.store(false, Ordering::SeqCst);
 }
 
+async fn run_session_observation(state: Arc<DaemonState>, changed_paths: Vec<String>) {
+    if state
+        .session_observation_running
+        .swap(true, Ordering::SeqCst)
+    {
+        state.set_last_session_observation_status("already_running");
+        return;
+    }
+
+    state.set_last_session_observation_status("running");
+    let worktree = worktree::inspect(Path::new("."));
+    let detail = render_session_observation_detail(&changed_paths, &worktree);
+    let store = Store::open_current();
+    let status = match store
+        .record_session_event_if_active("daemon_observation", &detail)
+        .await
+    {
+        Ok(Some(event)) => format!("ok event={}", event.id),
+        Ok(None) => "skipped no_active_session".to_string(),
+        Err(error) => format!("error: {error}"),
+    };
+    state.set_last_session_observation_status(&status);
+    state
+        .session_observation_running
+        .store(false, Ordering::SeqCst);
+}
+
+fn render_session_observation_detail(
+    changed_paths: &[String],
+    worktree: &worktree::WorktreeState,
+) -> String {
+    let paths = if changed_paths.is_empty() {
+        "none".to_string()
+    } else {
+        changed_paths
+            .iter()
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let extra_paths = changed_paths.len().saturating_sub(12);
+    let paths = if extra_paths == 0 {
+        paths
+    } else {
+        format!("{paths}, +{extra_paths} more")
+    };
+    let changed_file_count = worktree.changed_files.len();
+    let branch = worktree.branch.as_deref().unwrap_or("unknown");
+
+    format!(
+        "files changed: {paths}; git branch={branch} ahead={} behind={} changed_files={changed_file_count}",
+        worktree.ahead, worktree.behind
+    )
+}
+
 fn start_file_watcher(
     root: &Path,
     state: Arc<DaemonState>,
-) -> Result<(UnboundedReceiver<()>, RecommendedWatcher), String> {
+) -> Result<(UnboundedReceiver<Vec<String>>, RecommendedWatcher), String> {
     let (sender, receiver) = unbounded_channel();
     let callback_state = state.clone();
     let mut watcher =
         notify::recommended_watcher(move |event: notify::Result<Event>| match event {
             Ok(event) => {
-                if is_relevant_watch_event(&event) {
-                    let _ = sender.send(());
+                let paths = relevant_watch_paths(&event);
+                if !paths.is_empty() {
+                    let _ = sender.send(paths);
                 }
             }
             Err(error) => {
@@ -178,8 +242,25 @@ fn start_file_watcher(
     Ok((receiver, watcher))
 }
 
-fn is_relevant_watch_event(event: &Event) -> bool {
-    event.paths.iter().any(|path| !is_ignored_watch_path(path))
+fn relevant_watch_paths(event: &Event) -> Vec<String> {
+    let mut paths = event
+        .paths
+        .iter()
+        .filter(|path| !is_ignored_watch_path(path))
+        .map(|path| display_watch_path(path))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn display_watch_path(path: &Path) -> String {
+    if let Ok(current_dir) = std::env::current_dir() {
+        if let Ok(relative) = path.strip_prefix(current_dir) {
+            return relative.display().to_string();
+        }
+    }
+    path.display().to_string()
 }
 
 fn is_ignored_watch_path(path: &Path) -> bool {
@@ -241,7 +322,7 @@ fn render_status_json(peer_addr: SocketAddr, state: &DaemonState) -> String {
         .unwrap_or_else(|_| "unknown".to_string());
 
     format!(
-        "{{\"status\":\"running\",\"service\":\"hugr-daemon\",\"peer_addr\":{},\"current_dir\":{},\"store_exists\":{},\"store_root\":{},\"storage\":{},\"watcher_enabled\":{},\"indexing\":{},\"last_index_status\":{},\"memory_job_running\":{},\"last_memory_job_status\":{}}}",
+        "{{\"status\":\"running\",\"service\":\"hugr-daemon\",\"peer_addr\":{},\"current_dir\":{},\"store_exists\":{},\"store_root\":{},\"storage\":{},\"watcher_enabled\":{},\"indexing\":{},\"last_index_status\":{},\"memory_job_running\":{},\"last_memory_job_status\":{},\"session_observation_running\":{},\"last_session_observation_status\":{}}}",
         json_string(&peer_addr.to_string()),
         json_string(&current_dir),
         store.exists(),
@@ -251,7 +332,9 @@ fn render_status_json(peer_addr: SocketAddr, state: &DaemonState) -> String {
         state.indexing.load(Ordering::SeqCst),
         json_string(&state.last_index_status()),
         state.memory_job_running.load(Ordering::SeqCst),
-        json_string(&state.last_memory_job_status())
+        json_string(&state.last_memory_job_status()),
+        state.session_observation_running.load(Ordering::SeqCst),
+        json_string(&state.last_session_observation_status())
     )
 }
 
@@ -275,8 +358,10 @@ struct DaemonState {
     watcher_enabled: AtomicBool,
     indexing: AtomicBool,
     memory_job_running: AtomicBool,
+    session_observation_running: AtomicBool,
     last_index_status: Mutex<String>,
     last_memory_job_status: Mutex<String>,
+    last_session_observation_status: Mutex<String>,
 }
 
 impl Default for DaemonState {
@@ -285,8 +370,10 @@ impl Default for DaemonState {
             watcher_enabled: AtomicBool::new(false),
             indexing: AtomicBool::new(false),
             memory_job_running: AtomicBool::new(false),
+            session_observation_running: AtomicBool::new(false),
             last_index_status: Mutex::new("not_started".to_string()),
             last_memory_job_status: Mutex::new("not_started".to_string()),
+            last_session_observation_status: Mutex::new("not_started".to_string()),
         }
     }
 }
@@ -317,11 +404,28 @@ impl DaemonState {
             .map(|status| status.clone())
             .unwrap_or_else(|_| "unavailable".to_string())
     }
+
+    fn set_last_session_observation_status(&self, status: &str) {
+        if let Ok(mut value) = self.last_session_observation_status.lock() {
+            *value = status.to_string();
+        }
+    }
+
+    fn last_session_observation_status(&self) -> String {
+        self.last_session_observation_status
+            .lock()
+            .map(|status| status.clone())
+            .unwrap_or_else(|_| "unavailable".to_string())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DaemonState, is_ignored_watch_path, request_line_parts, response_for_request};
+    use super::{
+        DaemonState, is_ignored_watch_path, render_session_observation_detail, request_line_parts,
+        response_for_request,
+    };
+    use crate::worktree::{ChangedFile, WorktreeState};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::Path;
     use std::sync::atomic::Ordering;
@@ -366,6 +470,7 @@ mod tests {
         state.set_last_memory_job_status(
             "ok active=1 retired=0 duplicate_groups=0 stale_candidates=0",
         );
+        state.set_last_session_observation_status("ok event=evt_1_0");
 
         let response = response_for_request(
             "GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -378,6 +483,38 @@ mod tests {
         assert!(response.contains(r#""last_index_status":"watching""#));
         assert!(response.contains(r#""memory_job_running":false"#));
         assert!(response.contains(r#""last_memory_job_status":"ok active=1 retired=0 duplicate_groups=0 stale_candidates=0""#));
+        assert!(response.contains(r#""session_observation_running":false"#));
+        assert!(response.contains(r#""last_session_observation_status":"ok event=evt_1_0""#));
+    }
+
+    #[test]
+    fn session_observation_detail_includes_files_and_git_state() {
+        let worktree = WorktreeState {
+            inside_worktree: true,
+            root_path: Some("/repo".to_string()),
+            branch: Some("feature".to_string()),
+            upstream: Some("origin/feature".to_string()),
+            ahead: 2,
+            behind: 1,
+            changed_files: vec![ChangedFile {
+                path: "src/lib.rs".to_string(),
+                original_path: None,
+                staged_status: None,
+                unstaged_status: Some("modified".to_string()),
+            }],
+        };
+
+        let detail = render_session_observation_detail(
+            &[
+                "src/lib.rs".to_string(),
+                "Sources/Plugin/PluginRegistry.swift".to_string(),
+            ],
+            &worktree,
+        );
+
+        assert!(detail.contains("files changed: src/lib.rs"));
+        assert!(detail.contains("Sources/Plugin/PluginRegistry.swift"));
+        assert!(detail.contains("git branch=feature ahead=2 behind=1 changed_files=1"));
     }
 
     #[test]
