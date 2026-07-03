@@ -10,11 +10,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
-use tokio::time::{Duration, Instant};
+use tokio::time::{Duration, Instant, MissedTickBehavior};
 
 pub(crate) const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:5874";
 const INDEX_DEBOUNCE: Duration = Duration::from_millis(750);
 const IDLE_DEBOUNCE: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+const MEMORY_JOB_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DaemonConfig {
@@ -38,6 +39,8 @@ pub(crate) async fn serve(config: DaemonConfig) -> Result<(), String> {
     let (mut watcher_events, _watcher) = start_file_watcher(Path::new("."), state.clone())?;
     let debounce = tokio::time::sleep(IDLE_DEBOUNCE);
     tokio::pin!(debounce);
+    let mut memory_jobs = tokio::time::interval(MEMORY_JOB_INTERVAL);
+    memory_jobs.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut index_pending = false;
 
     println!("Hugr daemon listening on http://{local_addr}");
@@ -64,6 +67,12 @@ pub(crate) async fn serve(config: DaemonConfig) -> Result<(), String> {
                 let state = state.clone();
                 tokio::spawn(async move {
                     run_background_index(state).await;
+                });
+            }
+            _ = memory_jobs.tick() => {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    run_memory_maintenance_job(state).await;
                 });
             }
             signal = tokio::signal::ctrl_c() => {
@@ -114,6 +123,32 @@ async fn run_background_index(state: Arc<DaemonState>) {
     };
     state.set_last_index_status(&status);
     state.indexing.store(false, Ordering::SeqCst);
+}
+
+async fn run_memory_maintenance_job(state: Arc<DaemonState>) {
+    if state.memory_job_running.swap(true, Ordering::SeqCst) {
+        state.set_last_memory_job_status("already_running");
+        return;
+    }
+
+    state.set_last_memory_job_status("running");
+    let store = Store::open_current();
+    let status = if store.exists() {
+        match store.memory_maintenance_report().await {
+            Ok(report) => format!(
+                "ok active={} retired={} duplicate_groups={} stale_candidates={}",
+                report.active_count,
+                report.retired_count,
+                report.duplicate_groups.len(),
+                report.stale_candidates.len()
+            ),
+            Err(error) => format!("error: {error}"),
+        }
+    } else {
+        "skipped store_missing".to_string()
+    };
+    state.set_last_memory_job_status(&status);
+    state.memory_job_running.store(false, Ordering::SeqCst);
 }
 
 fn start_file_watcher(
@@ -206,7 +241,7 @@ fn render_status_json(peer_addr: SocketAddr, state: &DaemonState) -> String {
         .unwrap_or_else(|_| "unknown".to_string());
 
     format!(
-        "{{\"status\":\"running\",\"service\":\"hugr-daemon\",\"peer_addr\":{},\"current_dir\":{},\"store_exists\":{},\"store_root\":{},\"storage\":{},\"watcher_enabled\":{},\"indexing\":{},\"last_index_status\":{}}}",
+        "{{\"status\":\"running\",\"service\":\"hugr-daemon\",\"peer_addr\":{},\"current_dir\":{},\"store_exists\":{},\"store_root\":{},\"storage\":{},\"watcher_enabled\":{},\"indexing\":{},\"last_index_status\":{},\"memory_job_running\":{},\"last_memory_job_status\":{}}}",
         json_string(&peer_addr.to_string()),
         json_string(&current_dir),
         store.exists(),
@@ -214,7 +249,9 @@ fn render_status_json(peer_addr: SocketAddr, state: &DaemonState) -> String {
         json_string(&store.storage_summary()),
         state.watcher_enabled.load(Ordering::SeqCst),
         state.indexing.load(Ordering::SeqCst),
-        json_string(&state.last_index_status())
+        json_string(&state.last_index_status()),
+        state.memory_job_running.load(Ordering::SeqCst),
+        json_string(&state.last_memory_job_status())
     )
 }
 
@@ -237,7 +274,9 @@ fn http_response(status_code: u16, content_type: &str, body: &str) -> String {
 struct DaemonState {
     watcher_enabled: AtomicBool,
     indexing: AtomicBool,
+    memory_job_running: AtomicBool,
     last_index_status: Mutex<String>,
+    last_memory_job_status: Mutex<String>,
 }
 
 impl Default for DaemonState {
@@ -245,7 +284,9 @@ impl Default for DaemonState {
         Self {
             watcher_enabled: AtomicBool::new(false),
             indexing: AtomicBool::new(false),
+            memory_job_running: AtomicBool::new(false),
             last_index_status: Mutex::new("not_started".to_string()),
+            last_memory_job_status: Mutex::new("not_started".to_string()),
         }
     }
 }
@@ -259,6 +300,19 @@ impl DaemonState {
 
     fn last_index_status(&self) -> String {
         self.last_index_status
+            .lock()
+            .map(|status| status.clone())
+            .unwrap_or_else(|_| "unavailable".to_string())
+    }
+
+    fn set_last_memory_job_status(&self, status: &str) {
+        if let Ok(mut value) = self.last_memory_job_status.lock() {
+            *value = status.to_string();
+        }
+    }
+
+    fn last_memory_job_status(&self) -> String {
+        self.last_memory_job_status
             .lock()
             .map(|status| status.clone())
             .unwrap_or_else(|_| "unavailable".to_string())
@@ -309,6 +363,9 @@ mod tests {
         let state = DaemonState::default();
         state.watcher_enabled.store(true, Ordering::SeqCst);
         state.set_last_index_status("watching");
+        state.set_last_memory_job_status(
+            "ok active=1 retired=0 duplicate_groups=0 stale_candidates=0",
+        );
 
         let response = response_for_request(
             "GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -319,6 +376,8 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains(r#""watcher_enabled":true"#));
         assert!(response.contains(r#""last_index_status":"watching""#));
+        assert!(response.contains(r#""memory_job_running":false"#));
+        assert!(response.contains(r#""last_memory_job_status":"ok active=1 retired=0 duplicate_groups=0 stale_candidates=0""#));
     }
 
     #[test]
