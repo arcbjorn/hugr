@@ -7,6 +7,7 @@ use std::path::Path;
 pub(crate) struct IndexSummary {
     pub file_count: usize,
     pub symbol_count: usize,
+    pub sample_files: Vec<String>,
 }
 
 pub(crate) async fn index_project(limit: usize) -> Result<IndexSummary, String> {
@@ -18,6 +19,11 @@ pub(crate) async fn index_project(limit: usize) -> Result<IndexSummary, String> 
     Ok(IndexSummary {
         file_count: files.len(),
         symbol_count: symbols.len(),
+        sample_files: files
+            .iter()
+            .take(12)
+            .map(|file| file.path.clone())
+            .collect(),
     })
 }
 
