@@ -33,6 +33,7 @@ Implemented:
 - `.gitignore`-aware fallback discovery with generated/vendor/build skips
 - `discovered_files` table populated by `hugr context`
 - durable session tables and CLI workflow
+- daemon-observed file-change and git/worktree session events for active sessions
 - recent session facts in context packs
 - stdio MCP server with core Hugr tools
 - `hugr daemon` local HTTP runtime with `/health`, `/status`, file watching, debounced background indexing, and periodic memory-maintenance audits
@@ -63,7 +64,7 @@ Implemented:
 Not implemented yet:
 
 - tree-sitter-backed Kotlin parsing; the current published `tree-sitter-kotlin` crate resolves to `tree-sitter <0.23` and conflicts with Hugr's `tree-sitter 0.26` parser stack
-- automatic session observation and memory promotion jobs
+- shell/test outcome observation and memory promotion jobs
 - remote-only storage execution and the Hugr API sync backend
 
 ## Completion Gap Review
@@ -75,7 +76,7 @@ The near-term plan is close to complete, but the broader vision and technical bl
 - Context pack persistence: durable `context_packs` storage and real sync behavior for the `context_packs` sync class.
 - Context graph expansion: use code/source/entity graph neighborhoods during `hugr context`, not only direct file/symbol/memory retrieval.
 - Structured memory provenance: CLI/MCP support for source attachments, structured payloads, confidence, sensitivity, validity hints, and project scoping beyond raw text.
-- Automatic session observation: capture file edits, shell commands, git operations, test outcomes, failures, and discoveries without requiring manual `session event` calls.
+- Automatic session observation: daemon captures file-change and git/worktree events for active sessions; shell commands, test outcomes, failures, and discoveries still need observation hooks.
 - Session summarization and memory promotion: summarize session events and promote durable discoveries into long-term memory.
 - Risk and health signals: complexity, coupling, dead code, diagnostics, risky paths, stale-after-edit detection, and richer risk sections in context packs.
 - Semantic operations: symbol lookup/edit helpers, diagnostics integration, and safe structural operations where they reduce brittle text edits.
@@ -482,6 +483,7 @@ Recommended next commits:
 37. Done: `feat(daemon): add local runtime skeleton`
 38. Done: `feat(daemon): index on file changes`
 39. Done: `feat(daemon): audit memory in background`
+40. Done: `feat(session): observe daemon file changes`
 
 Each commit should leave the CLI usable.
 
@@ -498,6 +500,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add automatic session observation.
+Add shell/test outcome observation.
 
-That is the right next step because `hugr daemon` now has local HTTP status, recursive file watching, debounced background index refreshes, and periodic memory-maintenance audits. The next major product gap is capturing file edits, shell commands, git operations, test outcomes, failures, and discoveries without requiring manual `session event` calls.
+That is the right next step because `hugr daemon` now records file-change and git/worktree observations into the active session without manual `session event` calls. The remaining automatic observation gap is capturing shell commands, test outcomes, failures, and discoveries.
