@@ -143,6 +143,12 @@ pub struct SyncRunHistory {
     pub tables: Vec<SyncTableResult>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SyncApiTablePayload {
+    pub result: SyncTableResult,
+    pub records: Vec<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Memory {
     pub id: String,
@@ -1463,6 +1469,7 @@ impl Store {
         Ok(history)
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_api_sync_run(
         &self,
         operation: &str,
@@ -1475,6 +1482,100 @@ impl Store {
         let now = now_ms()?;
         self.record_sync_run(&conn, operation, "hugr_api", status, now, now, tables)
             .await
+    }
+
+    pub(crate) async fn apply_api_sync_push_payloads(
+        &self,
+        payloads: &[SyncApiTablePayload],
+        dry_run: bool,
+    ) -> Result<(Option<String>, String, Vec<SyncApiTablePayload>), String> {
+        if dry_run {
+            return Ok((None, "dry_run".to_string(), payloads.to_vec()));
+        }
+
+        self.init().await?;
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let mut applied_payloads = Vec::new();
+
+        for payload in payloads {
+            let result = match SyncTableKind::from_table_name(&payload.result.table) {
+                Some(SyncTableKind::Memories) => {
+                    apply_api_push_memory_records(&conn, &payload.records).await?
+                }
+                Some(_) | None => unsupported_api_table_result(&payload.result),
+            };
+            applied_payloads.push(SyncApiTablePayload {
+                result,
+                records: Vec::new(),
+            });
+        }
+
+        let status = api_sync_status_for_payloads(&applied_payloads);
+        let now = now_ms()?;
+        let tables = applied_payloads
+            .iter()
+            .map(|payload| payload.result.clone())
+            .collect::<Vec<_>>();
+        let run_id = self
+            .record_sync_run(&conn, "push", "hugr_api", &status, now, now, &tables)
+            .await?;
+
+        Ok((Some(run_id), status, applied_payloads))
+    }
+
+    pub(crate) async fn api_sync_pull_payloads(
+        &self,
+        requested_payloads: &[SyncApiTablePayload],
+        dry_run: bool,
+    ) -> Result<(Option<String>, String, Vec<SyncApiTablePayload>), String> {
+        self.init().await?;
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let mut response_payloads = Vec::new();
+
+        for payload in requested_payloads {
+            let response_payload = match SyncTableKind::from_table_name(&payload.result.table) {
+                Some(SyncTableKind::Memories) => {
+                    let result = planned_sync_table_result(
+                        SyncTableKind::Memories,
+                        table_row_count(&conn, "memories").await?,
+                    );
+                    let records = if dry_run {
+                        Vec::new()
+                    } else {
+                        memory_sync_records(&conn).await?
+                    };
+                    SyncApiTablePayload { result, records }
+                }
+                Some(_) | None => SyncApiTablePayload {
+                    result: unsupported_api_table_result(&payload.result),
+                    records: Vec::new(),
+                },
+            };
+            response_payloads.push(response_payload);
+        }
+
+        let status = if dry_run {
+            "dry_run".to_string()
+        } else {
+            api_sync_status_for_payloads(&response_payloads)
+        };
+        let run_id = if dry_run {
+            None
+        } else {
+            let now = now_ms()?;
+            let tables = response_payloads
+                .iter()
+                .map(|payload| payload.result.clone())
+                .collect::<Vec<_>>();
+            Some(
+                self.record_sync_run(&conn, "pull", "hugr_api", &status, now, now, &tables)
+                    .await?,
+            )
+        };
+
+        Ok((run_id, status, response_payloads))
     }
 
     pub async fn sync_push(&self, dry_run: bool) -> Result<SyncPushResult, String> {
@@ -1491,7 +1592,10 @@ impl Store {
 
         if !dry_run {
             if matches!(config.backend, SyncBackend::HugrApi) {
-                return execute_hugr_api_push(&config, false, &tables);
+                let payloads = self
+                    .sync_api_table_payloads(&local_conn, &tables, true)
+                    .await?;
+                return execute_hugr_api_push(&config, false, &payloads);
             } else {
                 self.ensure_sync_push_execution_allowed(&config)?;
                 let started_at_ms = now_ms()?;
@@ -1544,7 +1648,7 @@ impl Store {
     pub async fn sync_pull(&self, dry_run: bool) -> Result<SyncPullResult, String> {
         let config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&config) {
-            return execute_hugr_api_pull(&config, dry_run, &[]);
+            return execute_hugr_api_pull(&config, dry_run, &[], None).await;
         }
 
         self.init().await?;
@@ -1555,7 +1659,10 @@ impl Store {
 
         if !dry_run {
             if matches!(config.backend, SyncBackend::HugrApi) {
-                return execute_hugr_api_pull(&config, false, &tables);
+                let payloads = self
+                    .sync_api_table_payloads(&local_conn, &tables, false)
+                    .await?;
+                return execute_hugr_api_pull(&config, false, &payloads, Some(&local_conn)).await;
             } else {
                 self.ensure_sync_execute_allowed(&config, "pull")?;
                 let started_at_ms = now_ms()?;
@@ -1702,6 +1809,32 @@ impl Store {
         Ok(results)
     }
 
+    async fn sync_api_table_payloads(
+        &self,
+        conn: &Connection,
+        tables: &[SyncTableResult],
+        include_memory_records: bool,
+    ) -> Result<Vec<SyncApiTablePayload>, String> {
+        let memory_records =
+            if include_memory_records && tables.iter().any(|table| table.table == "memories") {
+                Some(memory_sync_records(conn).await?)
+            } else {
+                None
+            };
+
+        Ok(tables
+            .iter()
+            .map(|table| SyncApiTablePayload {
+                result: table.clone(),
+                records: if table.table == "memories" {
+                    memory_records.clone().unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect())
+    }
+
     async fn copy_sync_tables(
         &self,
         local_conn: &Connection,
@@ -1803,6 +1936,22 @@ impl Store {
 }
 
 impl SyncTableKind {
+    fn from_table_name(table_name: &str) -> Option<Self> {
+        match table_name {
+            "projects" => Some(Self::Projects),
+            "memories" => Some(Self::Memories),
+            "memory_embeddings" => Some(Self::MemoryEmbeddings),
+            "sources" => Some(Self::Sources),
+            "discovered_files" => Some(Self::DiscoveredFiles),
+            "entities" => Some(Self::Entities),
+            "code_symbols" => Some(Self::CodeSymbols),
+            "edges" => Some(Self::Edges),
+            "code_references" => Some(Self::CodeReferences),
+            "sessions" => Some(Self::Sessions),
+            _ => None,
+        }
+    }
+
     fn table_name(self) -> &'static str {
         match self {
             Self::Projects => "projects",
@@ -1890,9 +2039,9 @@ fn uses_remote_only_hugr_api_transport(config: &StorageConfig) -> bool {
 fn execute_hugr_api_push(
     config: &StorageConfig,
     dry_run: bool,
-    tables: &[SyncTableResult],
+    payloads: &[SyncApiTablePayload],
 ) -> Result<SyncPushResult, String> {
-    let response = post_hugr_api_sync(config, "push", dry_run, tables)?;
+    let response = post_hugr_api_sync(config, "push", dry_run, payloads)?;
     let parsed = parse_hugr_api_sync_response(&response)?;
     Ok(SyncPushResult {
         run_id: parsed.run_id,
@@ -1903,19 +2052,30 @@ fn execute_hugr_api_push(
     })
 }
 
-fn execute_hugr_api_pull(
+async fn execute_hugr_api_pull(
     config: &StorageConfig,
     dry_run: bool,
-    tables: &[SyncTableResult],
+    payloads: &[SyncApiTablePayload],
+    local_conn: Option<&Connection>,
 ) -> Result<SyncPullResult, String> {
-    let response = post_hugr_api_sync(config, "pull", dry_run, tables)?;
+    let response = post_hugr_api_sync(config, "pull", dry_run, payloads)?;
     let parsed = parse_hugr_api_sync_response(&response)?;
+    let tables = if !dry_run {
+        if let Some(local_conn) = local_conn {
+            apply_api_pull_payloads(local_conn, &parsed.payloads).await?
+        } else {
+            parsed.tables
+        }
+    } else {
+        parsed.tables
+    };
+
     Ok(SyncPullResult {
         run_id: parsed.run_id,
         dry_run,
         backend: config.backend.as_str().to_string(),
         status: parsed.status,
-        tables: parsed.tables,
+        tables,
     })
 }
 
@@ -1923,9 +2083,9 @@ fn post_hugr_api_sync(
     config: &StorageConfig,
     operation: &str,
     dry_run: bool,
-    tables: &[SyncTableResult],
+    payloads: &[SyncApiTablePayload],
 ) -> Result<String, String> {
-    let body = hugr_api_sync_request(config, operation, dry_run, tables);
+    let body = hugr_api_sync_request(config, operation, dry_run, payloads);
     post_hugr_api_json(config, &format!("/v1/sync/{operation}"), &body)
 }
 
@@ -1941,7 +2101,7 @@ fn hugr_api_sync_request(
     config: &StorageConfig,
     operation: &str,
     dry_run: bool,
-    tables: &[SyncTableResult],
+    payloads: &[SyncApiTablePayload],
 ) -> serde_json::Value {
     json!({
         "contract_version": HUGR_API_CONTRACT_VERSION,
@@ -1950,8 +2110,19 @@ fn hugr_api_sync_request(
         "storage_mode": config.mode.as_str(),
         "sync_classes": config.sync_classes.iter().map(|class| class.as_str()).collect::<Vec<_>>(),
         "explicit_opt_in_classes": config.sync_classes.iter().filter(|class| class.requires_explicit_opt_in()).map(|class| class.as_str()).collect::<Vec<_>>(),
-        "tables": tables.iter().map(sync_table_result_value).collect::<Vec<_>>()
+        "tables": payloads.iter().map(sync_api_table_payload_value).collect::<Vec<_>>()
     })
+}
+
+fn sync_api_table_payload_value(payload: &SyncApiTablePayload) -> serde_json::Value {
+    let mut value = sync_table_result_value(&payload.result);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "records".to_string(),
+            serde_json::Value::Array(payload.records.clone()),
+        );
+    }
+    value
 }
 
 fn sync_table_result_value(table: &SyncTableResult) -> serde_json::Value {
@@ -2068,25 +2239,43 @@ fn hugr_api_route_url(base_url: &str, path: &str) -> String {
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct HugrApiSyncResponse {
     run_id: Option<String>,
     status: String,
     tables: Vec<SyncTableResult>,
+    payloads: Vec<SyncApiTablePayload>,
 }
 
 fn parse_hugr_api_sync_response(response: &str) -> Result<HugrApiSyncResponse, String> {
     let value = serde_json::from_str::<serde_json::Value>(response)
         .map_err(|error| format!("invalid Hugr API sync response: {error}"))?;
     reject_hugr_api_error(&value)?;
-    let tables = json_array_field(&value, "tables")?
+    let payloads = json_array_field(&value, "tables")?
         .iter()
-        .map(parse_sync_table_result)
+        .map(parse_sync_api_table_payload)
         .collect::<Result<Vec<_>, _>>()?;
+    let tables = payloads
+        .iter()
+        .map(|payload| payload.result.clone())
+        .collect();
     Ok(HugrApiSyncResponse {
         run_id: json_optional_string_field(&value, "run_id")?,
         status: json_string_field(&value, "status")?,
         tables,
+        payloads,
+    })
+}
+
+fn parse_sync_api_table_payload(value: &serde_json::Value) -> Result<SyncApiTablePayload, String> {
+    let records = value
+        .get("records")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(SyncApiTablePayload {
+        result: parse_sync_table_result(value)?,
+        records,
     })
 }
 
@@ -2204,6 +2393,226 @@ fn json_bool_field(value: &serde_json::Value, field: &str) -> Result<bool, Strin
         .get(field)
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| format!("Hugr API response missing boolean field '{field}'"))
+}
+
+fn json_f64_field(value: &serde_json::Value, field: &str) -> Result<f64, String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| format!("Hugr API response missing number field '{field}'"))
+}
+
+fn api_sync_status_for_payloads(payloads: &[SyncApiTablePayload]) -> String {
+    if payloads
+        .iter()
+        .any(|payload| payload.result.conflict_count > 0)
+    {
+        "partial".to_string()
+    } else {
+        "accepted".to_string()
+    }
+}
+
+fn unsupported_api_table_result(result: &SyncTableResult) -> SyncTableResult {
+    let skipped_count = result.row_count;
+    let conflicts = if skipped_count == 0 {
+        Vec::new()
+    } else {
+        vec![SyncConflictSummary {
+            reason: "api_row_payload_not_supported".to_string(),
+            count: skipped_count,
+        }]
+    };
+
+    SyncTableResult {
+        class: result.class.clone(),
+        table: result.table.clone(),
+        row_count: result.row_count,
+        inserted_count: 0,
+        updated_count: 0,
+        skipped_count,
+        conflict_count: skipped_count,
+        executed: true,
+        conflicts,
+    }
+}
+
+async fn memory_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT
+                id, created_at_ms, kind, text, confidence, valid_from, valid_to,
+                superseded_by, sensitivity, structured_payload
+            FROM memories
+            ORDER BY created_at_ms, id
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(json!({
+            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
+            "created_at_ms": row.get::<i64>(1).map_err(|error| error.to_string())?,
+            "kind": row.get::<String>(2).map_err(|error| error.to_string())?,
+            "text": row.get::<String>(3).map_err(|error| error.to_string())?,
+            "confidence": row.get::<f64>(4).map_err(|error| error.to_string())?,
+            "valid_from": row.get::<Option<String>>(5).map_err(|error| error.to_string())?,
+            "valid_to": row.get::<Option<String>>(6).map_err(|error| error.to_string())?,
+            "superseded_by": row.get::<Option<String>>(7).map_err(|error| error.to_string())?,
+            "sensitivity": row.get::<String>(8).map_err(|error| error.to_string())?,
+            "structured_payload": row.get::<Option<String>>(9).map_err(|error| error.to_string())?
+        }));
+    }
+
+    Ok(records)
+}
+
+#[derive(Debug, Clone)]
+struct MemorySyncRecord {
+    id: String,
+    created_at_ms: i64,
+    kind: String,
+    text: String,
+    confidence: f64,
+    valid_from: Option<String>,
+    valid_to: Option<String>,
+    superseded_by: Option<String>,
+    sensitivity: String,
+    structured_payload: Option<String>,
+}
+
+fn memory_sync_record_from_value(value: &serde_json::Value) -> Result<MemorySyncRecord, String> {
+    Ok(MemorySyncRecord {
+        id: json_string_field(value, "id")?,
+        created_at_ms: json_i64_field(value, "created_at_ms")?,
+        kind: json_string_field(value, "kind")?,
+        text: json_string_field(value, "text")?,
+        confidence: json_f64_field(value, "confidence")?,
+        valid_from: json_optional_string_field(value, "valid_from")?,
+        valid_to: json_optional_string_field(value, "valid_to")?,
+        superseded_by: json_optional_string_field(value, "superseded_by")?,
+        sensitivity: json_string_field(value, "sensitivity")?,
+        structured_payload: json_optional_string_field(value, "structured_payload")?,
+    })
+}
+
+async fn apply_api_push_memory_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Memories;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = memory_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO memories (
+                    id, created_at_ms, kind, text, confidence, valid_from, valid_to,
+                    superseded_by, sensitivity, structured_payload
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT(id) DO UPDATE SET
+                    created_at_ms = excluded.created_at_ms,
+                    kind = excluded.kind,
+                    text = excluded.text,
+                    confidence = excluded.confidence,
+                    valid_from = excluded.valid_from,
+                    valid_to = excluded.valid_to,
+                    superseded_by = excluded.superseded_by,
+                    sensitivity = excluded.sensitivity,
+                    structured_payload = excluded.structured_payload
+                ",
+                params![
+                    record.id,
+                    record.created_at_ms,
+                    record.kind,
+                    record.text,
+                    record.confidence,
+                    record.valid_from,
+                    record.valid_to,
+                    record.superseded_by,
+                    record.sensitivity,
+                    record.structured_payload
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_pull_memory_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Memories;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = memory_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO memories (
+                    id, created_at_ms, kind, text, confidence, valid_from, valid_to,
+                    superseded_by, sensitivity, structured_payload
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT(id) DO UPDATE SET
+                    valid_to = COALESCE(memories.valid_to, excluded.valid_to),
+                    superseded_by = COALESCE(memories.superseded_by, excluded.superseded_by)
+                WHERE (memories.valid_to IS NULL AND excluded.valid_to IS NOT NULL)
+                   OR (memories.superseded_by IS NULL AND excluded.superseded_by IS NOT NULL)
+                ",
+                params![
+                    record.id,
+                    record.created_at_ms,
+                    record.kind,
+                    record.text,
+                    record.confidence,
+                    record.valid_from,
+                    record.valid_to,
+                    record.superseded_by,
+                    record.sensitivity,
+                    record.structured_payload
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_preserved");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_pull_payloads(
+    conn: &Connection,
+    payloads: &[SyncApiTablePayload],
+) -> Result<Vec<SyncTableResult>, String> {
+    let mut results = Vec::new();
+    for payload in payloads {
+        match SyncTableKind::from_table_name(&payload.result.table) {
+            Some(SyncTableKind::Memories) if !payload.records.is_empty() => {
+                results.push(apply_api_pull_memory_records(conn, &payload.records).await?);
+            }
+            _ => results.push(payload.result.clone()),
+        }
+    }
+    Ok(results)
 }
 
 #[derive(Debug, Default)]
@@ -4794,10 +5203,10 @@ fn now_ms() -> Result<i64, String> {
 mod tests {
     use super::{
         HUGR_API_CONTRACT_VERSION, HUGR_API_ROUTES, LOCAL_PROJECT_ID, Memory, MemorySource,
-        MemoryWriteOptions, StorageConfig, StorageMode, Store, SyncBackend, SyncClass,
-        SyncConflictSummary, SyncTableResult, fts_query, hugr_api_route_url, hugr_api_sync_request,
-        parse_hugr_api_history_response, parse_hugr_api_sync_response, query_terms, recall_score,
-        table_row_count,
+        MemoryWriteOptions, StorageConfig, StorageMode, Store, SyncApiTablePayload, SyncBackend,
+        SyncClass, SyncConflictSummary, SyncTableResult, apply_api_pull_payloads, fts_query,
+        hugr_api_route_url, hugr_api_sync_request, parse_hugr_api_history_response,
+        parse_hugr_api_sync_response, query_terms, recall_score, table_row_count,
     };
     use crate::code::{CodeReference, CodeSymbol};
     use crate::discovery::FileCandidate;
@@ -5055,8 +5464,23 @@ mod tests {
                 count: 1,
             }],
         };
+        let payload = SyncApiTablePayload {
+            result: table,
+            records: vec![serde_json::json!({
+                "id": "mem_1",
+                "created_at_ms": 1,
+                "kind": "fact",
+                "text": "plugin hooks run after config",
+                "confidence": 1.0,
+                "valid_from": null,
+                "valid_to": null,
+                "superseded_by": null,
+                "sensitivity": "normal",
+                "structured_payload": null
+            })],
+        };
 
-        let request = hugr_api_sync_request(&config, "push", false, &[table]);
+        let request = hugr_api_sync_request(&config, "push", false, &[payload]);
 
         assert_eq!(
             hugr_api_route_url("https://hugr.example/", "/v1/sync/push"),
@@ -5080,6 +5504,10 @@ mod tests {
         assert_eq!(
             request["tables"][0]["conflicts"][0]["reason"],
             serde_json::json!("local_row_newer_or_equal")
+        );
+        assert_eq!(
+            request["tables"][0]["records"][0]["id"],
+            serde_json::json!("mem_1")
         );
     }
 
@@ -5182,6 +5610,96 @@ mod tests {
         assert_eq!(history[0].status, "accepted");
         assert_eq!(history[0].tables[0].table, "memories");
         assert!(history[0].tables[0].executed);
+    }
+
+    #[tokio::test]
+    async fn api_push_applies_memory_row_payloads() {
+        let local = TestStore::new("hugr_api_push_local");
+        let remote = TestStore::new("hugr_api_push_remote");
+        let memory = local
+            .store
+            .remember("plugin hooks run after configuration")
+            .await
+            .unwrap();
+        let local_conn = local.store.connect().await.unwrap();
+        let table = SyncTableResult {
+            class: "memories".to_string(),
+            table: "memories".to_string(),
+            row_count: 1,
+            inserted_count: 0,
+            updated_count: 0,
+            skipped_count: 0,
+            conflict_count: 0,
+            executed: false,
+            conflicts: Vec::new(),
+        };
+        let payloads = local
+            .store
+            .sync_api_table_payloads(&local_conn, &[table], true)
+            .await
+            .unwrap();
+
+        let (run_id, status, response_payloads) = remote
+            .store
+            .apply_api_sync_push_payloads(&payloads, false)
+            .await
+            .unwrap();
+        let remote_conn = remote.store.connect().await.unwrap();
+
+        assert!(run_id.is_some());
+        assert_eq!(status, "accepted");
+        assert_eq!(response_payloads[0].result.table, "memories");
+        assert_eq!(response_payloads[0].result.inserted_count, 1);
+        assert!(response_payloads[0].records.is_empty());
+        assert_eq!(
+            memory_text(&remote_conn, &memory.id).await,
+            "plugin hooks run after configuration"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_pull_returns_and_applies_memory_row_payloads() {
+        let remote = TestStore::new("hugr_api_pull_remote");
+        let local = TestStore::new("hugr_api_pull_local");
+        let memory = remote
+            .store
+            .remember("remote memory flows through API pull")
+            .await
+            .unwrap();
+        local.store.init().await.unwrap();
+        let local_conn = local.store.connect().await.unwrap();
+        let request_payloads = vec![SyncApiTablePayload {
+            result: SyncTableResult {
+                class: "memories".to_string(),
+                table: "memories".to_string(),
+                row_count: 0,
+                inserted_count: 0,
+                updated_count: 0,
+                skipped_count: 0,
+                conflict_count: 0,
+                executed: false,
+                conflicts: Vec::new(),
+            },
+            records: Vec::new(),
+        }];
+
+        let (run_id, status, response_payloads) = remote
+            .store
+            .api_sync_pull_payloads(&request_payloads, false)
+            .await
+            .unwrap();
+        let applied = apply_api_pull_payloads(&local_conn, &response_payloads)
+            .await
+            .unwrap();
+
+        assert!(run_id.is_some());
+        assert_eq!(status, "accepted");
+        assert_eq!(response_payloads[0].records.len(), 1);
+        assert_eq!(applied[0].inserted_count, 1);
+        assert_eq!(
+            memory_text(&local_conn, &memory.id).await,
+            "remote memory flows through API pull"
+        );
     }
 
     #[tokio::test]
