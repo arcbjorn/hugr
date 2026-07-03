@@ -17,6 +17,8 @@ const CODE_REFERENCES_VERSION: i64 = 6;
 const CODE_REFERENCES_NAME: &str = "code_references";
 const SYNC_HISTORY_VERSION: i64 = 7;
 const SYNC_HISTORY_NAME: &str = "sync_history";
+const SESSION_PROMOTIONS_VERSION: i64 = 8;
+const SESSION_PROMOTIONS_NAME: &str = "session_promotions";
 
 pub async fn migrate(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
@@ -111,6 +113,22 @@ pub async fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![SYNC_HISTORY_VERSION, SYNC_HISTORY_NAME, now_ms()?],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    if !applied.contains(&SESSION_PROMOTIONS_VERSION) {
+        conn.execute_batch(session_promotions_sql())
+            .await
+            .map_err(|error| error.to_string())?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![
+                SESSION_PROMOTIONS_VERSION,
+                SESSION_PROMOTIONS_NAME,
+                now_ms()?
+            ],
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -271,6 +289,19 @@ fn sessions_sql() -> &'static str {
 
     CREATE INDEX IF NOT EXISTS session_events_session_idx
     ON session_events(session_id, created_at_ms DESC);
+    "
+}
+
+fn session_promotions_sql() -> &'static str {
+    "
+    CREATE TABLE IF NOT EXISTS session_promotions (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+        promoted_at_ms INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS session_promotions_memory_idx
+    ON session_promotions(memory_id);
     "
 }
 
