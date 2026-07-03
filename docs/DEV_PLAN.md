@@ -38,10 +38,15 @@ Implemented:
 - `hugr shell-hook <bash|zsh>` emits shell integration for automatic command-status observation
 - `hugr session promote [--json]` summarizes latest session facts into a durable memory
 - daemon background promotion turns ended, unpromoted sessions into durable memories
+- promoted session memories preserve structured provenance payloads and expose them through CLI, MCP, and context JSON
+- `hugr remember --source <kind:locator>` and MCP `hugr_remember.source` attach manual source provenance to memories
+- `hugr remember` and MCP `hugr_remember` accept confidence, sensitivity, and validity metadata for structured memory writes
+- structured memory payloads include current project id, name, root, remote, and default branch provenance
 - recent session facts in context packs
 - stdio MCP server with core Hugr tools
 - `hugr daemon` local HTTP runtime with `/health`, `/status`, file watching, debounced background indexing, and periodic memory-maintenance audits
 - daemon background indexing records discovery session events with indexed file/symbol summaries
+- `hugr index`, MCP `hugr_index`, and daemon discovery facts include file-role, language, and symbol-kind classifications
 - `hugr index` for explicit project indexing
 - best-effort code symbol extraction stored in `code_symbols`
 - best-effort direct reference/call/import extraction stored in `code_references`
@@ -49,9 +54,12 @@ Implemented:
 - important symbol citations in context packs
 - `hugr impact <file-or-symbol>` for direct indexed impact reports
 - local branch, upstream, ahead/behind, and worktree changes in context packs
-- environment-driven cloud/hybrid storage config placeholders with redacted status output
+- environment-driven cloud/hybrid/remote storage config with redacted status output
 - safe default and explicit opt-in cloud/hybrid sync class policy
-- `hugr sync status` execution-plan output for cloud/hybrid sync decisions
+- `hugr sync status` execution-plan output for cloud/hybrid/remote sync decisions
+- remote-only direct libSQL/Turso storage execution when `HUGR_STORAGE_MODE=remote` and credentials are explicit
+- Hugr API sync backend contract metadata in `hugr sync status`, including endpoint, contract version, and route surface
+- Hugr API sync client transport for explicit push, pull, and history requests against the `/v1/sync/*` contract
 - guarded `hugr sync push` dry-run and explicit execution path for safe sync classes
 - guarded `hugr sync pull` dry-run and explicit execution path for safe sync classes
 - `hugr sync history` with per-table sync counters and conflict summaries
@@ -69,19 +77,18 @@ Implemented:
 Not implemented yet:
 
 - tree-sitter-backed Kotlin parsing; the current published `tree-sitter-kotlin` crate resolves to `tree-sitter <0.23` and conflicts with Hugr's `tree-sitter 0.26` parser stack
-- richer discovery classification and structured provenance attachment
-- remote-only storage execution and the Hugr API sync backend
+- hosted Hugr API server execution and ordinary API-backed storage operations for remote-mode memory commands
 
 ## Completion Gap Review
 
 The near-term plan is close to complete, but the broader vision and technical blueprint still require several product systems before Hugr is complete:
 
 - Daemon/runtime service: `hugr daemon` local HTTP transport, file watching, debounced background indexing, and periodic memory-maintenance audits exist.
-- Remote/cloud execution: remote-only storage mode, hosted Hugr API backend, auth boundary, and API-backed sync.
+- Remote/cloud execution: direct remote libSQL/Turso storage mode exists; `hugr sync status` exposes the Hugr API contract metadata; and explicit API sync push, pull, and history requests can use the configured hosted endpoint. Hosted Hugr API server execution, auth boundary enforcement, live integration tests, and ordinary API-backed storage commands are still missing.
 - Context pack persistence: durable `context_packs` storage and real sync behavior for the `context_packs` sync class.
 - Context graph expansion: use code/source/entity graph neighborhoods during `hugr context`, not only direct file/symbol/memory retrieval.
-- Structured memory provenance: CLI/MCP support for source attachments, structured payloads, confidence, sensitivity, validity hints, and project scoping beyond raw text.
-- Automatic session observation: daemon captures file-change and git/worktree events for active sessions, `hugr run <command>` captures command/test outcomes, `hugr shell-hook <bash|zsh>` can observe ordinary shell command statuses, and daemon indexing captures discovery summaries; richer discovery classification still needs implementation.
+- Structured memory provenance: promoted session memories preserve structured payloads in JSON, and CLI/MCP memory writes support manual source attachments plus confidence, sensitivity, validity metadata, and project scope.
+- Automatic session observation: daemon captures file-change and git/worktree events for active sessions, `hugr run <command>` captures command/test outcomes, `hugr shell-hook <bash|zsh>` can observe ordinary shell command statuses, and daemon indexing captures classified discovery summaries.
 - Session summarization and memory promotion: manual `hugr session promote` summarizes latest session facts into long-term memory, and the daemon periodically promotes ended, unpromoted sessions.
 - Risk and health signals: complexity, coupling, dead code, diagnostics, risky paths, stale-after-edit detection, and richer risk sections in context packs.
 - Semantic operations: symbol lookup/edit helpers, diagnostics integration, and safe structural operations where they reduce brittle text edits.
@@ -395,14 +402,18 @@ Tasks:
 Implemented first slice:
 
 - `HUGR_STORAGE_MODE=local|hybrid|remote` is parsed and validated.
-- `HUGR_REMOTE_DATABASE_URL` and `HUGR_REMOTE_AUTH_TOKEN` placeholders are recognized, with common libSQL/Turso aliases.
+- `HUGR_REMOTE_DATABASE_URL` and `HUGR_REMOTE_AUTH_TOKEN` are recognized, with common libSQL/Turso aliases.
+- `HUGR_API_URL` and `HUGR_API_TOKEN` are recognized for the Hugr API backend contract.
 - CLI status, project status, doctor, and MCP project status expose redacted storage configuration.
-- Remote mode fails closed instead of silently writing to the local database; hybrid mode keeps local storage active while remote sync remains disabled.
+- Remote mode opens direct remote libSQL/Turso storage when explicitly configured; Hugr API remote mode fails ordinary local database commands with a hosted-storage-operations error instead of silently writing locally.
+- Hybrid mode keeps local storage active while guarded direct remote sync remains opt-in.
 - `HUGR_SYNC_CLASSES` represents safe default sync classes and explicit opt-ins for full source, raw command output, secrets, and private notes.
 - `HUGR_SYNC_BACKEND=direct_libsql|hugr_api` records the execution strategy decision, defaulting to direct libSQL/Turso.
-- `hugr sync status [--json]` renders the current sync execution plan, with guarded remote reads and writes available for explicitly configured hybrid direct libSQL/Turso storage.
-- `hugr sync push [--dry-run|--execute] [--json]` counts configured sync-class tables locally by default and only writes to direct libSQL/Turso when `--execute` and hybrid remote config are explicit.
-- `hugr sync pull [--dry-run|--execute] [--json]` counts configured sync-class tables locally by default and only reads from direct libSQL/Turso when `--execute` and hybrid remote config are explicit.
+- `hugr sync status [--json]` renders the current sync execution plan, with guarded remote reads and writes available for explicitly configured hybrid or remote direct libSQL/Turso storage.
+- For `HUGR_SYNC_BACKEND=hugr_api`, `hugr sync status [--json]` exposes the configured endpoint, `hugr-api-v1` contract version, and the planned `/v1/sync/*` route surface.
+- For explicit API sync execution, Hugr posts contract JSON to `POST /v1/sync/push` and `POST /v1/sync/pull`, fetches `GET /v1/sync/history`, and parses hosted table counters into the existing sync result types.
+- `hugr sync push [--dry-run|--execute] [--json]` counts configured sync-class tables locally by default, writes to direct libSQL/Turso when `--execute` and hybrid remote config are explicit, or posts to the Hugr API backend when selected.
+- `hugr sync pull [--dry-run|--execute] [--json]` counts configured sync-class tables locally by default, reads from direct libSQL/Turso when `--execute` and hybrid remote config are explicit, or posts to the Hugr API backend when selected.
 - Sync push currently covers project metadata, memories, embeddings, source references, entity/code-symbol indexes, graph/code-reference edges, and finalized session summaries. It does not sync raw session events, shell output, secrets, private notes, or full source without future explicit data sources.
 - Sync pull reconciles the same safe table set with conservative merge rules: local memories are not clobbered, project and code-index rows update only when the remote record is newer, dependent embeddings are skipped until their memory exists, and finalized sessions only replace open or older local summaries.
 - Sync push and pull report per-table inserted, updated, skipped, and conflict counts.
@@ -411,7 +422,7 @@ Implemented first slice:
 
 Open questions:
 
-- Should cloud mode stay on direct remote libSQL first, or move behind a Hugr API service before broader use?
+- Should hosted cloud mode use only the Hugr API service, or continue supporting direct remote libSQL/Turso for advanced users?
 - How long should sync history be retained before pruning?
 
 ## Phase 11: Memory Maintenance
@@ -494,6 +505,13 @@ Recommended next commits:
 43. Done: `feat(session): promote session memory`
 44. Done: `feat(session): auto-promote ended sessions`
 45. Done: `feat(session): capture indexing discoveries`
+46. Done: `feat(memory): preserve session provenance`
+47. Done: `feat(memory): attach manual sources`
+48. Done: `feat(memory): add write metadata`
+49. Done: `feat(index): classify discoveries`
+50. Done: `feat(memory): add project provenance`
+51. Done: `feat(sync): define Hugr API contract`
+52. Done: `feat(sync): add Hugr API client`
 
 Each commit should leave the CLI usable.
 
@@ -510,6 +528,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add structured provenance for promoted session and discovery memories.
+Add hosted Hugr API server execution and remote API storage operations.
 
-That is the right next step because Hugr can now collect session facts from daemon file changes, explicit `hugr run` command outcomes, bash/zsh shell hooks, daemon indexing discoveries, manual session promotion, and daemon background promotion for ended sessions. The remaining memory quality gap is preserving structured provenance instead of promoting everything as raw text.
+That is the right next step because direct remote libSQL/Turso storage is now executable and the CLI can send explicit sync requests to a configured Hugr API endpoint. The remaining remote/cloud gap is the hosted service itself, including auth enforcement, live contract tests, and remote-mode memory commands that do not depend on a local libSQL connection.
