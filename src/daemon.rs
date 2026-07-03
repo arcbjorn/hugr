@@ -1,8 +1,8 @@
 use crate::context::json_string;
 use crate::indexer;
 use crate::store::{
-    HUGR_API_CONTRACT_VERSION, Store, SyncConflictSummary, SyncExecutionPlan, SyncPullResult,
-    SyncPushResult, SyncRunHistory, SyncTableResult,
+    HUGR_API_CONTRACT_VERSION, Store, SyncApiTablePayload, SyncConflictSummary, SyncExecutionPlan,
+    SyncPullResult, SyncPushResult, SyncRunHistory, SyncTableResult,
 };
 use crate::worktree;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -496,58 +496,56 @@ async fn response_for_sync_api_operation(operation: &str, body: &str) -> String 
         Ok(request) => request,
         Err(error) => return http_response(400, "application/json", &render_error_json(&error)),
     };
-    let mut tables = request.tables;
-    for table in &mut tables {
-        table.executed = !request.dry_run;
-    }
-    let status = if request.dry_run {
-        "dry_run"
-    } else {
-        "accepted"
-    };
-    let run_id = if request.dry_run {
-        None
-    } else {
-        match Store::open_current()
-            .record_api_sync_run(operation, status, &tables)
-            .await
-        {
-            Ok(run_id) => Some(run_id),
-            Err(error) => {
-                return http_response(500, "application/json", &render_error_json(&error));
-            }
-        }
-    };
 
     match operation {
-        "push" => {
-            let result = SyncPushResult {
-                run_id,
-                dry_run: request.dry_run,
-                backend: "hugr_api".to_string(),
-                status: status.to_string(),
-                tables,
-            };
-            http_response(
-                200,
-                "application/json",
-                &render_sync_push_response_json(&result),
-            )
-        }
-        "pull" => {
-            let result = SyncPullResult {
-                run_id,
-                dry_run: request.dry_run,
-                backend: "hugr_api".to_string(),
-                status: status.to_string(),
-                tables,
-            };
-            http_response(
-                200,
-                "application/json",
-                &render_sync_pull_response_json(&result),
-            )
-        }
+        "push" => match Store::open_current()
+            .apply_api_sync_push_payloads(&request.table_payloads, request.dry_run)
+            .await
+        {
+            Ok((run_id, status, payloads)) => {
+                let tables = payloads
+                    .iter()
+                    .map(|payload| payload.result.clone())
+                    .collect();
+                let result = SyncPushResult {
+                    run_id,
+                    dry_run: request.dry_run,
+                    backend: "hugr_api".to_string(),
+                    status,
+                    tables,
+                };
+                http_response(
+                    200,
+                    "application/json",
+                    &render_sync_push_response_json(&result, &payloads),
+                )
+            }
+            Err(error) => http_response(500, "application/json", &render_error_json(&error)),
+        },
+        "pull" => match Store::open_current()
+            .api_sync_pull_payloads(&request.table_payloads, request.dry_run)
+            .await
+        {
+            Ok((run_id, status, payloads)) => {
+                let tables = payloads
+                    .iter()
+                    .map(|payload| payload.result.clone())
+                    .collect();
+                let result = SyncPullResult {
+                    run_id,
+                    dry_run: request.dry_run,
+                    backend: "hugr_api".to_string(),
+                    status,
+                    tables,
+                };
+                http_response(
+                    200,
+                    "application/json",
+                    &render_sync_pull_response_json(&result, &payloads),
+                )
+            }
+            Err(error) => http_response(500, "application/json", &render_error_json(&error)),
+        },
         _ => http_response(400, "application/json", r#"{"error":"bad_request"}"#),
     }
 }
@@ -633,10 +631,10 @@ fn request_header(request: &HttpRequest, name: &str) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct SyncApiOperationRequest {
     dry_run: bool,
-    tables: Vec<SyncTableResult>,
+    table_payloads: Vec<SyncApiTablePayload>,
 }
 
 fn parse_sync_api_operation_request(
@@ -660,10 +658,23 @@ fn parse_sync_api_operation_request(
 
     Ok(SyncApiOperationRequest {
         dry_run: json_bool_field(&value, "dry_run")?,
-        tables: json_array_field(&value, "tables")?
+        table_payloads: json_array_field(&value, "tables")?
             .iter()
-            .map(parse_sync_table_result)
+            .map(parse_sync_api_table_payload)
             .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn parse_sync_api_table_payload(value: &Value) -> Result<SyncApiTablePayload, String> {
+    let records = value
+        .get("records")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(SyncApiTablePayload {
+        result: parse_sync_table_result(value)?,
+        records,
     })
 }
 
@@ -779,24 +790,30 @@ fn sync_execution_plan_value(plan: &SyncExecutionPlan) -> Value {
     })
 }
 
-fn render_sync_push_response_json(result: &SyncPushResult) -> String {
+fn render_sync_push_response_json(
+    result: &SyncPushResult,
+    payloads: &[SyncApiTablePayload],
+) -> String {
     json!({
         "run_id": result.run_id,
         "dry_run": result.dry_run,
         "backend": result.backend,
         "status": result.status,
-        "tables": result.tables.iter().map(sync_table_result_value).collect::<Vec<_>>()
+        "tables": payloads.iter().map(sync_api_table_payload_value).collect::<Vec<_>>()
     })
     .to_string()
 }
 
-fn render_sync_pull_response_json(result: &SyncPullResult) -> String {
+fn render_sync_pull_response_json(
+    result: &SyncPullResult,
+    payloads: &[SyncApiTablePayload],
+) -> String {
     json!({
         "run_id": result.run_id,
         "dry_run": result.dry_run,
         "backend": result.backend,
         "status": result.status,
-        "tables": result.tables.iter().map(sync_table_result_value).collect::<Vec<_>>()
+        "tables": payloads.iter().map(sync_api_table_payload_value).collect::<Vec<_>>()
     })
     .to_string()
 }
@@ -818,6 +835,14 @@ fn sync_run_history_value(run: &SyncRunHistory) -> Value {
         "ended_at_ms": run.ended_at_ms,
         "tables": run.tables.iter().map(sync_table_result_value).collect::<Vec<_>>()
     })
+}
+
+fn sync_api_table_payload_value(payload: &SyncApiTablePayload) -> Value {
+    let mut value = sync_table_result_value(&payload.result);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("records".to_string(), Value::Array(payload.records.clone()));
+    }
+    value
 }
 
 fn sync_table_result_value(table: &SyncTableResult) -> Value {
