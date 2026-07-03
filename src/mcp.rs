@@ -2,7 +2,9 @@ use crate::context::ContextPack;
 use crate::discovery;
 use crate::impact;
 use crate::indexer;
-use crate::store::{Memory, Project, Session, SessionEvent, Store};
+use crate::store::{
+    Memory, MemorySource, MemoryWriteOptions, Project, Session, SessionEvent, Store,
+};
 use crate::worktree;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -156,7 +158,10 @@ async fn tool_context(arguments: &Value) -> Result<Value, String> {
 
 async fn tool_remember(arguments: &Value) -> Result<Value, String> {
     let text = required_string(arguments, "text")?;
-    let memory = Store::open_current().remember(&text).await?;
+    let options = optional_memory_write_options(arguments)?;
+    let memory = Store::open_current()
+        .remember_with_options(&text, options)
+        .await?;
     Ok(tool_result(
         format!("remembered {}", memory.id),
         json!({ "memory": memory_json(&memory) }),
@@ -240,7 +245,10 @@ async fn tool_index(arguments: &Value) -> Result<Value, String> {
         ),
         json!({
             "files": summary.file_count,
-            "symbols": summary.symbol_count
+            "symbols": summary.symbol_count,
+            "file_roles": summary.file_roles.iter().map(index_classification_json).collect::<Vec<_>>(),
+            "languages": summary.languages.iter().map(index_classification_json).collect::<Vec<_>>(),
+            "symbol_kinds": summary.symbol_kinds.iter().map(index_classification_json).collect::<Vec<_>>()
         }),
     ))
 }
@@ -354,6 +362,46 @@ fn tool_schema(name: &str, description: &str, properties: &[(&str, &str)]) -> Va
         );
     }
 
+    if name == "hugr_remember" {
+        props.insert(
+            "confidence".to_string(),
+            json!({
+                "type": "number",
+                "minimum": 0.0,
+                "maximum": 1.0
+            }),
+        );
+        props.insert(
+            "sensitivity".to_string(),
+            json!({
+                "type": "string"
+            }),
+        );
+        props.insert(
+            "valid_from".to_string(),
+            json!({
+                "type": "string"
+            }),
+        );
+        props.insert(
+            "valid_to".to_string(),
+            json!({
+                "type": "string"
+            }),
+        );
+        props.insert(
+            "source".to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string" },
+                    "locator": { "type": "string" }
+                },
+                "required": ["kind", "locator"]
+            }),
+        );
+    }
+
     if name == "hugr_session_end" {
         props.insert(
             "summary".to_string(),
@@ -405,6 +453,50 @@ fn optional_bounded_usize(
         .map_err(|error| error.to_string())
 }
 
+fn optional_memory_write_options(arguments: &Value) -> Result<MemoryWriteOptions, String> {
+    Ok(MemoryWriteOptions {
+        source: optional_memory_source(arguments)?,
+        confidence: optional_f64(arguments, "confidence")?,
+        sensitivity: optional_string(arguments, "sensitivity")?,
+        valid_from: optional_string(arguments, "valid_from")?,
+        valid_to: optional_string(arguments, "valid_to")?,
+    })
+}
+
+fn optional_memory_source(arguments: &Value) -> Result<Option<MemorySource>, String> {
+    match arguments.get("source") {
+        Some(source) if source.is_object() => Ok(Some(MemorySource {
+            kind: required_string(source, "kind")?,
+            locator: required_string(source, "locator")?,
+        })),
+        Some(_) => Err("source must be an object".to_string()),
+        None => Ok(None),
+    }
+}
+
+fn optional_f64(arguments: &Value, key: &str) -> Result<Option<f64>, String> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_f64()
+        .map(Some)
+        .ok_or_else(|| format!("{key} must be a number"))
+}
+
+fn optional_string(arguments: &Value, key: &str) -> Result<Option<String>, String> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .map(Some)
+        .ok_or_else(|| format!("{key} must be a non-empty string"))
+}
+
 fn tool_result(text: String, structured: Value) -> Value {
     json!({
         "content": [
@@ -441,7 +533,22 @@ fn memory_json(memory: &Memory) -> Value {
         "id": &memory.id,
         "created_at_ms": memory.created_at_ms,
         "kind": &memory.kind,
-        "text": &memory.text
+        "text": &memory.text,
+        "structured_payload": memory_payload_json(memory.structured_payload.as_deref())
+    })
+}
+
+fn memory_payload_json(payload: Option<&str>) -> Value {
+    match payload {
+        Some(payload) => serde_json::from_str(payload).unwrap_or_else(|_| json!(payload)),
+        None => Value::Null,
+    }
+}
+
+fn index_classification_json(classification: &indexer::IndexClassification) -> Value {
+    json!({
+        "name": &classification.name,
+        "count": classification.count
     })
 }
 
@@ -484,7 +591,9 @@ fn context_pack_json(pack: &ContextPack) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_line, tools};
+    use super::{handle_line, index_classification_json, memory_json, tools};
+    use crate::indexer::IndexClassification;
+    use crate::store::Memory;
     use serde_json::Value;
 
     #[tokio::test]
@@ -514,5 +623,79 @@ mod tests {
         assert!(names.contains(&"hugr_session_event"));
         assert!(names.contains(&"hugr_session_end"));
         assert!(names.contains(&"hugr_forget"));
+    }
+
+    #[test]
+    fn remember_tool_schema_allows_source_and_metadata() {
+        let tools = tools();
+        let remember = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("hugr_remember"))
+            .unwrap();
+
+        assert_eq!(
+            remember["inputSchema"]["properties"]["source"]["properties"]["kind"]["type"],
+            "string"
+        );
+        assert_eq!(
+            remember["inputSchema"]["properties"]["source"]["properties"]["locator"]["type"],
+            "string"
+        );
+        assert_eq!(
+            remember["inputSchema"]["properties"]["source"]["required"][0],
+            "kind"
+        );
+        assert_eq!(
+            remember["inputSchema"]["properties"]["confidence"]["type"],
+            "number"
+        );
+        assert_eq!(
+            remember["inputSchema"]["properties"]["confidence"]["minimum"],
+            0.0
+        );
+        assert_eq!(
+            remember["inputSchema"]["properties"]["sensitivity"]["type"],
+            "string"
+        );
+        assert_eq!(
+            remember["inputSchema"]["properties"]["valid_from"]["type"],
+            "string"
+        );
+        assert_eq!(
+            remember["inputSchema"]["properties"]["valid_to"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn memory_json_preserves_structured_payload() {
+        let memory = Memory {
+            id: "mem_1".to_string(),
+            created_at_ms: 7,
+            kind: "fact".to_string(),
+            text: "Session promoted finding".to_string(),
+            structured_payload: Some(
+                r#"{"source":{"type":"session_promotion","session_id":"ses_1"}}"#.to_string(),
+            ),
+        };
+
+        let value = memory_json(&memory);
+
+        assert_eq!(
+            value["structured_payload"]["source"]["type"],
+            "session_promotion"
+        );
+        assert_eq!(value["structured_payload"]["source"]["session_id"], "ses_1");
+    }
+
+    #[test]
+    fn index_classification_json_includes_name_and_count() {
+        let value = index_classification_json(&IndexClassification {
+            name: "source".to_string(),
+            count: 3,
+        });
+
+        assert_eq!(value["name"], "source");
+        assert_eq!(value["count"], 3);
     }
 }

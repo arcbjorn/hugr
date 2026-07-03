@@ -1,4 +1,4 @@
-use crate::cli::{Command, OutputFormat, help_text};
+use crate::cli::{Command, MemoryWriteArgs, OutputFormat, help_text};
 use crate::context::{ContextPack, json_string};
 use crate::daemon;
 use crate::discovery;
@@ -6,9 +6,9 @@ use crate::impact as impact_analysis;
 use crate::indexer;
 use crate::mcp;
 use crate::store::{
-    ForgetResult, Memory, MemoryConsolidationResult, MemoryMaintenanceReport,
-    SessionPromotionResult, StaleRetirementResult, Store, SyncConflictSummary, SyncExecutionPlan,
-    SyncPullResult, SyncPushResult, SyncRunHistory, SyncTableResult,
+    ForgetResult, Memory, MemoryConsolidationResult, MemoryMaintenanceReport, MemorySource,
+    MemoryWriteOptions, SessionPromotionResult, StaleRetirementResult, Store, SyncConflictSummary,
+    SyncExecutionPlan, SyncPullResult, SyncPushResult, SyncRunHistory, SyncTableResult,
 };
 use crate::worktree;
 use std::collections::HashSet;
@@ -21,7 +21,7 @@ pub async fn execute(command: Command) -> Result<(), String> {
     match command {
         Command::Init => init().await,
         Command::Status => status().await,
-        Command::Remember { text } => remember(&text).await,
+        Command::Remember { text, options } => remember(&text, &options).await,
         Command::Recall { query, format } => recall(&query, format).await,
         Command::Context { task, format } => context(&task, format).await,
         Command::Index => index().await,
@@ -88,10 +88,39 @@ async fn status() -> Result<(), String> {
     Ok(())
 }
 
-async fn remember(text: &str) -> Result<(), String> {
-    let memory = Store::open_current().remember(text).await?;
+async fn remember(text: &str, options: &MemoryWriteArgs) -> Result<(), String> {
+    let store = Store::open_current();
+    let write_options = memory_write_options_from_args(options)?;
+    let memory = if write_options == MemoryWriteOptions::default() {
+        store.remember(text).await?
+    } else {
+        store.remember_with_options(text, write_options).await?
+    };
     println!("remembered {}", memory.id);
     Ok(())
+}
+
+fn memory_write_options_from_args(args: &MemoryWriteArgs) -> Result<MemoryWriteOptions, String> {
+    Ok(MemoryWriteOptions {
+        source: args.source.as_ref().map(|source| MemorySource {
+            kind: source.kind.clone(),
+            locator: source.locator.clone(),
+        }),
+        confidence: args
+            .confidence
+            .as_deref()
+            .map(parse_memory_confidence)
+            .transpose()?,
+        sensitivity: args.sensitivity.clone(),
+        valid_from: args.valid_from.clone(),
+        valid_to: args.valid_to.clone(),
+    })
+}
+
+fn parse_memory_confidence(value: &str) -> Result<f64, String> {
+    value
+        .parse::<f64>()
+        .map_err(|_| "memory confidence must be a number".to_string())
 }
 
 async fn recall(query: &str, format: OutputFormat) -> Result<(), String> {
@@ -172,6 +201,18 @@ async fn index() -> Result<(), String> {
 
     println!("indexed {} files", summary.file_count);
     println!("indexed {} symbols", summary.symbol_count);
+    println!(
+        "file_roles: {}",
+        indexer::format_classifications(&summary.file_roles)
+    );
+    println!(
+        "languages: {}",
+        indexer::format_classifications(&summary.languages)
+    );
+    println!(
+        "symbol_kinds: {}",
+        indexer::format_classifications(&summary.symbol_kinds)
+    );
     Ok(())
 }
 
@@ -537,12 +578,22 @@ fn render_recall_json(query: &str, memories: &[Memory]) -> String {
 
 fn render_memory_json(memory: &Memory) -> String {
     format!(
-        "{{\"id\":{},\"created_at_ms\":{},\"kind\":{},\"text\":{}}}",
+        "{{\"id\":{},\"created_at_ms\":{},\"kind\":{},\"text\":{},\"structured_payload\":{}}}",
         json_string(&memory.id),
         memory.created_at_ms,
         json_string(&memory.kind),
-        json_string(&memory.text)
+        json_string(&memory.text),
+        render_optional_json_payload(memory.structured_payload.as_deref())
     )
+}
+
+fn render_optional_json_payload(payload: Option<&str>) -> String {
+    match payload {
+        Some(payload) => serde_json::from_str::<serde_json::Value>(payload)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|_| json_string(payload)),
+        None => "null".to_string(),
+    }
 }
 
 fn render_memory_list_json(memories: &[Memory]) -> String {
@@ -787,9 +838,16 @@ fn render_sync_status_text(plan: &SyncExecutionPlan) -> String {
     } else {
         plan.explicit_opt_in_classes.join(",")
     };
+    let remote_endpoint = plan.remote_endpoint.as_deref().unwrap_or("none");
+    let api_contract_version = plan.api_contract_version.as_deref().unwrap_or("none");
+    let api_routes = if plan.api_routes.is_empty() {
+        "none".to_string()
+    } else {
+        plan.api_routes.join(",")
+    };
 
     format!(
-        "Hugr sync\n  storage_mode: {}\n  backend: {}\n  status: {}\n  local_writes_enabled: {}\n  remote_configured: {}\n  remote_auth_configured: {}\n  remote_reads_enabled: {}\n  remote_writes_enabled: {}\n  sync_classes: {}\n  explicit_opt_in_classes: {}\n",
+        "Hugr sync\n  storage_mode: {}\n  backend: {}\n  status: {}\n  local_writes_enabled: {}\n  remote_configured: {}\n  remote_auth_configured: {}\n  remote_reads_enabled: {}\n  remote_writes_enabled: {}\n  remote_endpoint: {}\n  api_contract_version: {}\n  api_routes: {}\n  sync_classes: {}\n  explicit_opt_in_classes: {}\n",
         plan.storage_mode,
         plan.backend,
         plan.status,
@@ -798,6 +856,9 @@ fn render_sync_status_text(plan: &SyncExecutionPlan) -> String {
         plan.remote_auth_configured,
         plan.remote_reads_enabled,
         plan.remote_writes_enabled,
+        remote_endpoint,
+        api_contract_version,
+        api_routes,
         sync_classes,
         explicit_opt_in_classes
     )
@@ -805,7 +866,7 @@ fn render_sync_status_text(plan: &SyncExecutionPlan) -> String {
 
 fn render_sync_status_json(plan: &SyncExecutionPlan) -> String {
     format!(
-        "{{\"storage_mode\":{},\"backend\":{},\"status\":{},\"local_writes_enabled\":{},\"remote_configured\":{},\"remote_auth_configured\":{},\"remote_reads_enabled\":{},\"remote_writes_enabled\":{},\"sync_classes\":{},\"explicit_opt_in_classes\":{}}}",
+        "{{\"storage_mode\":{},\"backend\":{},\"status\":{},\"local_writes_enabled\":{},\"remote_configured\":{},\"remote_auth_configured\":{},\"remote_reads_enabled\":{},\"remote_writes_enabled\":{},\"remote_endpoint\":{},\"api_contract_version\":{},\"api_routes\":{},\"sync_classes\":{},\"explicit_opt_in_classes\":{}}}",
         json_string(&plan.storage_mode),
         json_string(&plan.backend),
         json_string(&plan.status),
@@ -814,9 +875,16 @@ fn render_sync_status_json(plan: &SyncExecutionPlan) -> String {
         plan.remote_auth_configured,
         plan.remote_reads_enabled,
         plan.remote_writes_enabled,
+        render_optional_string_json(plan.remote_endpoint.as_deref()),
+        render_optional_string_json(plan.api_contract_version.as_deref()),
+        render_string_array_json(&plan.api_routes),
         render_string_array_json(&plan.sync_classes),
         render_string_array_json(&plan.explicit_opt_in_classes)
     )
+}
+
+fn render_optional_string_json(value: Option<&str>) -> String {
+    value.map(json_string).unwrap_or_else(|| "null".to_string())
 }
 
 fn render_string_array_json(values: &[String]) -> String {
@@ -1072,16 +1140,24 @@ mod tests {
                 created_at_ms: 7,
                 kind: "fact".to_string(),
                 text: "Session promoted finding".to_string(),
+                structured_payload: Some(
+                    r#"{"source":{"type":"session_promotion","session_id":"ses_1"}}"#.to_string(),
+                ),
             },
         };
 
         let text = render_session_promotion_text(&result);
         let json = render_session_promotion_json(&result);
+        let parsed = serde_json::from_str::<serde_json::Value>(&json).unwrap();
 
         assert!(text.contains("session: ses_1"));
         assert!(text.contains("memory: mem_1"));
         assert!(json.contains("\"session_id\":\"ses_1\""));
         assert!(json.contains("\"memory\""));
+        assert_eq!(
+            parsed["memory"]["structured_payload"]["source"]["type"],
+            "session_promotion"
+        );
     }
 
     #[test]
@@ -1093,6 +1169,7 @@ mod tests {
                 created_at_ms: 7,
                 kind: "fact".to_string(),
                 text: "plugin hooks run after configuration is loaded".to_string(),
+                structured_payload: None,
             }],
         );
 
@@ -1112,6 +1189,7 @@ mod tests {
                 created_at_ms: 7,
                 kind: "fact".to_string(),
                 text: "plugin hooks run after configuration is loaded".to_string(),
+                structured_payload: None,
             }],
         };
 
@@ -1137,12 +1215,14 @@ mod tests {
                         created_at_ms: 7,
                         kind: "fact".to_string(),
                         text: "plugin hooks".to_string(),
+                        structured_payload: None,
                     },
                     Memory {
                         id: "mem_2".to_string(),
                         created_at_ms: 8,
                         kind: "fact".to_string(),
                         text: "Plugin hooks".to_string(),
+                        structured_payload: None,
                     },
                 ],
             }],
@@ -1155,12 +1235,14 @@ mod tests {
                     created_at_ms: 9,
                     kind: "fact".to_string(),
                     text: "plugin hooks run before configuration".to_string(),
+                    structured_payload: None,
                 },
                 older_memory: Memory {
                     id: "mem_old".to_string(),
                     created_at_ms: 7,
                     kind: "fact".to_string(),
                     text: "plugin hooks run after configuration".to_string(),
+                    structured_payload: None,
                 },
             }],
         };
@@ -1188,12 +1270,14 @@ mod tests {
                         created_at_ms: 8,
                         kind: "fact".to_string(),
                         text: "plugin hooks".to_string(),
+                        structured_payload: None,
                     },
                     Memory {
                         id: "mem_retire".to_string(),
                         created_at_ms: 7,
                         kind: "fact".to_string(),
                         text: "Plugin hooks".to_string(),
+                        structured_payload: None,
                     },
                 ],
             }],
@@ -1202,12 +1286,14 @@ mod tests {
                 created_at_ms: 8,
                 kind: "fact".to_string(),
                 text: "plugin hooks".to_string(),
+                structured_payload: None,
             }],
             retired_memories: vec![Memory {
                 id: "mem_retire".to_string(),
                 created_at_ms: 7,
                 kind: "fact".to_string(),
                 text: "Plugin hooks".to_string(),
+                structured_payload: None,
             }],
         };
 
@@ -1233,12 +1319,14 @@ mod tests {
                     created_at_ms: 8,
                     kind: "fact".to_string(),
                     text: "plugin hooks run before configuration".to_string(),
+                    structured_payload: None,
                 },
                 older_memory: Memory {
                     id: "mem_old".to_string(),
                     created_at_ms: 7,
                     kind: "fact".to_string(),
                     text: "plugin hooks run after configuration".to_string(),
+                    structured_payload: None,
                 },
             }],
             kept_memories: vec![Memory {
@@ -1246,12 +1334,14 @@ mod tests {
                 created_at_ms: 8,
                 kind: "fact".to_string(),
                 text: "plugin hooks run before configuration".to_string(),
+                structured_payload: None,
             }],
             retired_memories: vec![Memory {
                 id: "mem_old".to_string(),
                 created_at_ms: 7,
                 kind: "fact".to_string(),
                 text: "plugin hooks run after configuration".to_string(),
+                structured_payload: None,
             }],
         };
 
@@ -1275,6 +1365,9 @@ mod tests {
             remote_auth_configured: true,
             remote_reads_enabled: true,
             remote_writes_enabled: true,
+            remote_endpoint: Some("https://hugr.example".to_string()),
+            api_contract_version: Some("hugr-api-v1".to_string()),
+            api_routes: vec!["GET /v1/sync/status".to_string()],
             sync_classes: vec!["memories".to_string(), "full_source".to_string()],
             explicit_opt_in_classes: vec!["full_source".to_string()],
             status: "remote_sync_ready".to_string(),
@@ -1282,10 +1375,13 @@ mod tests {
 
         let text = render_sync_status_text(&plan);
         assert!(text.contains("backend: direct_libsql"));
+        assert!(text.contains("remote_endpoint: https://hugr.example"));
+        assert!(text.contains("api_contract_version: hugr-api-v1"));
         assert!(text.contains("explicit_opt_in_classes: full_source"));
 
         let json = render_sync_status_json(&plan);
         assert!(json.contains("\"storage_mode\":\"hybrid\""));
+        assert!(json.contains("\"api_routes\":[\"GET /v1/sync/status\"]"));
         assert!(json.contains("\"sync_classes\":[\"memories\",\"full_source\"]"));
     }
 

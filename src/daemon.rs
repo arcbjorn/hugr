@@ -173,8 +173,12 @@ fn render_discovery_capture_detail(summary: &indexer::IndexSummary) -> String {
     };
 
     format!(
-        "indexed files={} symbols={}; sample_files={sample_files}",
-        summary.file_count, summary.symbol_count
+        "indexed files={} symbols={}; file_roles={}; languages={}; symbol_kinds={}; sample_files={sample_files}",
+        summary.file_count,
+        summary.symbol_count,
+        indexer::format_classifications(&summary.file_roles),
+        indexer::format_classifications(&summary.languages),
+        indexer::format_classifications(&summary.symbol_kinds)
     )
 }
 
@@ -516,7 +520,7 @@ mod tests {
         DaemonState, is_ignored_watch_path, render_discovery_capture_detail,
         render_session_observation_detail, request_line_parts, response_for_request,
     };
-    use crate::indexer::IndexSummary;
+    use crate::indexer::{IndexClassification, IndexSummary};
     use crate::worktree::{ChangedFile, WorktreeState};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::Path;
@@ -620,9 +624,24 @@ mod tests {
             file_count: 14,
             symbol_count: 7,
             sample_files: vec!["src/lib.rs".to_string(), "src/store.rs".to_string()],
+            file_roles: vec![IndexClassification {
+                name: "source".to_string(),
+                count: 10,
+            }],
+            languages: vec![IndexClassification {
+                name: "rust".to_string(),
+                count: 9,
+            }],
+            symbol_kinds: vec![IndexClassification {
+                name: "function".to_string(),
+                count: 7,
+            }],
         });
 
         assert!(detail.contains("indexed files=14 symbols=7"));
+        assert!(detail.contains("file_roles=source=10"));
+        assert!(detail.contains("languages=rust=9"));
+        assert!(detail.contains("symbol_kinds=function=7"));
         assert!(detail.contains("sample_files=src/lib.rs, src/store.rs, +12 more"));
     }
 

@@ -4,17 +4,26 @@ use crate::embedding::{EmbeddingProvider, SelectedEmbeddingProvider};
 use crate::migrations;
 use crate::testmap::{self, TestCandidate};
 use libsql::{Builder, Connection, Row, params};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HUGR_DIR: &str = ".hugr";
 const HUGR_DB: &str = "hugr.db";
 const LOCAL_PROJECT_ID: &str = "project_local";
+const HUGR_API_CONTRACT_VERSION: &str = "hugr-api-v1";
+const HUGR_API_ROUTES: &[&str] = &[
+    "GET /v1/sync/status",
+    "POST /v1/sync/push",
+    "POST /v1/sync/pull",
+    "GET /v1/sync/history",
+];
 static SESSION_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +87,9 @@ pub struct SyncExecutionPlan {
     pub remote_auth_configured: bool,
     pub remote_reads_enabled: bool,
     pub remote_writes_enabled: bool,
+    pub remote_endpoint: Option<String>,
+    pub api_contract_version: Option<String>,
+    pub api_routes: Vec<String>,
     pub sync_classes: Vec<String>,
     pub explicit_opt_in_classes: Vec<String>,
     pub status: String,
@@ -137,6 +149,22 @@ pub struct Memory {
     pub created_at_ms: i64,
     pub kind: String,
     pub text: String,
+    pub structured_payload: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySource {
+    pub kind: String,
+    pub locator: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MemoryWriteOptions {
+    pub source: Option<MemorySource>,
+    pub confidence: Option<f64>,
+    pub sensitivity: Option<String>,
+    pub valid_from: Option<String>,
+    pub valid_to: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,8 +293,11 @@ impl Store {
     }
 
     pub async fn init(&self) -> Result<(), String> {
-        fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
-        fs::create_dir_all(self.root.join("sessions")).map_err(|error| error.to_string())?;
+        let storage_config = self.storage_config()?;
+        if !matches!(storage_config.mode, StorageMode::Remote) {
+            fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
+            fs::create_dir_all(self.root.join("sessions")).map_err(|error| error.to_string())?;
+        }
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
         let project = current_project_input()?;
@@ -279,9 +310,46 @@ impl Store {
     }
 
     pub async fn remember(&self, text: &str) -> Result<Memory, String> {
+        self.remember_with_source(text, None).await
+    }
+
+    pub async fn remember_with_source(
+        &self,
+        text: &str,
+        source: Option<MemorySource>,
+    ) -> Result<Memory, String> {
+        self.remember_with_options(
+            text,
+            MemoryWriteOptions {
+                source,
+                ..MemoryWriteOptions::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn remember_with_options(
+        &self,
+        text: &str,
+        options: MemoryWriteOptions,
+    ) -> Result<Memory, String> {
         self.init().await?;
         let conn = self.connect().await?;
-        insert_memory(&conn, self.embedding_provider()?, text).await
+        let options = normalize_memory_write_options(options)?;
+        let project = project_from_conn(&conn).await?;
+        let structured_payload = memory_write_payload(&options, project.as_ref());
+        insert_memory(
+            &conn,
+            self.embedding_provider()?,
+            text,
+            options.confidence.unwrap_or(1.0),
+            options
+                .sensitivity
+                .clone()
+                .unwrap_or_else(|| "normal".to_string()),
+            structured_payload,
+        )
+        .await
     }
 
     pub async fn memories(&self) -> Result<Vec<Memory>, String> {
@@ -1086,7 +1154,17 @@ impl Store {
         }
 
         let memory_text = session_promotion_text(&session, &facts);
-        let memory = insert_memory(conn, self.embedding_provider()?, &memory_text).await?;
+        let project = project_from_conn(conn).await?;
+        let structured_payload = session_promotion_payload(&session, &facts, project.as_ref());
+        let memory = insert_memory(
+            conn,
+            self.embedding_provider()?,
+            &memory_text,
+            1.0,
+            "normal".to_string(),
+            Some(structured_payload),
+        )
+        .await?;
         insert_session_promotion(conn, &session.id, &memory.id).await?;
         Ok(SessionPromotionResult {
             session_id: session.id,
@@ -1203,7 +1281,13 @@ impl Store {
         let mut rows = conn
             .query(
                 "
-                SELECT m.id, m.created_at_ms, m.kind, m.text, bm25(memories_fts) AS fts_rank
+                SELECT
+                    m.id,
+                    m.created_at_ms,
+                    m.kind,
+                    m.text,
+                    m.structured_payload,
+                    bm25(memories_fts) AS fts_rank
                 FROM memories_fts
                 JOIN memories AS m ON m.rowid = memories_fts.rowid
                 WHERE memories_fts MATCH ?1
@@ -1218,18 +1302,13 @@ impl Store {
         let mut matches = Vec::new();
 
         while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-            let memory = Memory {
-                id: row.get::<String>(0).map_err(|error| error.to_string())?,
-                created_at_ms: row.get::<i64>(1).map_err(|error| error.to_string())?,
-                kind: row.get::<String>(2).map_err(|error| error.to_string())?,
-                text: row.get::<String>(3).map_err(|error| error.to_string())?,
-            };
+            let memory = memory_from_row(&row)?;
             let term_score = recall_score(&memory, terms, query);
             if term_score > 0 {
                 matches.push(RankedMemory {
                     memory,
                     term_score,
-                    fts_rank: Some(row.get::<f64>(4).map_err(|error| error.to_string())?),
+                    fts_rank: Some(row.get::<f64>(5).map_err(|error| error.to_string())?),
                     vector_rank: None,
                 });
             }
@@ -1254,7 +1333,13 @@ impl Store {
                     SELECT id, row_number() OVER () AS vector_rank
                     FROM vector_top_k('memory_embeddings_vector_idx', ?1, ?2)
                 )
-                SELECT m.id, m.created_at_ms, m.kind, m.text, vector_matches.vector_rank
+                SELECT
+                    m.id,
+                    m.created_at_ms,
+                    m.kind,
+                    m.text,
+                    m.structured_payload,
+                    vector_matches.vector_rank
                 FROM vector_matches
                 JOIN memory_embeddings AS e ON e.rowid = vector_matches.id
                 JOIN memories AS m ON m.id = e.memory_id
@@ -1270,15 +1355,10 @@ impl Store {
 
         while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
             matches.push(RankedMemory {
-                memory: Memory {
-                    id: row.get::<String>(0).map_err(|error| error.to_string())?,
-                    created_at_ms: row.get::<i64>(1).map_err(|error| error.to_string())?,
-                    kind: row.get::<String>(2).map_err(|error| error.to_string())?,
-                    text: row.get::<String>(3).map_err(|error| error.to_string())?,
-                },
+                memory: memory_from_row(&row)?,
                 term_score: 0,
                 fts_rank: None,
-                vector_rank: Some(row.get::<i64>(4).map_err(|error| error.to_string())?),
+                vector_rank: Some(row.get::<i64>(5).map_err(|error| error.to_string())?),
             });
         }
 
@@ -1343,6 +1423,11 @@ impl Store {
     }
 
     pub async fn sync_history(&self, limit: usize) -> Result<Vec<SyncRunHistory>, String> {
+        let config = self.storage_config()?.clone();
+        if uses_hugr_api_transport(&config) {
+            return fetch_hugr_api_history(&config, limit.max(1));
+        }
+
         self.init().await?;
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
@@ -1379,46 +1464,54 @@ impl Store {
     }
 
     pub async fn sync_push(&self, dry_run: bool) -> Result<SyncPushResult, String> {
-        self.init().await?;
         let config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&config) {
+            return execute_hugr_api_push(&config, dry_run, &[]);
+        }
+
+        self.init().await?;
         let local_conn = self.connect().await?;
         migrations::migrate(&local_conn).await?;
         let mut tables = self.sync_table_results(&local_conn, &config, false).await?;
         let mut run_id = None;
 
         if !dry_run {
-            self.ensure_sync_push_execution_allowed(&config)?;
-            let started_at_ms = now_ms()?;
-            let remote_url = config
-                .remote_url
-                .as_ref()
-                .ok_or_else(|| "remote database URL is not configured".to_string())?;
-            let remote_auth_token = config
-                .remote_auth_token
-                .as_ref()
-                .ok_or_else(|| "remote auth token is not configured".to_string())?;
-            let remote_db = Builder::new_remote(remote_url.clone(), remote_auth_token.clone())
-                .build()
-                .await
-                .map_err(|error| error.to_string())?;
-            let remote_conn = remote_db.connect().map_err(|error| error.to_string())?;
-            migrations::migrate(&remote_conn).await?;
-            tables = self
-                .copy_sync_tables(&local_conn, &remote_conn, &config)
-                .await?;
-            let ended_at_ms = now_ms()?;
-            run_id = Some(
-                self.record_sync_run(
-                    &local_conn,
-                    "push",
-                    config.backend.as_str(),
-                    "executed",
-                    started_at_ms,
-                    ended_at_ms,
-                    &tables,
-                )
-                .await?,
-            );
+            if matches!(config.backend, SyncBackend::HugrApi) {
+                return execute_hugr_api_push(&config, false, &tables);
+            } else {
+                self.ensure_sync_push_execution_allowed(&config)?;
+                let started_at_ms = now_ms()?;
+                let remote_url = config
+                    .remote_url
+                    .as_ref()
+                    .ok_or_else(|| "remote database URL is not configured".to_string())?;
+                let remote_auth_token = config
+                    .remote_auth_token
+                    .as_ref()
+                    .ok_or_else(|| "remote auth token is not configured".to_string())?;
+                let remote_db = Builder::new_remote(remote_url.clone(), remote_auth_token.clone())
+                    .build()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let remote_conn = remote_db.connect().map_err(|error| error.to_string())?;
+                migrations::migrate(&remote_conn).await?;
+                tables = self
+                    .copy_sync_tables(&local_conn, &remote_conn, &config)
+                    .await?;
+                let ended_at_ms = now_ms()?;
+                run_id = Some(
+                    self.record_sync_run(
+                        &local_conn,
+                        "push",
+                        config.backend.as_str(),
+                        "executed",
+                        started_at_ms,
+                        ended_at_ms,
+                        &tables,
+                    )
+                    .await?,
+                );
+            }
         }
 
         Ok(SyncPushResult {
@@ -1435,46 +1528,54 @@ impl Store {
     }
 
     pub async fn sync_pull(&self, dry_run: bool) -> Result<SyncPullResult, String> {
-        self.init().await?;
         let config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&config) {
+            return execute_hugr_api_pull(&config, dry_run, &[]);
+        }
+
+        self.init().await?;
         let local_conn = self.connect().await?;
         migrations::migrate(&local_conn).await?;
         let mut tables = self.sync_table_results(&local_conn, &config, false).await?;
         let mut run_id = None;
 
         if !dry_run {
-            self.ensure_sync_execute_allowed(&config, "pull")?;
-            let started_at_ms = now_ms()?;
-            let remote_url = config
-                .remote_url
-                .as_ref()
-                .ok_or_else(|| "remote database URL is not configured".to_string())?;
-            let remote_auth_token = config
-                .remote_auth_token
-                .as_ref()
-                .ok_or_else(|| "remote auth token is not configured".to_string())?;
-            let remote_db = Builder::new_remote(remote_url.clone(), remote_auth_token.clone())
-                .build()
-                .await
-                .map_err(|error| error.to_string())?;
-            let remote_conn = remote_db.connect().map_err(|error| error.to_string())?;
-            migrations::migrate(&remote_conn).await?;
-            tables = self
-                .copy_pull_tables(&remote_conn, &local_conn, &config)
-                .await?;
-            let ended_at_ms = now_ms()?;
-            run_id = Some(
-                self.record_sync_run(
-                    &local_conn,
-                    "pull",
-                    config.backend.as_str(),
-                    "executed",
-                    started_at_ms,
-                    ended_at_ms,
-                    &tables,
-                )
-                .await?,
-            );
+            if matches!(config.backend, SyncBackend::HugrApi) {
+                return execute_hugr_api_pull(&config, false, &tables);
+            } else {
+                self.ensure_sync_execute_allowed(&config, "pull")?;
+                let started_at_ms = now_ms()?;
+                let remote_url = config
+                    .remote_url
+                    .as_ref()
+                    .ok_or_else(|| "remote database URL is not configured".to_string())?;
+                let remote_auth_token = config
+                    .remote_auth_token
+                    .as_ref()
+                    .ok_or_else(|| "remote auth token is not configured".to_string())?;
+                let remote_db = Builder::new_remote(remote_url.clone(), remote_auth_token.clone())
+                    .build()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let remote_conn = remote_db.connect().map_err(|error| error.to_string())?;
+                migrations::migrate(&remote_conn).await?;
+                tables = self
+                    .copy_pull_tables(&remote_conn, &local_conn, &config)
+                    .await?;
+                let ended_at_ms = now_ms()?;
+                run_id = Some(
+                    self.record_sync_run(
+                        &local_conn,
+                        "pull",
+                        config.backend.as_str(),
+                        "executed",
+                        started_at_ms,
+                        ended_at_ms,
+                        &tables,
+                    )
+                    .await?,
+                );
+            }
         }
 
         Ok(SyncPullResult {
@@ -1493,10 +1594,29 @@ impl Store {
     async fn connect(&self) -> Result<Connection, String> {
         let storage_config = self.storage_config()?;
         if matches!(storage_config.mode, StorageMode::Remote) {
-            return Err(
-                "HUGR_STORAGE_MODE=remote is configured but remote storage is not implemented yet"
-                    .to_string(),
-            );
+            if matches!(storage_config.backend, SyncBackend::HugrApi) {
+                return Err(
+                    "HUGR_STORAGE_MODE=remote with HUGR_SYNC_BACKEND=hugr_api requires hosted Hugr API storage operations for local database commands; use `hugr sync status --json` to inspect the sync transport"
+                        .to_string(),
+                );
+            }
+            let remote_url = storage_config
+                .remote_url
+                .as_ref()
+                .ok_or_else(|| "remote database URL is not configured".to_string())?;
+            let remote_auth_token = storage_config
+                .remote_auth_token
+                .as_ref()
+                .ok_or_else(|| "remote auth token is not configured".to_string())?;
+            let db = Builder::new_remote(remote_url.clone(), remote_auth_token.clone())
+                .build()
+                .await
+                .map_err(|error| error.to_string())?;
+            let conn = db.connect().map_err(|error| error.to_string())?;
+            conn.execute_batch("PRAGMA foreign_keys = ON;")
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(conn);
         }
 
         let db = Builder::new_local(self.db_path())
@@ -1744,6 +1864,334 @@ fn push_sync_table(
     }
 }
 
+fn uses_hugr_api_transport(config: &StorageConfig) -> bool {
+    matches!(config.backend, SyncBackend::HugrApi)
+        && matches!(config.mode, StorageMode::Hybrid | StorageMode::Remote)
+}
+
+fn uses_remote_only_hugr_api_transport(config: &StorageConfig) -> bool {
+    matches!(config.backend, SyncBackend::HugrApi) && matches!(config.mode, StorageMode::Remote)
+}
+
+fn execute_hugr_api_push(
+    config: &StorageConfig,
+    dry_run: bool,
+    tables: &[SyncTableResult],
+) -> Result<SyncPushResult, String> {
+    let response = post_hugr_api_sync(config, "push", dry_run, tables)?;
+    let parsed = parse_hugr_api_sync_response(&response)?;
+    Ok(SyncPushResult {
+        run_id: parsed.run_id,
+        dry_run,
+        backend: config.backend.as_str().to_string(),
+        status: parsed.status,
+        tables: parsed.tables,
+    })
+}
+
+fn execute_hugr_api_pull(
+    config: &StorageConfig,
+    dry_run: bool,
+    tables: &[SyncTableResult],
+) -> Result<SyncPullResult, String> {
+    let response = post_hugr_api_sync(config, "pull", dry_run, tables)?;
+    let parsed = parse_hugr_api_sync_response(&response)?;
+    Ok(SyncPullResult {
+        run_id: parsed.run_id,
+        dry_run,
+        backend: config.backend.as_str().to_string(),
+        status: parsed.status,
+        tables: parsed.tables,
+    })
+}
+
+fn post_hugr_api_sync(
+    config: &StorageConfig,
+    operation: &str,
+    dry_run: bool,
+    tables: &[SyncTableResult],
+) -> Result<String, String> {
+    let body = hugr_api_sync_request(config, operation, dry_run, tables);
+    post_hugr_api_json(config, &format!("/v1/sync/{operation}"), &body)
+}
+
+fn fetch_hugr_api_history(
+    config: &StorageConfig,
+    limit: usize,
+) -> Result<Vec<SyncRunHistory>, String> {
+    let response = get_hugr_api_json(config, &format!("/v1/sync/history?limit={limit}"))?;
+    parse_hugr_api_history_response(&response)
+}
+
+fn hugr_api_sync_request(
+    config: &StorageConfig,
+    operation: &str,
+    dry_run: bool,
+    tables: &[SyncTableResult],
+) -> serde_json::Value {
+    json!({
+        "contract_version": HUGR_API_CONTRACT_VERSION,
+        "operation": operation,
+        "dry_run": dry_run,
+        "storage_mode": config.mode.as_str(),
+        "sync_classes": config.sync_classes.iter().map(|class| class.as_str()).collect::<Vec<_>>(),
+        "explicit_opt_in_classes": config.sync_classes.iter().filter(|class| class.requires_explicit_opt_in()).map(|class| class.as_str()).collect::<Vec<_>>(),
+        "tables": tables.iter().map(sync_table_result_value).collect::<Vec<_>>()
+    })
+}
+
+fn sync_table_result_value(table: &SyncTableResult) -> serde_json::Value {
+    json!({
+        "class": table.class,
+        "table": table.table,
+        "row_count": table.row_count,
+        "inserted_count": table.inserted_count,
+        "updated_count": table.updated_count,
+        "skipped_count": table.skipped_count,
+        "conflict_count": table.conflict_count,
+        "executed": table.executed,
+        "conflicts": table.conflicts.iter().map(|conflict| {
+            json!({
+                "reason": conflict.reason,
+                "count": conflict.count
+            })
+        }).collect::<Vec<_>>()
+    })
+}
+
+fn post_hugr_api_json(
+    config: &StorageConfig,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<String, String> {
+    request_hugr_api_json(config, "POST", path, Some(body))
+}
+
+fn get_hugr_api_json(config: &StorageConfig, path: &str) -> Result<String, String> {
+    request_hugr_api_json(config, "GET", path, None)
+}
+
+fn request_hugr_api_json(
+    config: &StorageConfig,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<String, String> {
+    let url = hugr_api_route_url(
+        config
+            .remote_url
+            .as_ref()
+            .ok_or_else(|| "HUGR_SYNC_BACKEND=hugr_api requires HUGR_API_URL".to_string())?,
+        path,
+    );
+    let token = config
+        .remote_auth_token
+        .as_ref()
+        .ok_or_else(|| "HUGR_SYNC_BACKEND=hugr_api requires HUGR_API_TOKEN".to_string())?;
+    let mut args = vec![
+        "-fsS".to_string(),
+        "-X".to_string(),
+        method.to_string(),
+        url,
+        "-H".to_string(),
+        "Accept: application/json".to_string(),
+        "-H".to_string(),
+        format!("Authorization: Bearer {token}"),
+    ];
+    if body.is_some() {
+        args.extend([
+            "-H".to_string(),
+            "Content-Type: application/json".to_string(),
+            "--data-binary".to_string(),
+            "@-".to_string(),
+        ]);
+    }
+
+    let mut command = ProcessCommand::new("curl");
+    command
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if body.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to execute curl for Hugr API: {error}"))?;
+
+    if let Some(body) = body {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "failed to open Hugr API request stdin".to_string())?;
+        stdin
+            .write_all(body.to_string().as_bytes())
+            .map_err(|error| format!("failed to write Hugr API request: {error}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to read Hugr API response: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            return Err(format!(
+                "Hugr API request failed with status {}",
+                output.status
+            ));
+        }
+        return Err(format!("Hugr API request failed: {stderr}"));
+    }
+
+    String::from_utf8(output.stdout).map_err(|error| error.to_string())
+}
+
+fn hugr_api_route_url(base_url: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HugrApiSyncResponse {
+    run_id: Option<String>,
+    status: String,
+    tables: Vec<SyncTableResult>,
+}
+
+fn parse_hugr_api_sync_response(response: &str) -> Result<HugrApiSyncResponse, String> {
+    let value = serde_json::from_str::<serde_json::Value>(response)
+        .map_err(|error| format!("invalid Hugr API sync response: {error}"))?;
+    reject_hugr_api_error(&value)?;
+    let tables = json_array_field(&value, "tables")?
+        .iter()
+        .map(parse_sync_table_result)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(HugrApiSyncResponse {
+        run_id: json_optional_string_field(&value, "run_id")?,
+        status: json_string_field(&value, "status")?,
+        tables,
+    })
+}
+
+fn parse_hugr_api_history_response(response: &str) -> Result<Vec<SyncRunHistory>, String> {
+    let value = serde_json::from_str::<serde_json::Value>(response)
+        .map_err(|error| format!("invalid Hugr API history response: {error}"))?;
+    reject_hugr_api_error(&value)?;
+    json_array_field(&value, "runs")?
+        .iter()
+        .map(parse_sync_run_history)
+        .collect()
+}
+
+fn parse_sync_run_history(value: &serde_json::Value) -> Result<SyncRunHistory, String> {
+    Ok(SyncRunHistory {
+        id: json_string_field(value, "id")?,
+        operation: json_string_field(value, "operation")?,
+        backend: json_string_field(value, "backend")?,
+        status: json_string_field(value, "status")?,
+        started_at_ms: json_i64_field(value, "started_at_ms")?,
+        ended_at_ms: json_i64_field(value, "ended_at_ms")?,
+        tables: json_array_field(value, "tables")?
+            .iter()
+            .map(parse_sync_table_result)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn parse_sync_table_result(value: &serde_json::Value) -> Result<SyncTableResult, String> {
+    Ok(SyncTableResult {
+        class: json_string_field(value, "class")?,
+        table: json_string_field(value, "table")?,
+        row_count: json_usize_field(value, "row_count")?,
+        inserted_count: json_usize_field(value, "inserted_count")?,
+        updated_count: json_usize_field(value, "updated_count")?,
+        skipped_count: json_usize_field(value, "skipped_count")?,
+        conflict_count: json_usize_field(value, "conflict_count")?,
+        executed: json_bool_field(value, "executed")?,
+        conflicts: json_array_field(value, "conflicts")?
+            .iter()
+            .map(parse_sync_conflict_summary)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn parse_sync_conflict_summary(value: &serde_json::Value) -> Result<SyncConflictSummary, String> {
+    Ok(SyncConflictSummary {
+        reason: json_string_field(value, "reason")?,
+        count: json_usize_field(value, "count")?,
+    })
+}
+
+fn reject_hugr_api_error(value: &serde_json::Value) -> Result<(), String> {
+    if let Some(message) = value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return Err(format!("Hugr API request failed: {message}"));
+    }
+    if let Some(message) = value.get("error").and_then(serde_json::Value::as_str) {
+        return Err(format!("Hugr API request failed: {message}"));
+    }
+    Ok(())
+}
+
+fn json_array_field<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a Vec<serde_json::Value>, String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("Hugr API response missing array field '{field}'"))
+}
+
+fn json_string_field(value: &serde_json::Value, field: &str) -> Result<String, String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("Hugr API response missing string field '{field}'"))
+}
+
+fn json_optional_string_field(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<Option<String>, String> {
+    match value.get(field) {
+        Some(serde_json::Value::Null) | None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(|value| Some(value.to_string()))
+            .ok_or_else(|| format!("Hugr API response field '{field}' must be a string")),
+    }
+}
+
+fn json_i64_field(value: &serde_json::Value, field: &str) -> Result<i64, String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| format!("Hugr API response missing integer field '{field}'"))
+}
+
+fn json_usize_field(value: &serde_json::Value, field: &str) -> Result<usize, String> {
+    let raw = value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("Hugr API response missing unsigned integer field '{field}'"))?;
+    usize::try_from(raw).map_err(|error| error.to_string())
+}
+
+fn json_bool_field(value: &serde_json::Value, field: &str) -> Result<bool, String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| format!("Hugr API response missing boolean field '{field}'"))
+}
+
 #[derive(Debug, Default)]
 struct SyncApplyStats {
     affected_count: usize,
@@ -1846,6 +2294,9 @@ async fn insert_memory(
     conn: &Connection,
     embedding_provider: &SelectedEmbeddingProvider,
     text: &str,
+    confidence: f64,
+    sensitivity: String,
+    structured_payload: Option<String>,
 ) -> Result<Memory, String> {
     let created_at_ms = now_ms()?;
     let memory = Memory {
@@ -1853,15 +2304,30 @@ async fn insert_memory(
         created_at_ms,
         kind: "fact".to_string(),
         text: text.trim().to_string(),
+        structured_payload,
     };
 
     conn.execute(
-        "INSERT INTO memories (id, created_at_ms, kind, text) VALUES (?1, ?2, ?3, ?4)",
+        "
+        INSERT INTO memories (
+            id,
+            created_at_ms,
+            kind,
+            text,
+            confidence,
+            sensitivity,
+            structured_payload
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ",
         params![
             memory.id.clone(),
             memory.created_at_ms,
             memory.kind.clone(),
-            memory.text.clone()
+            memory.text.clone(),
+            confidence,
+            sensitivity,
+            memory.structured_payload.clone()
         ],
     )
     .await
@@ -1890,7 +2356,7 @@ async fn active_memories(conn: &Connection) -> Result<Vec<Memory>, String> {
     let mut rows = conn
         .query(
             "
-            SELECT id, created_at_ms, kind, text
+            SELECT id, created_at_ms, kind, text, structured_payload
             FROM memories
             WHERE valid_to IS NULL
             ORDER BY created_at_ms DESC
@@ -1914,6 +2380,9 @@ fn memory_from_row(row: &Row) -> Result<Memory, String> {
         created_at_ms: row.get::<i64>(1).map_err(|error| error.to_string())?,
         kind: row.get::<String>(2).map_err(|error| error.to_string())?,
         text: row.get::<String>(3).map_err(|error| error.to_string())?,
+        structured_payload: row
+            .get::<Option<String>>(4)
+            .map_err(|error| error.to_string())?,
     })
 }
 
@@ -3299,6 +3768,7 @@ impl StorageConfig {
             &lookup,
             &[
                 "HUGR_REMOTE_DATABASE_URL",
+                "HUGR_API_URL",
                 "HUGR_LIBSQL_URL",
                 "TURSO_DATABASE_URL",
                 "LIBSQL_URL",
@@ -3308,6 +3778,7 @@ impl StorageConfig {
             &lookup,
             &[
                 "HUGR_REMOTE_AUTH_TOKEN",
+                "HUGR_API_TOKEN",
                 "HUGR_LIBSQL_AUTH_TOKEN",
                 "TURSO_AUTH_TOKEN",
                 "LIBSQL_AUTH_TOKEN",
@@ -3364,11 +3835,11 @@ impl StorageConfig {
                 self.backend.as_str()
             ),
             StorageMode::Hybrid => format!(
-                "hybrid (local active, remote sync backend not implemented, backend: {}, {auth_status}, sync classes: {sync_classes})",
+                "hybrid (local active, Hugr API sync transport configured, backend: {}, {auth_status}, sync classes: {sync_classes})",
                 self.backend.as_str()
             ),
             StorageMode::Remote => format!(
-                "remote configured (not implemented, backend: {}, {auth_status}, sync classes: {sync_classes})",
+                "remote (backend: {}, {auth_status}, sync classes: {sync_classes})",
                 self.backend.as_str()
             ),
         }
@@ -3380,11 +3851,23 @@ impl StorageConfig {
             && self.backend == SyncBackend::DirectLibsql
             && remote_configured
             && self.auth_token_configured;
+        let direct_remote_ready = matches!(self.mode, StorageMode::Remote)
+            && self.backend == SyncBackend::DirectLibsql
+            && remote_configured
+            && self.auth_token_configured;
+        let hugr_api_transport_ready =
+            matches!(self.mode, StorageMode::Hybrid | StorageMode::Remote)
+                && self.backend == SyncBackend::HugrApi
+                && remote_configured
+                && self.auth_token_configured;
         let status = match self.mode {
             StorageMode::Local => "local_only",
             StorageMode::Hybrid if direct_hybrid_sync_ready => "remote_sync_ready",
+            StorageMode::Hybrid if hugr_api_transport_ready => "hugr_api_transport_ready",
             StorageMode::Hybrid => "remote_sync_backend_pending",
-            StorageMode::Remote => "remote_execution_disabled",
+            StorageMode::Remote if direct_remote_ready => "remote_storage_ready",
+            StorageMode::Remote if hugr_api_transport_ready => "hugr_api_transport_ready",
+            StorageMode::Remote => "remote_storage_pending",
         };
 
         SyncExecutionPlan {
@@ -3393,8 +3876,23 @@ impl StorageConfig {
             local_writes_enabled: !matches!(self.mode, StorageMode::Remote),
             remote_configured,
             remote_auth_configured: self.auth_token_configured,
-            remote_reads_enabled: direct_hybrid_sync_ready,
-            remote_writes_enabled: direct_hybrid_sync_ready,
+            remote_reads_enabled: direct_hybrid_sync_ready
+                || direct_remote_ready
+                || hugr_api_transport_ready,
+            remote_writes_enabled: direct_hybrid_sync_ready
+                || direct_remote_ready
+                || hugr_api_transport_ready,
+            remote_endpoint: self.remote_url.clone(),
+            api_contract_version: (self.backend == SyncBackend::HugrApi)
+                .then(|| HUGR_API_CONTRACT_VERSION.to_string()),
+            api_routes: if self.backend == SyncBackend::HugrApi {
+                HUGR_API_ROUTES
+                    .iter()
+                    .map(|route| route.to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            },
             sync_classes: self
                 .sync_classes
                 .iter()
@@ -3933,7 +4431,7 @@ async fn promoted_memory_for_session(
     let mut rows = conn
         .query(
             "
-            SELECT m.id, m.created_at_ms, m.kind, m.text
+            SELECT m.id, m.created_at_ms, m.kind, m.text, m.structured_payload
             FROM session_promotions AS p
             JOIN memories AS m ON m.id = p.memory_id
             WHERE p.session_id = ?1
@@ -3978,6 +4476,162 @@ fn session_promotion_text(session: &Session, facts: &[SessionFact]) -> String {
         "Session '{}' produced durable findings: {}",
         session.task, facts
     )
+}
+
+fn session_promotion_payload(
+    session: &Session,
+    facts: &[SessionFact],
+    project: Option<&Project>,
+) -> String {
+    let facts = facts
+        .iter()
+        .map(|fact| {
+            json!({
+                "kind": &fact.kind,
+                "detail": &fact.detail,
+                "created_at_ms": fact.created_at_ms
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "source".to_string(),
+        json!({
+            "type": "session_promotion",
+            "session_id": &session.id,
+            "task": &session.task,
+            "branch": &session.branch,
+            "started_at_ms": session.started_at_ms,
+            "ended_at_ms": session.ended_at_ms
+        }),
+    );
+    payload.insert("facts".to_string(), json!(facts));
+    if let Some(project) = project {
+        payload.insert("project".to_string(), project_scope_payload(project));
+    }
+
+    json!(payload).to_string()
+}
+
+fn project_scope_payload(project: &Project) -> serde_json::Value {
+    json!({
+        "id": &project.id,
+        "name": &project.name,
+        "root_path": &project.root_path,
+        "git_remote": &project.git_remote,
+        "default_branch": &project.default_branch
+    })
+}
+
+fn memory_write_payload(options: &MemoryWriteOptions, project: Option<&Project>) -> Option<String> {
+    let mut payload = serde_json::Map::new();
+
+    if let Some(project) = project {
+        payload.insert("project".to_string(), project_scope_payload(project));
+    }
+
+    if let Some(source) = &options.source {
+        payload.insert(
+            "source".to_string(),
+            json!({
+                "type": "manual",
+                "kind": &source.kind,
+                "locator": &source.locator
+            }),
+        );
+    }
+
+    let mut metadata = serde_json::Map::new();
+    if let Some(confidence) = options.confidence {
+        metadata.insert("confidence".to_string(), json!(confidence));
+    }
+    if let Some(sensitivity) = &options.sensitivity {
+        metadata.insert("sensitivity".to_string(), json!(sensitivity));
+    }
+    if options.valid_from.is_some() || options.valid_to.is_some() {
+        metadata.insert(
+            "validity".to_string(),
+            json!({
+                "valid_from": &options.valid_from,
+                "valid_to": &options.valid_to
+            }),
+        );
+    }
+
+    if !metadata.is_empty() {
+        payload.insert("metadata".to_string(), json!(metadata));
+    }
+
+    (!payload.is_empty()).then(|| json!(payload).to_string())
+}
+
+fn normalize_memory_write_options(
+    options: MemoryWriteOptions,
+) -> Result<MemoryWriteOptions, String> {
+    if let Some(confidence) = options.confidence {
+        if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+            return Err("memory confidence must be between 0.0 and 1.0".to_string());
+        }
+    }
+
+    let source = options.source.map(normalize_memory_source).transpose()?;
+    let sensitivity = options
+        .sensitivity
+        .map(normalize_memory_label)
+        .transpose()?;
+    let valid_from = options.valid_from.map(normalize_memory_value).transpose()?;
+    let valid_to = options.valid_to.map(normalize_memory_value).transpose()?;
+
+    Ok(MemoryWriteOptions {
+        source,
+        confidence: options.confidence,
+        sensitivity,
+        valid_from,
+        valid_to,
+    })
+}
+
+fn normalize_memory_source(source: MemorySource) -> Result<MemorySource, String> {
+    let kind = source.kind.trim();
+    let locator = source.locator.trim();
+    if kind.is_empty() {
+        return Err("memory source kind is required".to_string());
+    }
+    if locator.is_empty() {
+        return Err("memory source locator is required".to_string());
+    }
+
+    Ok(MemorySource {
+        kind: kind.to_string(),
+        locator: locator.to_string(),
+    })
+}
+
+fn normalize_memory_label(value: String) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("memory sensitivity is required".to_string());
+    }
+    if !value
+        .chars()
+        .all(|char| char.is_ascii_alphanumeric() || char == '_' || char == '-')
+    {
+        return Err(
+            "memory sensitivity may only contain letters, numbers, hyphens, or underscores"
+                .to_string(),
+        );
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_memory_value(value: String) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err("memory validity value is required".to_string())
+    } else {
+        Ok(value.to_string())
+    }
 }
 
 fn session_promotion_fact_text(fact: &SessionFact) -> String {
@@ -4125,8 +4779,11 @@ fn now_ms() -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LOCAL_PROJECT_ID, Memory, StorageConfig, StorageMode, Store, SyncBackend, SyncClass,
-        SyncConflictSummary, fts_query, query_terms, recall_score, table_row_count,
+        HUGR_API_CONTRACT_VERSION, HUGR_API_ROUTES, LOCAL_PROJECT_ID, Memory, MemorySource,
+        MemoryWriteOptions, StorageConfig, StorageMode, Store, SyncBackend, SyncClass,
+        SyncConflictSummary, SyncTableResult, fts_query, hugr_api_route_url, hugr_api_sync_request,
+        parse_hugr_api_history_response, parse_hugr_api_sync_response, query_terms, recall_score,
+        table_row_count,
     };
     use crate::code::{CodeReference, CodeSymbol};
     use crate::discovery::FileCandidate;
@@ -4176,6 +4833,7 @@ mod tests {
             created_at_ms: 1,
             kind: "fact".into(),
             text: "plugin hooks run after configuration is loaded".into(),
+            structured_payload: None,
         };
         let terms = query_terms("add plugin hooks");
         assert!(recall_score(&memory, &terms, "add plugin hooks") > 0);
@@ -4240,6 +4898,36 @@ mod tests {
         assert!(plan.remote_auth_configured);
         assert!(plan.remote_reads_enabled);
         assert!(plan.remote_writes_enabled);
+        assert_eq!(
+            plan.remote_endpoint.as_deref(),
+            Some("libsql://example.turso.io")
+        );
+        assert_eq!(plan.api_contract_version, None);
+        assert!(plan.api_routes.is_empty());
+    }
+
+    #[test]
+    fn storage_config_reads_remote_direct_libsql_execution() {
+        let config = StorageConfig::from_lookup(env_lookup(&[
+            ("HUGR_STORAGE_MODE", "remote"),
+            ("HUGR_REMOTE_DATABASE_URL", "libsql://example.turso.io"),
+            ("HUGR_REMOTE_AUTH_TOKEN", "secret-token"),
+        ]))
+        .unwrap();
+
+        let plan = config.sync_execution_plan();
+        assert_eq!(
+            config.summary(),
+            "remote (backend: direct_libsql, auth configured, sync classes: memories,sources,entities,edges,embeddings,context_packs,session_summaries)"
+        );
+        assert_eq!(plan.status, "remote_storage_ready");
+        assert!(!plan.local_writes_enabled);
+        assert!(plan.remote_reads_enabled);
+        assert!(plan.remote_writes_enabled);
+        assert_eq!(
+            plan.remote_endpoint.as_deref(),
+            Some("libsql://example.turso.io")
+        );
     }
 
     #[test]
@@ -4295,8 +4983,8 @@ mod tests {
         let config = StorageConfig::from_lookup(env_lookup(&[
             ("HUGR_STORAGE_MODE", "hybrid"),
             ("HUGR_SYNC_BACKEND", "hugr-api"),
-            ("HUGR_REMOTE_DATABASE_URL", "https://hugr.example"),
-            ("HUGR_REMOTE_AUTH_TOKEN", "secret-token"),
+            ("HUGR_API_URL", "https://hugr.example"),
+            ("HUGR_API_TOKEN", "secret-token"),
         ]))
         .unwrap();
 
@@ -4304,14 +4992,152 @@ mod tests {
         assert_eq!(config.sync_execution_plan().backend, "hugr_api");
         assert_eq!(
             config.summary(),
-            "hybrid (local active, remote sync backend not implemented, backend: hugr_api, auth configured, sync classes: memories,sources,entities,edges,embeddings,context_packs,session_summaries)"
+            "hybrid (local active, Hugr API sync transport configured, backend: hugr_api, auth configured, sync classes: memories,sources,entities,edges,embeddings,context_packs,session_summaries)"
         );
         assert_eq!(
             config.sync_execution_plan().status,
-            "remote_sync_backend_pending"
+            "hugr_api_transport_ready"
         );
-        assert!(!config.sync_execution_plan().remote_reads_enabled);
-        assert!(!config.sync_execution_plan().remote_writes_enabled);
+        assert!(config.sync_execution_plan().remote_reads_enabled);
+        assert!(config.sync_execution_plan().remote_writes_enabled);
+        assert_eq!(
+            config.sync_execution_plan().remote_endpoint.as_deref(),
+            Some("https://hugr.example")
+        );
+        assert_eq!(
+            config.sync_execution_plan().api_contract_version.as_deref(),
+            Some(HUGR_API_CONTRACT_VERSION)
+        );
+        assert_eq!(
+            config.sync_execution_plan().api_routes,
+            HUGR_API_ROUTES
+                .iter()
+                .map(|route| route.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn hugr_api_transport_builds_contract_request() {
+        let config = StorageConfig {
+            mode: StorageMode::Hybrid,
+            backend: SyncBackend::HugrApi,
+            remote_url: Some("https://hugr.example/".to_string()),
+            remote_auth_token: Some("secret-token".to_string()),
+            auth_token_configured: true,
+            sync_classes: vec![SyncClass::Memories, SyncClass::Secrets],
+        };
+        let table = SyncTableResult {
+            class: "memories".to_string(),
+            table: "memories".to_string(),
+            row_count: 2,
+            inserted_count: 1,
+            updated_count: 0,
+            skipped_count: 1,
+            conflict_count: 1,
+            executed: true,
+            conflicts: vec![SyncConflictSummary {
+                reason: "local_row_newer_or_equal".to_string(),
+                count: 1,
+            }],
+        };
+
+        let request = hugr_api_sync_request(&config, "push", false, &[table]);
+
+        assert_eq!(
+            hugr_api_route_url("https://hugr.example/", "/v1/sync/push"),
+            "https://hugr.example/v1/sync/push"
+        );
+        assert_eq!(
+            request["contract_version"],
+            serde_json::json!(HUGR_API_CONTRACT_VERSION)
+        );
+        assert_eq!(request["operation"], serde_json::json!("push"));
+        assert_eq!(request["dry_run"], serde_json::json!(false));
+        assert_eq!(
+            request["sync_classes"],
+            serde_json::json!(["memories", "secrets"])
+        );
+        assert_eq!(
+            request["explicit_opt_in_classes"],
+            serde_json::json!(["secrets"])
+        );
+        assert_eq!(request["tables"][0]["table"], serde_json::json!("memories"));
+        assert_eq!(
+            request["tables"][0]["conflicts"][0]["reason"],
+            serde_json::json!("local_row_newer_or_equal")
+        );
+    }
+
+    #[test]
+    fn parses_hugr_api_sync_response() {
+        let response = r#"{
+            "run_id": "api_sync_push_1",
+            "status": "executed",
+            "tables": [
+                {
+                    "class": "memories",
+                    "table": "memories",
+                    "row_count": 2,
+                    "inserted_count": 1,
+                    "updated_count": 0,
+                    "skipped_count": 1,
+                    "conflict_count": 1,
+                    "executed": true,
+                    "conflicts": [
+                        {"reason": "local_row_newer_or_equal", "count": 1}
+                    ]
+                }
+            ]
+        }"#;
+
+        let parsed = parse_hugr_api_sync_response(response).unwrap();
+
+        assert_eq!(parsed.run_id.as_deref(), Some("api_sync_push_1"));
+        assert_eq!(parsed.status, "executed");
+        assert_eq!(parsed.tables.len(), 1);
+        assert_eq!(parsed.tables[0].table, "memories");
+        assert_eq!(parsed.tables[0].inserted_count, 1);
+        assert_eq!(parsed.tables[0].conflicts[0].count, 1);
+    }
+
+    #[test]
+    fn parses_hugr_api_history_response() {
+        let response = r#"{
+            "runs": [
+                {
+                    "id": "api_sync_pull_1",
+                    "operation": "pull",
+                    "backend": "hugr_api",
+                    "status": "executed",
+                    "started_at_ms": 10,
+                    "ended_at_ms": 20,
+                    "tables": [
+                        {
+                            "class": "session_summaries",
+                            "table": "sessions",
+                            "row_count": 3,
+                            "inserted_count": 1,
+                            "updated_count": 1,
+                            "skipped_count": 1,
+                            "conflict_count": 1,
+                            "executed": true,
+                            "conflicts": [
+                                {"reason": "remote_row_missing_dependency", "count": 1}
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }"#;
+
+        let history = parse_hugr_api_history_response(response).unwrap();
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, "api_sync_pull_1");
+        assert_eq!(history[0].operation, "pull");
+        assert_eq!(history[0].tables[0].table, "sessions");
+        assert_eq!(history[0].tables[0].updated_count, 1);
     }
 
     #[tokio::test]
@@ -4319,8 +5145,8 @@ mod tests {
         let mut test = TestStore::new("remote_mode");
         test.store.storage_config = Ok(StorageConfig {
             mode: StorageMode::Remote,
-            backend: SyncBackend::DirectLibsql,
-            remote_url: Some("libsql://example.turso.io".to_string()),
+            backend: SyncBackend::HugrApi,
+            remote_url: Some("https://hugr.example".to_string()),
             remote_auth_token: Some("secret-token".to_string()),
             auth_token_configured: true,
             sync_classes: vec![SyncClass::Memories],
@@ -4328,7 +5154,7 @@ mod tests {
 
         let error = test.store.init().await.unwrap_err();
 
-        assert!(error.contains("remote storage is not implemented"));
+        assert!(error.contains("hosted Hugr API storage operations"));
         assert!(!test.store.db_path().exists());
     }
 
@@ -4714,12 +5540,14 @@ mod tests {
             created_at_ms: 10,
             kind: "fact".to_string(),
             text: "plugin hooks run after configuration is loaded".to_string(),
+            structured_payload: None,
         };
         let kept = Memory {
             id: "mem_keep".to_string(),
             created_at_ms: 20,
             kind: "fact".to_string(),
             text: "database migrations are recorded".to_string(),
+            structured_payload: None,
         };
 
         let result = test.store.forget("plugin hooks", 25).await.unwrap();
@@ -4936,6 +5764,71 @@ mod tests {
             (DEFAULT_EMBEDDING_DIMENSIONS * 4) as i64
         );
         assert!(rows.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn remember_with_options_preserves_structured_metadata() {
+        let test = TestStore::new("memory_source");
+        let memory = test
+            .store
+            .remember_with_options(
+                "plugin hooks are documented",
+                MemoryWriteOptions {
+                    source: Some(MemorySource {
+                        kind: "file".to_string(),
+                        locator: "docs/plugins.md".to_string(),
+                    }),
+                    confidence: Some(0.75),
+                    sensitivity: Some("private".to_string()),
+                    valid_from: Some("2026-01-01".to_string()),
+                    valid_to: Some("2026-12-31".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        let payload = serde_json::from_str::<serde_json::Value>(
+            memory.structured_payload.as_deref().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(payload["source"]["type"], "manual");
+        assert_eq!(payload["source"]["kind"], "file");
+        assert_eq!(payload["source"]["locator"], "docs/plugins.md");
+        assert_eq!(payload["project"]["id"], LOCAL_PROJECT_ID);
+        assert!(payload["project"]["root_path"].as_str().is_some());
+        assert_eq!(payload["metadata"]["confidence"], 0.75);
+        assert_eq!(payload["metadata"]["sensitivity"], "private");
+        assert_eq!(payload["metadata"]["validity"]["valid_from"], "2026-01-01");
+        assert_eq!(payload["metadata"]["validity"]["valid_to"], "2026-12-31");
+
+        let conn = test.store.connect().await.unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT confidence, sensitivity FROM memories WHERE id = ?1",
+                params![memory.id.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<f64>(0).unwrap(), 0.75);
+        assert_eq!(row.get::<String>(1).unwrap(), "private");
+
+        let memories = test
+            .store
+            .recall("plugin hooks documented", 5)
+            .await
+            .unwrap();
+        let recalled = memories
+            .iter()
+            .find(|candidate| candidate.id == memory.id)
+            .unwrap();
+        let recalled_payload = serde_json::from_str::<serde_json::Value>(
+            recalled.structured_payload.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(recalled_payload["source"]["locator"], "docs/plugins.md");
+        assert_eq!(recalled_payload["project"]["id"], LOCAL_PROJECT_ID);
+        assert_eq!(recalled_payload["metadata"]["sensitivity"], "private");
     }
 
     #[tokio::test]
@@ -5210,6 +6103,22 @@ mod tests {
                 .contains("command: cargo test; status: 0")
         );
         assert!(!promoted.memory.text.contains("command: command:"));
+        let payload = serde_json::from_str::<serde_json::Value>(
+            promoted.memory.structured_payload.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["source"]["type"], "session_promotion");
+        assert_eq!(payload["project"]["id"], LOCAL_PROJECT_ID);
+        assert_eq!(
+            payload["source"]["session_id"],
+            promoted.session_id.as_str()
+        );
+        assert_eq!(payload["source"]["task"], "stabilize plugin registry");
+        assert_eq!(payload["facts"][0]["kind"], "command");
+        assert_eq!(
+            payload["facts"][0]["detail"],
+            "command: cargo test; status: 0"
+        );
 
         let memories = test
             .store
@@ -5217,9 +6126,9 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            memories
-                .iter()
-                .any(|memory| memory.id == promoted.memory.id)
+            memories.iter().any(
+                |memory| memory.id == promoted.memory.id && memory.structured_payload.is_some()
+            )
         );
     }
 

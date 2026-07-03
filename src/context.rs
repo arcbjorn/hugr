@@ -72,6 +72,7 @@ pub struct ContextMemory {
     pub created_at_ms: i64,
     pub kind: String,
     pub text: String,
+    pub structured_payload: Option<String>,
     pub citation_id: String,
     pub evidence_score: usize,
     pub evidence_reason: String,
@@ -633,17 +634,7 @@ impl ContextPack {
             if index > 0 {
                 rendered.push(',');
             }
-            let _ = write!(
-                rendered,
-                "{{\"id\":{},\"created_at_ms\":{},\"kind\":{},\"text\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
-                json_string(&memory.id),
-                memory.created_at_ms,
-                json_string(&memory.kind),
-                json_string(&memory.text),
-                json_string(&memory.citation_id),
-                memory.evidence_score,
-                json_string(&memory.evidence_reason)
-            );
+            rendered.push_str(&render_context_memory_json(memory));
         }
         rendered.push_str("],");
 
@@ -825,6 +816,7 @@ fn context_memory_from(
         created_at_ms: memory.created_at_ms,
         kind: memory.kind,
         text: memory.text,
+        structured_payload: memory.structured_payload,
         evidence_score,
         evidence_reason,
     }
@@ -832,15 +824,25 @@ fn context_memory_from(
 
 fn render_context_memory_json(memory: &ContextMemory) -> String {
     format!(
-        "{{\"id\":{},\"created_at_ms\":{},\"kind\":{},\"text\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
+        "{{\"id\":{},\"created_at_ms\":{},\"kind\":{},\"text\":{},\"structured_payload\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
         json_string(&memory.id),
         memory.created_at_ms,
         json_string(&memory.kind),
         json_string(&memory.text),
+        render_optional_json_payload(memory.structured_payload.as_deref()),
         json_string(&memory.citation_id),
         memory.evidence_score,
         json_string(&memory.evidence_reason)
     )
+}
+
+fn render_optional_json_payload(payload: Option<&str>) -> String {
+    match payload {
+        Some(payload) => serde_json::from_str::<serde_json::Value>(payload)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|_| json_string(payload)),
+        None => "null".to_string(),
+    }
 }
 
 fn file_evidence(candidate: &FileCandidate, terms: &[String]) -> (usize, String) {
@@ -1305,14 +1307,27 @@ mod tests {
                 created_at_ms: 7,
                 kind: "fact".to_string(),
                 text: "plugin hooks run after configuration is loaded".to_string(),
+                structured_payload: Some(
+                    r#"{"source":{"type":"session_promotion","session_id":"ses_1"}}"#.to_string(),
+                ),
             }],
         );
 
         let markdown = pack.render_markdown();
+        let json = pack.render_json();
+        let parsed = serde_json::from_str::<serde_json::Value>(&json).unwrap();
 
         assert!(markdown.contains("- src/plugin.rs [file:src/plugin.rs]"));
         assert!(
             markdown.contains("- mem_1 [memory]: plugin hooks run after configuration is loaded")
+        );
+        assert_eq!(
+            parsed["relevant_memories"][0]["structured_payload"]["source"]["type"],
+            "session_promotion"
+        );
+        assert_eq!(
+            parsed["relevant_memories"][0]["structured_payload"]["source"]["session_id"],
+            "ses_1"
         );
     }
 
@@ -1447,12 +1462,14 @@ mod tests {
                     created_at_ms: 10,
                     kind: "fact".to_string(),
                     text: "plugin hooks run after configuration is loaded".to_string(),
+                    structured_payload: None,
                 },
                 Memory {
                     id: "mem_2".to_string(),
                     created_at_ms: 20,
                     kind: "fact".to_string(),
                     text: "plugin hooks now run before configuration is loaded".to_string(),
+                    structured_payload: None,
                 },
             ],
         );
@@ -1501,12 +1518,14 @@ mod tests {
                     created_at_ms: 20,
                     kind: "fact".to_string(),
                     text: "plugin hooks now run before configuration is loaded".to_string(),
+                    structured_payload: None,
                 },
                 Memory {
                     id: "mem_old".to_string(),
                     created_at_ms: 10,
                     kind: "fact".to_string(),
                     text: "plugin hooks run after configuration is loaded".to_string(),
+                    structured_payload: None,
                 },
             ],
             Vec::new(),
@@ -1522,12 +1541,14 @@ mod tests {
                     created_at_ms: 20,
                     kind: "fact".to_string(),
                     text: "plugin hooks now run before configuration is loaded".to_string(),
+                    structured_payload: None,
                 },
                 older_memory: Memory {
                     id: "mem_old".to_string(),
                     created_at_ms: 10,
                     kind: "fact".to_string(),
                     text: "plugin hooks run after configuration is loaded".to_string(),
+                    structured_payload: None,
                 },
             }],
         );
