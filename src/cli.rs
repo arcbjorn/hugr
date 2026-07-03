@@ -6,6 +6,7 @@ pub enum Command {
     Status,
     Remember {
         text: String,
+        options: MemoryWriteArgs,
     },
     Recall {
         query: String,
@@ -76,6 +77,21 @@ pub enum Command {
     Help,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySourceArg {
+    pub kind: String,
+    pub locator: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryWriteArgs {
+    pub source: Option<MemorySourceArg>,
+    pub confidence: Option<String>,
+    pub sensitivity: Option<String>,
+    pub valid_from: Option<String>,
+    pub valid_to: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
     Markdown,
@@ -91,9 +107,7 @@ impl Command {
         match command {
             "init" => Ok(Self::Init),
             "status" => Ok(Self::Status),
-            "remember" => Ok(Self::Remember {
-                text: required_text(args, "remember")?,
-            }),
+            "remember" => parse_remember_command(args),
             "recall" => {
                 let text = required_text_output(args, "recall")?;
                 Ok(Self::Recall {
@@ -144,6 +158,111 @@ impl Command {
             "help" | "--help" | "-h" => Ok(Self::Help),
             unknown => Err(format!("unknown command '{unknown}'")),
         }
+    }
+}
+
+fn parse_remember_command(args: &[String]) -> Result<Command, String> {
+    let mut options = MemoryWriteArgs::default();
+    let mut words = Vec::new();
+    let mut index = 2;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            words.extend(args.iter().skip(index + 1).cloned());
+            break;
+        } else if arg == "--source" {
+            index += 1;
+            options.source = Some(parse_memory_source(
+                args.get(index).map(String::as_str),
+                "hugr remember --source",
+            )?);
+        } else if let Some(value) = arg.strip_prefix("--source=") {
+            options.source = Some(parse_memory_source(Some(value), "hugr remember --source")?);
+        } else if arg == "--confidence" {
+            index += 1;
+            options.confidence = Some(required_option_value(
+                args.get(index).map(String::as_str),
+                "hugr remember --confidence",
+            )?);
+        } else if let Some(value) = arg.strip_prefix("--confidence=") {
+            options.confidence = Some(required_option_value(
+                Some(value),
+                "hugr remember --confidence",
+            )?);
+        } else if arg == "--sensitivity" {
+            index += 1;
+            options.sensitivity = Some(required_option_value(
+                args.get(index).map(String::as_str),
+                "hugr remember --sensitivity",
+            )?);
+        } else if let Some(value) = arg.strip_prefix("--sensitivity=") {
+            options.sensitivity = Some(required_option_value(
+                Some(value),
+                "hugr remember --sensitivity",
+            )?);
+        } else if arg == "--valid-from" {
+            index += 1;
+            options.valid_from = Some(required_option_value(
+                args.get(index).map(String::as_str),
+                "hugr remember --valid-from",
+            )?);
+        } else if let Some(value) = arg.strip_prefix("--valid-from=") {
+            options.valid_from = Some(required_option_value(
+                Some(value),
+                "hugr remember --valid-from",
+            )?);
+        } else if arg == "--valid-to" {
+            index += 1;
+            options.valid_to = Some(required_option_value(
+                args.get(index).map(String::as_str),
+                "hugr remember --valid-to",
+            )?);
+        } else if let Some(value) = arg.strip_prefix("--valid-to=") {
+            options.valid_to = Some(required_option_value(
+                Some(value),
+                "hugr remember --valid-to",
+            )?);
+        } else if arg.starts_with("--") {
+            return Err(format!("unknown option '{arg}'"));
+        } else {
+            words.push(arg.clone());
+        }
+
+        index += 1;
+    }
+
+    let text = words.join(" ");
+    if text.trim().is_empty() {
+        Err("hugr remember requires text".to_string())
+    } else {
+        Ok(Command::Remember { text, options })
+    }
+}
+
+fn required_option_value(value: Option<&str>, command: &str) -> Result<String, String> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{command} requires a value"))
+}
+
+fn parse_memory_source(value: Option<&str>, command: &str) -> Result<MemorySourceArg, String> {
+    let value = value
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("{command} requires a value"))?;
+    let Some((kind, locator)) = value.split_once(':') else {
+        return Err(format!("{command} must use kind:locator"));
+    };
+    let kind = kind.trim();
+    let locator = locator.trim();
+    if kind.is_empty() || locator.is_empty() {
+        Err(format!("{command} must use kind:locator"))
+    } else {
+        Ok(MemorySourceArg {
+            kind: kind.to_string(),
+            locator: locator.to_string(),
+        })
     }
 }
 
@@ -340,10 +459,6 @@ struct TextOutput {
     format: OutputFormat,
 }
 
-fn required_text(args: &[String], command: &str) -> Result<String, String> {
-    optional_text(args).ok_or_else(|| format!("hugr {command} requires text"))
-}
-
 fn required_text_from(args: &[String], start: usize, command: &str) -> Result<String, String> {
     optional_text_from(args, start).ok_or_else(|| format!("hugr {command} requires text"))
 }
@@ -366,10 +481,6 @@ fn required_text_output(args: &[String], command: &str) -> Result<TextOutput, St
     } else {
         Ok(TextOutput { value, format })
     }
-}
-
-fn optional_text(args: &[String]) -> Option<String> {
-    optional_text_from(args, 2)
 }
 
 fn optional_text_from(args: &[String], start: usize) -> Option<String> {
@@ -439,12 +550,12 @@ fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions,
 }
 
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr impact [--json] <file-or-symbol>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr impact [--json] <file-or-symbol>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, OutputFormat};
+    use super::{Command, MemorySourceArg, MemoryWriteArgs, OutputFormat};
 
     #[test]
     fn parses_context_text() {
@@ -736,6 +847,93 @@ mod tests {
             Ok(Command::ObserveCommand {
                 status: 1,
                 command: vec!["cargo".into(), "test".into()]
+            })
+        );
+    }
+
+    #[test]
+    fn parses_remember_command() {
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "remember".into(),
+                "plugin".into(),
+                "hooks".into()
+            ]),
+            Ok(Command::Remember {
+                text: "plugin hooks".into(),
+                options: MemoryWriteArgs::default(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_remember_source_attachment() {
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "remember".into(),
+                "--source".into(),
+                "file:src/lib.rs".into(),
+                "plugin".into(),
+                "hooks".into(),
+            ]),
+            Ok(Command::Remember {
+                text: "plugin hooks".into(),
+                options: MemoryWriteArgs {
+                    source: Some(MemorySourceArg {
+                        kind: "file".into(),
+                        locator: "src/lib.rs".into(),
+                    }),
+                    ..MemoryWriteArgs::default()
+                },
+            })
+        );
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "remember".into(),
+                "--source=url:https://example.test/docs".into(),
+                "remote".into(),
+                "docs".into(),
+            ]),
+            Ok(Command::Remember {
+                text: "remote docs".into(),
+                options: MemoryWriteArgs {
+                    source: Some(MemorySourceArg {
+                        kind: "url".into(),
+                        locator: "https://example.test/docs".into(),
+                    }),
+                    ..MemoryWriteArgs::default()
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn parses_remember_metadata() {
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "remember".into(),
+                "--confidence=0.75".into(),
+                "--sensitivity".into(),
+                "private".into(),
+                "--valid-from".into(),
+                "2026-01-01".into(),
+                "--valid-to=2026-12-31".into(),
+                "plugin".into(),
+                "hooks".into(),
+            ]),
+            Ok(Command::Remember {
+                text: "plugin hooks".into(),
+                options: MemoryWriteArgs {
+                    confidence: Some("0.75".into()),
+                    sensitivity: Some("private".into()),
+                    valid_from: Some("2026-01-01".into()),
+                    valid_to: Some("2026-12-31".into()),
+                    ..MemoryWriteArgs::default()
+                },
             })
         );
     }
