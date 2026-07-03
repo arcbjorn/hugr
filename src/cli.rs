@@ -31,6 +31,9 @@ pub enum Command {
     SessionEnd {
         summary: Option<String>,
     },
+    SessionPromote {
+        format: OutputFormat,
+    },
     SyncStatus {
         format: OutputFormat,
     },
@@ -48,6 +51,16 @@ pub enum Command {
     Mcp,
     Daemon {
         addr: String,
+    },
+    Run {
+        command: Vec<String>,
+    },
+    ObserveCommand {
+        status: i32,
+        command: Vec<String>,
+    },
+    ShellHook {
+        shell: String,
     },
     Improve {
         execute: bool,
@@ -108,6 +121,9 @@ impl Command {
             "sync" => parse_sync_command(args),
             "mcp" => Ok(Self::Mcp),
             "daemon" => parse_daemon_command(args),
+            "run" => parse_run_command(args),
+            "observe" => parse_observe_command(args),
+            "shell-hook" => parse_shell_hook_command(args),
             "improve" => {
                 let options = improve_options_from(args, 2)?;
                 Ok(Self::Improve {
@@ -128,6 +144,78 @@ impl Command {
             "help" | "--help" | "-h" => Ok(Self::Help),
             unknown => Err(format!("unknown command '{unknown}'")),
         }
+    }
+}
+
+fn parse_observe_command(args: &[String]) -> Result<Command, String> {
+    match args.get(2).map(String::as_str) {
+        Some("command") => parse_observe_shell_command(args),
+        Some(unknown) => Err(format!("unknown observe command '{unknown}'")),
+        None => Err("hugr observe requires a subcommand".to_string()),
+    }
+}
+
+fn parse_observe_shell_command(args: &[String]) -> Result<Command, String> {
+    let mut status = None;
+    let mut command = Vec::new();
+    let mut index = 3;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            command.extend(args.iter().skip(index + 1).cloned());
+            break;
+        } else if arg == "--status" {
+            index += 1;
+            status = Some(parse_status_code(
+                args.get(index).map(String::as_str),
+                "hugr observe command --status",
+            )?);
+        } else if let Some(value) = arg.strip_prefix("--status=") {
+            status = Some(parse_status_code(
+                Some(value),
+                "hugr observe command --status",
+            )?);
+        } else if arg.starts_with("--") {
+            return Err(format!("unknown option '{arg}'"));
+        } else {
+            command.extend(args.iter().skip(index).cloned());
+            break;
+        }
+
+        index += 1;
+    }
+
+    let status = status.ok_or_else(|| "hugr observe command requires --status".to_string())?;
+    if command.is_empty() {
+        Err("hugr observe command requires a command".to_string())
+    } else {
+        Ok(Command::ObserveCommand { status, command })
+    }
+}
+
+fn parse_status_code(value: Option<&str>, command: &str) -> Result<i32, String> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("{command} requires a value"))?
+        .parse::<i32>()
+        .map_err(|_| format!("{command} must be an integer"))
+}
+
+fn parse_shell_hook_command(args: &[String]) -> Result<Command, String> {
+    let shell = args
+        .get(2)
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| "hugr shell-hook requires a shell".to_string())?;
+
+    if args.len() > 3 {
+        return Err(format!("unknown option '{}'", args[3]));
+    }
+
+    match shell.as_str() {
+        "bash" | "zsh" => Ok(Command::ShellHook { shell }),
+        _ => Err("hugr shell-hook supports bash or zsh".to_string()),
     }
 }
 
@@ -159,6 +247,20 @@ fn parse_daemon_command(args: &[String]) -> Result<Command, String> {
     Ok(Command::Daemon { addr })
 }
 
+fn parse_run_command(args: &[String]) -> Result<Command, String> {
+    let mut command = args.iter().skip(2);
+    if command.clone().next().is_some_and(|arg| arg == "--") {
+        command.next();
+    }
+
+    let command = command.cloned().collect::<Vec<_>>();
+    if command.is_empty() {
+        Err("hugr run requires a command".to_string())
+    } else {
+        Ok(Command::Run { command })
+    }
+}
+
 fn parse_project_command(args: &[String]) -> Result<Command, String> {
     match args.get(2).map(String::as_str) {
         Some("status") => Ok(Command::ProjectStatus),
@@ -185,6 +287,9 @@ fn parse_session_command(args: &[String]) -> Result<Command, String> {
         }
         Some("end") => Ok(Command::SessionEnd {
             summary: optional_text_from(args, 3),
+        }),
+        Some("promote") => Ok(Command::SessionPromote {
+            format: output_format_from(args, 3)?,
         }),
         Some(unknown) => Err(format!("unknown session command '{unknown}'")),
         None => Err("hugr session requires a subcommand".to_string()),
@@ -334,7 +439,7 @@ fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions,
 }
 
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr impact [--json] <file-or-symbol>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr impact [--json] <file-or-symbol>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
 }
 
 #[cfg(test)]
@@ -437,6 +542,17 @@ mod tests {
             Command::parse(&["hugr".into(), "session".into(), "end".into(), "done".into()]),
             Ok(Command::SessionEnd {
                 summary: Some("done".into())
+            })
+        );
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "session".into(),
+                "promote".into(),
+                "--json".into()
+            ]),
+            Ok(Command::SessionPromote {
+                format: OutputFormat::Json
             })
         );
     }
@@ -564,6 +680,78 @@ mod tests {
             ]),
             Ok(Command::Daemon {
                 addr: "127.0.0.1:9999".into()
+            })
+        );
+    }
+
+    #[test]
+    fn parses_run_command() {
+        assert_eq!(
+            Command::parse(&["hugr".into(), "run".into(), "cargo".into(), "test".into()]),
+            Ok(Command::Run {
+                command: vec!["cargo".into(), "test".into()]
+            })
+        );
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "run".into(),
+                "--".into(),
+                "cargo".into(),
+                "test".into()
+            ]),
+            Ok(Command::Run {
+                command: vec!["cargo".into(), "test".into()]
+            })
+        );
+    }
+
+    #[test]
+    fn parses_observe_command() {
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "observe".into(),
+                "command".into(),
+                "--status".into(),
+                "0".into(),
+                "--".into(),
+                "cargo".into(),
+                "test".into()
+            ]),
+            Ok(Command::ObserveCommand {
+                status: 0,
+                command: vec!["cargo".into(), "test".into()]
+            })
+        );
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "observe".into(),
+                "command".into(),
+                "--status=1".into(),
+                "cargo".into(),
+                "test".into()
+            ]),
+            Ok(Command::ObserveCommand {
+                status: 1,
+                command: vec!["cargo".into(), "test".into()]
+            })
+        );
+    }
+
+    #[test]
+    fn parses_shell_hook_command() {
+        assert_eq!(
+            Command::parse(&["hugr".into(), "shell-hook".into(), "zsh".into()]),
+            Ok(Command::ShellHook {
+                shell: "zsh".into()
+            })
+        );
+        assert_eq!(
+            Command::parse(&["hugr".into(), "shell-hook".into(), "bash".into()]),
+            Ok(Command::ShellHook {
+                shell: "bash".into()
             })
         );
     }
