@@ -1500,8 +1500,42 @@ impl Store {
 
         for payload in payloads {
             let result = match SyncTableKind::from_table_name(&payload.result.table) {
+                Some(table)
+                    if api_table_supports_records(table)
+                        && payload.records.is_empty()
+                        && payload.result.row_count > 0 =>
+                {
+                    missing_api_row_payload_result(&payload.result)
+                }
                 Some(SyncTableKind::Memories) => {
                     apply_api_push_memory_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::MemoryEmbeddings) => {
+                    apply_api_push_memory_embedding_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::Projects) => {
+                    apply_api_push_project_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::Sources) => {
+                    apply_api_push_source_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::DiscoveredFiles) => {
+                    apply_api_push_discovered_file_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::Entities) => {
+                    apply_api_push_entity_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::CodeSymbols) => {
+                    apply_api_push_code_symbol_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::Edges) => {
+                    apply_api_push_edge_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::CodeReferences) => {
+                    apply_api_push_code_reference_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::Sessions) => {
+                    apply_api_push_session_records(&conn, &payload.records).await?
                 }
                 Some(_) | None => unsupported_api_table_result(&payload.result),
             };
@@ -1536,15 +1570,15 @@ impl Store {
 
         for payload in requested_payloads {
             let response_payload = match SyncTableKind::from_table_name(&payload.result.table) {
-                Some(SyncTableKind::Memories) => {
+                Some(table) if api_table_supports_records(table) => {
                     let result = planned_sync_table_result(
-                        SyncTableKind::Memories,
-                        table_row_count(&conn, "memories").await?,
+                        table,
+                        table_row_count(&conn, table.table_name()).await?,
                     );
                     let records = if dry_run {
                         Vec::new()
                     } else {
-                        memory_sync_records(&conn).await?
+                        api_sync_records_for_table(&conn, table).await?
                     };
                     SyncApiTablePayload { result, records }
                 }
@@ -1813,26 +1847,28 @@ impl Store {
         &self,
         conn: &Connection,
         tables: &[SyncTableResult],
-        include_memory_records: bool,
+        include_records: bool,
     ) -> Result<Vec<SyncApiTablePayload>, String> {
-        let memory_records =
-            if include_memory_records && tables.iter().any(|table| table.table == "memories") {
-                Some(memory_sync_records(conn).await?)
-            } else {
-                None
-            };
+        let mut payloads = Vec::new();
 
-        Ok(tables
-            .iter()
-            .map(|table| SyncApiTablePayload {
+        for table in tables {
+            let records = if include_records {
+                match SyncTableKind::from_table_name(&table.table) {
+                    Some(table) if api_table_supports_records(table) => {
+                        api_sync_records_for_table(conn, table).await?
+                    }
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            payloads.push(SyncApiTablePayload {
                 result: table.clone(),
-                records: if table.table == "memories" {
-                    memory_records.clone().unwrap_or_default()
-                } else {
-                    Vec::new()
-                },
-            })
-            .collect())
+                records,
+            });
+        }
+
+        Ok(payloads)
     }
 
     async fn copy_sync_tables(
@@ -2402,6 +2438,29 @@ fn json_f64_field(value: &serde_json::Value, field: &str) -> Result<f64, String>
         .ok_or_else(|| format!("Hugr API response missing number field '{field}'"))
 }
 
+fn json_optional_i64_field(value: &serde_json::Value, field: &str) -> Result<Option<i64>, String> {
+    match value.get(field) {
+        Some(serde_json::Value::Null) | None => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("Hugr API response field '{field}' must be an integer")),
+    }
+}
+
+fn json_bytes_field(value: &serde_json::Value, field: &str) -> Result<Vec<u8>, String> {
+    let values = json_array_field(value, field)?;
+    values
+        .iter()
+        .map(|value| {
+            let byte = value
+                .as_u64()
+                .ok_or_else(|| format!("Hugr API response field '{field}' must contain bytes"))?;
+            u8::try_from(byte).map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
 fn api_sync_status_for_payloads(payloads: &[SyncApiTablePayload]) -> String {
     if payloads
         .iter()
@@ -2435,6 +2494,88 @@ fn unsupported_api_table_result(result: &SyncTableResult) -> SyncTableResult {
         executed: true,
         conflicts,
     }
+}
+
+fn missing_api_row_payload_result(result: &SyncTableResult) -> SyncTableResult {
+    let skipped_count = result.row_count;
+    SyncTableResult {
+        class: result.class.clone(),
+        table: result.table.clone(),
+        row_count: result.row_count,
+        inserted_count: 0,
+        updated_count: 0,
+        skipped_count,
+        conflict_count: skipped_count,
+        executed: true,
+        conflicts: vec![SyncConflictSummary {
+            reason: "api_row_payload_missing".to_string(),
+            count: skipped_count,
+        }],
+    }
+}
+
+fn api_table_supports_records(table: SyncTableKind) -> bool {
+    matches!(
+        table,
+        SyncTableKind::Projects
+            | SyncTableKind::Memories
+            | SyncTableKind::MemoryEmbeddings
+            | SyncTableKind::Sources
+            | SyncTableKind::DiscoveredFiles
+            | SyncTableKind::Entities
+            | SyncTableKind::CodeSymbols
+            | SyncTableKind::Edges
+            | SyncTableKind::CodeReferences
+            | SyncTableKind::Sessions
+    )
+}
+
+async fn api_sync_records_for_table(
+    conn: &Connection,
+    table: SyncTableKind,
+) -> Result<Vec<serde_json::Value>, String> {
+    match table {
+        SyncTableKind::Projects => project_sync_records(conn).await,
+        SyncTableKind::Memories => memory_sync_records(conn).await,
+        SyncTableKind::MemoryEmbeddings => memory_embedding_sync_records(conn).await,
+        SyncTableKind::Sources => source_sync_records(conn).await,
+        SyncTableKind::DiscoveredFiles => discovered_file_sync_records(conn).await,
+        SyncTableKind::Entities => entity_sync_records(conn).await,
+        SyncTableKind::CodeSymbols => code_symbol_sync_records(conn).await,
+        SyncTableKind::Edges => edge_sync_records(conn).await,
+        SyncTableKind::CodeReferences => code_reference_sync_records(conn).await,
+        SyncTableKind::Sessions => session_sync_records(conn).await,
+        _ => Ok(Vec::new()),
+    }
+}
+
+async fn project_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT id, name, root_path, git_remote, default_branch, created_at_ms, updated_at_ms
+            FROM projects
+            ORDER BY id
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(json!({
+            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
+            "name": row.get::<String>(1).map_err(|error| error.to_string())?,
+            "root_path": row.get::<String>(2).map_err(|error| error.to_string())?,
+            "git_remote": row.get::<Option<String>>(3).map_err(|error| error.to_string())?,
+            "default_branch": row.get::<Option<String>>(4).map_err(|error| error.to_string())?,
+            "created_at_ms": row.get::<i64>(5).map_err(|error| error.to_string())?,
+            "updated_at_ms": row.get::<i64>(6).map_err(|error| error.to_string())?
+        }));
+    }
+
+    Ok(records)
 }
 
 async fn memory_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
@@ -2471,6 +2612,246 @@ async fn memory_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>
     Ok(records)
 }
 
+async fn memory_embedding_sync_records(
+    conn: &Connection,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = conn
+        .query(
+            "SELECT memory_id, model, dimensions, embedding FROM memory_embeddings ORDER BY memory_id",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(json!({
+            "memory_id": row.get::<String>(0).map_err(|error| error.to_string())?,
+            "model": row.get::<String>(1).map_err(|error| error.to_string())?,
+            "dimensions": row.get::<i64>(2).map_err(|error| error.to_string())?,
+            "embedding": row.get::<Vec<u8>>(3).map_err(|error| error.to_string())?
+        }));
+    }
+
+    Ok(records)
+}
+
+async fn source_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = conn
+        .query(
+            "SELECT id, kind, locator, created_at_ms FROM sources ORDER BY id",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(json!({
+            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
+            "kind": row.get::<String>(1).map_err(|error| error.to_string())?,
+            "locator": row.get::<String>(2).map_err(|error| error.to_string())?,
+            "created_at_ms": row.get::<i64>(3).map_err(|error| error.to_string())?
+        }));
+    }
+
+    Ok(records)
+}
+
+async fn discovered_file_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT project_id, path, language, size_bytes, discovered_at_ms, updated_at_ms
+            FROM discovered_files
+            ORDER BY project_id, path
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(json!({
+            "project_id": row.get::<String>(0).map_err(|error| error.to_string())?,
+            "path": row.get::<String>(1).map_err(|error| error.to_string())?,
+            "language": row.get::<Option<String>>(2).map_err(|error| error.to_string())?,
+            "size_bytes": row.get::<Option<i64>>(3).map_err(|error| error.to_string())?,
+            "discovered_at_ms": row.get::<i64>(4).map_err(|error| error.to_string())?,
+            "updated_at_ms": row.get::<i64>(5).map_err(|error| error.to_string())?
+        }));
+    }
+
+    Ok(records)
+}
+
+async fn entity_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = conn
+        .query(
+            "SELECT id, kind, name, locator, created_at_ms FROM entities ORDER BY id",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(json!({
+            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
+            "kind": row.get::<String>(1).map_err(|error| error.to_string())?,
+            "name": row.get::<String>(2).map_err(|error| error.to_string())?,
+            "locator": row.get::<Option<String>>(3).map_err(|error| error.to_string())?,
+            "created_at_ms": row.get::<i64>(4).map_err(|error| error.to_string())?
+        }));
+    }
+
+    Ok(records)
+}
+
+async fn code_symbol_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT
+                project_id, path, name, kind, language, line_start, line_end,
+                signature, indexed_at_ms
+            FROM code_symbols
+            ORDER BY project_id, path, kind, name, line_start
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(json!({
+            "project_id": row.get::<String>(0).map_err(|error| error.to_string())?,
+            "path": row.get::<String>(1).map_err(|error| error.to_string())?,
+            "name": row.get::<String>(2).map_err(|error| error.to_string())?,
+            "kind": row.get::<String>(3).map_err(|error| error.to_string())?,
+            "language": row.get::<Option<String>>(4).map_err(|error| error.to_string())?,
+            "line_start": row.get::<i64>(5).map_err(|error| error.to_string())?,
+            "line_end": row.get::<Option<i64>>(6).map_err(|error| error.to_string())?,
+            "signature": row.get::<String>(7).map_err(|error| error.to_string())?,
+            "indexed_at_ms": row.get::<i64>(8).map_err(|error| error.to_string())?
+        }));
+    }
+
+    Ok(records)
+}
+
+async fn edge_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = conn
+        .query(
+            "SELECT id, from_id, to_id, kind, created_at_ms FROM edges ORDER BY id",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(json!({
+            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
+            "from_id": row.get::<String>(1).map_err(|error| error.to_string())?,
+            "to_id": row.get::<String>(2).map_err(|error| error.to_string())?,
+            "kind": row.get::<String>(3).map_err(|error| error.to_string())?,
+            "created_at_ms": row.get::<i64>(4).map_err(|error| error.to_string())?
+        }));
+    }
+
+    Ok(records)
+}
+
+async fn code_reference_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT
+                project_id, path, target_path, target_name, target_kind, kind,
+                language, line_start, excerpt, indexed_at_ms
+            FROM code_references
+            ORDER BY project_id, path, target_path, target_name, line_start, kind
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(json!({
+            "project_id": row.get::<String>(0).map_err(|error| error.to_string())?,
+            "path": row.get::<String>(1).map_err(|error| error.to_string())?,
+            "target_path": row.get::<String>(2).map_err(|error| error.to_string())?,
+            "target_name": row.get::<String>(3).map_err(|error| error.to_string())?,
+            "target_kind": row.get::<String>(4).map_err(|error| error.to_string())?,
+            "kind": row.get::<String>(5).map_err(|error| error.to_string())?,
+            "language": row.get::<Option<String>>(6).map_err(|error| error.to_string())?,
+            "line_start": row.get::<i64>(7).map_err(|error| error.to_string())?,
+            "excerpt": row.get::<String>(8).map_err(|error| error.to_string())?,
+            "indexed_at_ms": row.get::<i64>(9).map_err(|error| error.to_string())?
+        }));
+    }
+
+    Ok(records)
+}
+
+async fn session_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT id, project_id, task, branch, started_at_ms, ended_at_ms, final_summary
+            FROM sessions
+            WHERE final_summary IS NOT NULL
+            ORDER BY started_at_ms, id
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(json!({
+            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
+            "project_id": row.get::<String>(1).map_err(|error| error.to_string())?,
+            "task": row.get::<String>(2).map_err(|error| error.to_string())?,
+            "branch": row.get::<Option<String>>(3).map_err(|error| error.to_string())?,
+            "started_at_ms": row.get::<i64>(4).map_err(|error| error.to_string())?,
+            "ended_at_ms": row.get::<Option<i64>>(5).map_err(|error| error.to_string())?,
+            "final_summary": row.get::<Option<String>>(6).map_err(|error| error.to_string())?
+        }));
+    }
+
+    Ok(records)
+}
+
+#[derive(Debug, Clone)]
+struct ProjectSyncRecord {
+    id: String,
+    name: String,
+    root_path: String,
+    git_remote: Option<String>,
+    default_branch: Option<String>,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+fn project_sync_record_from_value(value: &serde_json::Value) -> Result<ProjectSyncRecord, String> {
+    Ok(ProjectSyncRecord {
+        id: json_string_field(value, "id")?,
+        name: json_string_field(value, "name")?,
+        root_path: json_string_field(value, "root_path")?,
+        git_remote: json_optional_string_field(value, "git_remote")?,
+        default_branch: json_optional_string_field(value, "default_branch")?,
+        created_at_ms: json_i64_field(value, "created_at_ms")?,
+        updated_at_ms: json_i64_field(value, "updated_at_ms")?,
+    })
+}
+
 #[derive(Debug, Clone)]
 struct MemorySyncRecord {
     id: String,
@@ -2483,6 +2864,25 @@ struct MemorySyncRecord {
     superseded_by: Option<String>,
     sensitivity: String,
     structured_payload: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryEmbeddingSyncRecord {
+    memory_id: String,
+    model: String,
+    dimensions: i64,
+    embedding: Vec<u8>,
+}
+
+fn memory_embedding_sync_record_from_value(
+    value: &serde_json::Value,
+) -> Result<MemoryEmbeddingSyncRecord, String> {
+    Ok(MemoryEmbeddingSyncRecord {
+        memory_id: json_string_field(value, "memory_id")?,
+        model: json_string_field(value, "model")?,
+        dimensions: json_i64_field(value, "dimensions")?,
+        embedding: json_bytes_field(value, "embedding")?,
+    })
 }
 
 fn memory_sync_record_from_value(value: &serde_json::Value) -> Result<MemorySyncRecord, String> {
@@ -2498,6 +2898,256 @@ fn memory_sync_record_from_value(value: &serde_json::Value) -> Result<MemorySync
         sensitivity: json_string_field(value, "sensitivity")?,
         structured_payload: json_optional_string_field(value, "structured_payload")?,
     })
+}
+
+#[derive(Debug, Clone)]
+struct SourceSyncRecord {
+    id: String,
+    kind: String,
+    locator: String,
+    created_at_ms: i64,
+}
+
+fn source_sync_record_from_value(value: &serde_json::Value) -> Result<SourceSyncRecord, String> {
+    Ok(SourceSyncRecord {
+        id: json_string_field(value, "id")?,
+        kind: json_string_field(value, "kind")?,
+        locator: json_string_field(value, "locator")?,
+        created_at_ms: json_i64_field(value, "created_at_ms")?,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveredFileSyncRecord {
+    project_id: String,
+    path: String,
+    language: Option<String>,
+    size_bytes: Option<i64>,
+    discovered_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+fn discovered_file_sync_record_from_value(
+    value: &serde_json::Value,
+) -> Result<DiscoveredFileSyncRecord, String> {
+    Ok(DiscoveredFileSyncRecord {
+        project_id: json_string_field(value, "project_id")?,
+        path: json_string_field(value, "path")?,
+        language: json_optional_string_field(value, "language")?,
+        size_bytes: json_optional_i64_field(value, "size_bytes")?,
+        discovered_at_ms: json_i64_field(value, "discovered_at_ms")?,
+        updated_at_ms: json_i64_field(value, "updated_at_ms")?,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct EntitySyncRecord {
+    id: String,
+    kind: String,
+    name: String,
+    locator: Option<String>,
+    created_at_ms: i64,
+}
+
+fn entity_sync_record_from_value(value: &serde_json::Value) -> Result<EntitySyncRecord, String> {
+    Ok(EntitySyncRecord {
+        id: json_string_field(value, "id")?,
+        kind: json_string_field(value, "kind")?,
+        name: json_string_field(value, "name")?,
+        locator: json_optional_string_field(value, "locator")?,
+        created_at_ms: json_i64_field(value, "created_at_ms")?,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct CodeSymbolSyncRecord {
+    project_id: String,
+    path: String,
+    name: String,
+    kind: String,
+    language: Option<String>,
+    line_start: i64,
+    line_end: Option<i64>,
+    signature: String,
+    indexed_at_ms: i64,
+}
+
+fn code_symbol_sync_record_from_value(
+    value: &serde_json::Value,
+) -> Result<CodeSymbolSyncRecord, String> {
+    Ok(CodeSymbolSyncRecord {
+        project_id: json_string_field(value, "project_id")?,
+        path: json_string_field(value, "path")?,
+        name: json_string_field(value, "name")?,
+        kind: json_string_field(value, "kind")?,
+        language: json_optional_string_field(value, "language")?,
+        line_start: json_i64_field(value, "line_start")?,
+        line_end: json_optional_i64_field(value, "line_end")?,
+        signature: json_string_field(value, "signature")?,
+        indexed_at_ms: json_i64_field(value, "indexed_at_ms")?,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct EdgeSyncRecord {
+    id: String,
+    from_id: String,
+    to_id: String,
+    kind: String,
+    created_at_ms: i64,
+}
+
+fn edge_sync_record_from_value(value: &serde_json::Value) -> Result<EdgeSyncRecord, String> {
+    Ok(EdgeSyncRecord {
+        id: json_string_field(value, "id")?,
+        from_id: json_string_field(value, "from_id")?,
+        to_id: json_string_field(value, "to_id")?,
+        kind: json_string_field(value, "kind")?,
+        created_at_ms: json_i64_field(value, "created_at_ms")?,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct CodeReferenceSyncRecord {
+    project_id: String,
+    path: String,
+    target_path: String,
+    target_name: String,
+    target_kind: String,
+    kind: String,
+    language: Option<String>,
+    line_start: i64,
+    excerpt: String,
+    indexed_at_ms: i64,
+}
+
+fn code_reference_sync_record_from_value(
+    value: &serde_json::Value,
+) -> Result<CodeReferenceSyncRecord, String> {
+    Ok(CodeReferenceSyncRecord {
+        project_id: json_string_field(value, "project_id")?,
+        path: json_string_field(value, "path")?,
+        target_path: json_string_field(value, "target_path")?,
+        target_name: json_string_field(value, "target_name")?,
+        target_kind: json_string_field(value, "target_kind")?,
+        kind: json_string_field(value, "kind")?,
+        language: json_optional_string_field(value, "language")?,
+        line_start: json_i64_field(value, "line_start")?,
+        excerpt: json_string_field(value, "excerpt")?,
+        indexed_at_ms: json_i64_field(value, "indexed_at_ms")?,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct SessionSyncRecord {
+    id: String,
+    project_id: String,
+    task: String,
+    branch: Option<String>,
+    started_at_ms: i64,
+    ended_at_ms: Option<i64>,
+    final_summary: Option<String>,
+}
+
+fn session_sync_record_from_value(value: &serde_json::Value) -> Result<SessionSyncRecord, String> {
+    Ok(SessionSyncRecord {
+        id: json_string_field(value, "id")?,
+        project_id: json_string_field(value, "project_id")?,
+        task: json_string_field(value, "task")?,
+        branch: json_optional_string_field(value, "branch")?,
+        started_at_ms: json_i64_field(value, "started_at_ms")?,
+        ended_at_ms: json_optional_i64_field(value, "ended_at_ms")?,
+        final_summary: json_optional_string_field(value, "final_summary")?,
+    })
+}
+
+async fn apply_api_push_project_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Projects;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = project_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO projects (
+                    id, name, root_path, git_remote, default_branch, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    root_path = excluded.root_path,
+                    git_remote = excluded.git_remote,
+                    default_branch = excluded.default_branch,
+                    updated_at_ms = excluded.updated_at_ms
+                ",
+                params![
+                    record.id,
+                    record.name,
+                    record.root_path,
+                    record.git_remote,
+                    record.default_branch,
+                    record.created_at_ms,
+                    record.updated_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_pull_project_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Projects;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = project_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO projects (
+                    id, name, root_path, git_remote, default_branch, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    root_path = excluded.root_path,
+                    git_remote = excluded.git_remote,
+                    default_branch = excluded.default_branch,
+                    updated_at_ms = excluded.updated_at_ms
+                WHERE excluded.updated_at_ms > projects.updated_at_ms
+                ",
+                params![
+                    record.id,
+                    record.name,
+                    record.root_path,
+                    record.git_remote,
+                    record.default_branch,
+                    record.created_at_ms,
+                    record.updated_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_newer_or_equal");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
 }
 
 async fn apply_api_push_memory_records(
@@ -2599,6 +3249,655 @@ async fn apply_api_pull_memory_records(
     finish_sync_table_result(conn, table, before_count, stats).await
 }
 
+async fn apply_api_push_memory_embedding_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::MemoryEmbeddings;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = memory_embedding_sync_record_from_value(value)?;
+        if !memory_exists(conn, &record.memory_id).await? {
+            stats.record_skip("missing_memory");
+            continue;
+        }
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO memory_embeddings (memory_id, model, dimensions, embedding)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(memory_id) DO UPDATE SET
+                    model = excluded.model,
+                    dimensions = excluded.dimensions,
+                    embedding = excluded.embedding
+                ",
+                params![
+                    record.memory_id,
+                    record.model,
+                    record.dimensions,
+                    record.embedding
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_pull_memory_embedding_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::MemoryEmbeddings;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = memory_embedding_sync_record_from_value(value)?;
+        if !memory_exists(conn, &record.memory_id).await? {
+            stats.record_skip("missing_memory");
+            continue;
+        }
+        let affected = conn
+            .execute(
+                "
+                INSERT OR IGNORE INTO memory_embeddings (memory_id, model, dimensions, embedding)
+                VALUES (?1, ?2, ?3, ?4)
+                ",
+                params![
+                    record.memory_id,
+                    record.model,
+                    record.dimensions,
+                    record.embedding
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_preserved");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_push_source_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Sources;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = source_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO sources (id, kind, locator, created_at_ms)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(id) DO UPDATE SET
+                    kind = excluded.kind,
+                    locator = excluded.locator,
+                    created_at_ms = excluded.created_at_ms
+                ",
+                params![record.id, record.kind, record.locator, record.created_at_ms],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_pull_source_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Sources;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = source_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT OR IGNORE INTO sources (id, kind, locator, created_at_ms)
+                VALUES (?1, ?2, ?3, ?4)
+                ",
+                params![record.id, record.kind, record.locator, record.created_at_ms],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_preserved");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_push_discovered_file_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::DiscoveredFiles;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = discovered_file_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO discovered_files (
+                    project_id, path, language, size_bytes, discovered_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(project_id, path) DO UPDATE SET
+                    language = excluded.language,
+                    size_bytes = excluded.size_bytes,
+                    updated_at_ms = excluded.updated_at_ms
+                ",
+                params![
+                    record.project_id,
+                    record.path,
+                    record.language,
+                    record.size_bytes,
+                    record.discovered_at_ms,
+                    record.updated_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_pull_discovered_file_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::DiscoveredFiles;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = discovered_file_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO discovered_files (
+                    project_id, path, language, size_bytes, discovered_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(project_id, path) DO UPDATE SET
+                    language = excluded.language,
+                    size_bytes = excluded.size_bytes,
+                    updated_at_ms = excluded.updated_at_ms
+                WHERE excluded.updated_at_ms > discovered_files.updated_at_ms
+                ",
+                params![
+                    record.project_id,
+                    record.path,
+                    record.language,
+                    record.size_bytes,
+                    record.discovered_at_ms,
+                    record.updated_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_newer_or_equal");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_push_entity_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Entities;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = entity_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO entities (id, kind, name, locator, created_at_ms)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT(id) DO UPDATE SET
+                    kind = excluded.kind,
+                    name = excluded.name,
+                    locator = excluded.locator,
+                    created_at_ms = excluded.created_at_ms
+                ",
+                params![
+                    record.id,
+                    record.kind,
+                    record.name,
+                    record.locator,
+                    record.created_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_pull_entity_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Entities;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = entity_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT OR IGNORE INTO entities (id, kind, name, locator, created_at_ms)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ",
+                params![
+                    record.id,
+                    record.kind,
+                    record.name,
+                    record.locator,
+                    record.created_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_preserved");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_push_code_symbol_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::CodeSymbols;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = code_symbol_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO code_symbols (
+                    project_id, path, name, kind, language, line_start, line_end,
+                    signature, indexed_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(project_id, path, kind, name, line_start) DO UPDATE SET
+                    language = excluded.language,
+                    line_end = excluded.line_end,
+                    signature = excluded.signature,
+                    indexed_at_ms = excluded.indexed_at_ms
+                ",
+                params![
+                    record.project_id,
+                    record.path,
+                    record.name,
+                    record.kind,
+                    record.language,
+                    record.line_start,
+                    record.line_end,
+                    record.signature,
+                    record.indexed_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_pull_code_symbol_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::CodeSymbols;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = code_symbol_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO code_symbols (
+                    project_id, path, name, kind, language, line_start, line_end,
+                    signature, indexed_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(project_id, path, kind, name, line_start) DO UPDATE SET
+                    language = excluded.language,
+                    line_end = excluded.line_end,
+                    signature = excluded.signature,
+                    indexed_at_ms = excluded.indexed_at_ms
+                WHERE excluded.indexed_at_ms > code_symbols.indexed_at_ms
+                ",
+                params![
+                    record.project_id,
+                    record.path,
+                    record.name,
+                    record.kind,
+                    record.language,
+                    record.line_start,
+                    record.line_end,
+                    record.signature,
+                    record.indexed_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_newer_or_equal");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_push_edge_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Edges;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = edge_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO edges (id, from_id, to_id, kind, created_at_ms)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT(id) DO UPDATE SET
+                    from_id = excluded.from_id,
+                    to_id = excluded.to_id,
+                    kind = excluded.kind,
+                    created_at_ms = excluded.created_at_ms
+                ",
+                params![
+                    record.id,
+                    record.from_id,
+                    record.to_id,
+                    record.kind,
+                    record.created_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_pull_edge_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Edges;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = edge_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT OR IGNORE INTO edges (id, from_id, to_id, kind, created_at_ms)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ",
+                params![
+                    record.id,
+                    record.from_id,
+                    record.to_id,
+                    record.kind,
+                    record.created_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_preserved");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_push_code_reference_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::CodeReferences;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = code_reference_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO code_references (
+                    project_id, path, target_path, target_name, target_kind, kind,
+                    language, line_start, excerpt, indexed_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT(project_id, path, target_path, target_name, line_start, kind)
+                DO UPDATE SET
+                    target_kind = excluded.target_kind,
+                    language = excluded.language,
+                    excerpt = excluded.excerpt,
+                    indexed_at_ms = excluded.indexed_at_ms
+                ",
+                params![
+                    record.project_id,
+                    record.path,
+                    record.target_path,
+                    record.target_name,
+                    record.target_kind,
+                    record.kind,
+                    record.language,
+                    record.line_start,
+                    record.excerpt,
+                    record.indexed_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_pull_code_reference_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::CodeReferences;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = code_reference_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO code_references (
+                    project_id, path, target_path, target_name, target_kind, kind,
+                    language, line_start, excerpt, indexed_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT(project_id, path, target_path, target_name, line_start, kind)
+                DO UPDATE SET
+                    target_kind = excluded.target_kind,
+                    language = excluded.language,
+                    excerpt = excluded.excerpt,
+                    indexed_at_ms = excluded.indexed_at_ms
+                WHERE excluded.indexed_at_ms > code_references.indexed_at_ms
+                ",
+                params![
+                    record.project_id,
+                    record.path,
+                    record.target_path,
+                    record.target_name,
+                    record.target_kind,
+                    record.kind,
+                    record.language,
+                    record.line_start,
+                    record.excerpt,
+                    record.indexed_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_newer_or_equal");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_push_session_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Sessions;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = session_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO sessions (
+                    id, project_id, task, branch, started_at_ms, ended_at_ms, final_summary
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(id) DO UPDATE SET
+                    project_id = excluded.project_id,
+                    task = excluded.task,
+                    branch = excluded.branch,
+                    started_at_ms = excluded.started_at_ms,
+                    ended_at_ms = excluded.ended_at_ms,
+                    final_summary = excluded.final_summary
+                ",
+                params![
+                    record.id,
+                    record.project_id,
+                    record.task,
+                    record.branch,
+                    record.started_at_ms,
+                    record.ended_at_ms,
+                    record.final_summary
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_pull_session_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Sessions;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = session_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO sessions (
+                    id, project_id, task, branch, started_at_ms, ended_at_ms, final_summary
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(id) DO UPDATE SET
+                    project_id = excluded.project_id,
+                    task = excluded.task,
+                    branch = excluded.branch,
+                    started_at_ms = excluded.started_at_ms,
+                    ended_at_ms = excluded.ended_at_ms,
+                    final_summary = excluded.final_summary
+                WHERE sessions.ended_at_ms IS NULL
+                   OR excluded.ended_at_ms > sessions.ended_at_ms
+                ",
+                params![
+                    record.id,
+                    record.project_id,
+                    record.task,
+                    record.branch,
+                    record.started_at_ms,
+                    record.ended_at_ms,
+                    record.final_summary
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_newer_or_equal");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
 async fn apply_api_pull_payloads(
     conn: &Connection,
     payloads: &[SyncApiTablePayload],
@@ -2606,8 +3905,36 @@ async fn apply_api_pull_payloads(
     let mut results = Vec::new();
     for payload in payloads {
         match SyncTableKind::from_table_name(&payload.result.table) {
+            Some(SyncTableKind::Projects) if !payload.records.is_empty() => {
+                results.push(apply_api_pull_project_records(conn, &payload.records).await?);
+            }
             Some(SyncTableKind::Memories) if !payload.records.is_empty() => {
                 results.push(apply_api_pull_memory_records(conn, &payload.records).await?);
+            }
+            Some(SyncTableKind::MemoryEmbeddings) if !payload.records.is_empty() => {
+                results
+                    .push(apply_api_pull_memory_embedding_records(conn, &payload.records).await?);
+            }
+            Some(SyncTableKind::Sources) if !payload.records.is_empty() => {
+                results.push(apply_api_pull_source_records(conn, &payload.records).await?);
+            }
+            Some(SyncTableKind::DiscoveredFiles) if !payload.records.is_empty() => {
+                results.push(apply_api_pull_discovered_file_records(conn, &payload.records).await?);
+            }
+            Some(SyncTableKind::Entities) if !payload.records.is_empty() => {
+                results.push(apply_api_pull_entity_records(conn, &payload.records).await?);
+            }
+            Some(SyncTableKind::CodeSymbols) if !payload.records.is_empty() => {
+                results.push(apply_api_pull_code_symbol_records(conn, &payload.records).await?);
+            }
+            Some(SyncTableKind::Edges) if !payload.records.is_empty() => {
+                results.push(apply_api_pull_edge_records(conn, &payload.records).await?);
+            }
+            Some(SyncTableKind::CodeReferences) if !payload.records.is_empty() => {
+                results.push(apply_api_pull_code_reference_records(conn, &payload.records).await?);
+            }
+            Some(SyncTableKind::Sessions) if !payload.records.is_empty() => {
+                results.push(apply_api_pull_session_records(conn, &payload.records).await?);
             }
             _ => results.push(payload.result.clone()),
         }
@@ -5204,9 +6531,10 @@ mod tests {
     use super::{
         HUGR_API_CONTRACT_VERSION, HUGR_API_ROUTES, LOCAL_PROJECT_ID, Memory, MemorySource,
         MemoryWriteOptions, StorageConfig, StorageMode, Store, SyncApiTablePayload, SyncBackend,
-        SyncClass, SyncConflictSummary, SyncTableResult, apply_api_pull_payloads, fts_query,
-        hugr_api_route_url, hugr_api_sync_request, parse_hugr_api_history_response,
-        parse_hugr_api_sync_response, query_terms, recall_score, table_row_count,
+        SyncClass, SyncConflictSummary, SyncTableKind, SyncTableResult, apply_api_pull_payloads,
+        fts_query, hugr_api_route_url, hugr_api_sync_request, parse_hugr_api_history_response,
+        parse_hugr_api_sync_response, planned_sync_table_result, query_terms, recall_score,
+        table_row_count,
     };
     use crate::code::{CodeReference, CodeSymbol};
     use crate::discovery::FileCandidate;
@@ -5700,6 +7028,345 @@ mod tests {
             memory_text(&local_conn, &memory.id).await,
             "remote memory flows through API pull"
         );
+    }
+
+    #[tokio::test]
+    async fn api_push_applies_project_source_entity_and_edge_payloads() {
+        let local = TestStore::new("hugr_api_push_structural_local");
+        let remote = TestStore::new("hugr_api_push_structural_remote");
+        local.store.init().await.unwrap();
+        let local_conn = local.store.connect().await.unwrap();
+        insert_source_for_sync(&local_conn, "src_1", "url", "https://example.test", 10).await;
+        insert_entity_for_sync(&local_conn, "ent_1", "service", "PluginRegistry", None, 11).await;
+        insert_edge_for_sync(&local_conn, "edge_1", "ent_1", "ent_2", "depends_on", 12).await;
+        let tables = vec![
+            planned_sync_table_result(SyncTableKind::Projects, 1),
+            planned_sync_table_result(SyncTableKind::Sources, 1),
+            planned_sync_table_result(SyncTableKind::Entities, 1),
+            planned_sync_table_result(SyncTableKind::Edges, 1),
+        ];
+
+        let payloads = local
+            .store
+            .sync_api_table_payloads(&local_conn, &tables, true)
+            .await
+            .unwrap();
+        let (_, status, response_payloads) = remote
+            .store
+            .apply_api_sync_push_payloads(&payloads, false)
+            .await
+            .unwrap();
+        let remote_conn = remote.store.connect().await.unwrap();
+
+        assert_eq!(status, "accepted");
+        assert_eq!(response_payloads.len(), 4);
+        assert_eq!(table_row_count(&remote_conn, "sources").await.unwrap(), 1);
+        assert_eq!(table_row_count(&remote_conn, "entities").await.unwrap(), 1);
+        assert_eq!(table_row_count(&remote_conn, "edges").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn api_pull_returns_and_applies_project_source_entity_and_edge_payloads() {
+        let remote = TestStore::new("hugr_api_pull_structural_remote");
+        let local = TestStore::new("hugr_api_pull_structural_local");
+        remote.store.init().await.unwrap();
+        local.store.init().await.unwrap();
+        let remote_conn = remote.store.connect().await.unwrap();
+        let local_conn = local.store.connect().await.unwrap();
+        remote_conn
+            .execute(
+                "
+                INSERT INTO projects (
+                    id, name, root_path, git_remote, default_branch, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ",
+                params![
+                    "project_remote".to_string(),
+                    "remote".to_string(),
+                    "/remote".to_string(),
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    10_i64,
+                    20_i64
+                ],
+            )
+            .await
+            .unwrap();
+        insert_source_for_sync(&remote_conn, "src_1", "url", "https://example.test", 10).await;
+        insert_entity_for_sync(
+            &remote_conn,
+            "ent_1",
+            "service",
+            "PluginRegistry",
+            Some("src/registry.rs"),
+            11,
+        )
+        .await;
+        insert_edge_for_sync(&remote_conn, "edge_1", "ent_1", "ent_2", "depends_on", 12).await;
+        let request_payloads = vec![
+            SyncApiTablePayload {
+                result: planned_sync_table_result(SyncTableKind::Projects, 0),
+                records: Vec::new(),
+            },
+            SyncApiTablePayload {
+                result: planned_sync_table_result(SyncTableKind::Sources, 0),
+                records: Vec::new(),
+            },
+            SyncApiTablePayload {
+                result: planned_sync_table_result(SyncTableKind::Entities, 0),
+                records: Vec::new(),
+            },
+            SyncApiTablePayload {
+                result: planned_sync_table_result(SyncTableKind::Edges, 0),
+                records: Vec::new(),
+            },
+        ];
+
+        let (_, status, response_payloads) = remote
+            .store
+            .api_sync_pull_payloads(&request_payloads, false)
+            .await
+            .unwrap();
+        let applied = apply_api_pull_payloads(&local_conn, &response_payloads)
+            .await
+            .unwrap();
+
+        assert_eq!(status, "accepted");
+        assert_eq!(response_payloads.len(), 4);
+        assert!(applied.iter().any(|table| table.table == "projects"));
+        assert_eq!(table_row_count(&local_conn, "sources").await.unwrap(), 1);
+        assert_eq!(table_row_count(&local_conn, "entities").await.unwrap(), 1);
+        assert_eq!(table_row_count(&local_conn, "edges").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn api_push_applies_index_embedding_and_session_payloads() {
+        let local = TestStore::new("hugr_api_push_index_local");
+        let remote = TestStore::new("hugr_api_push_index_remote");
+        local
+            .store
+            .remember("api index payload memory")
+            .await
+            .unwrap();
+        local
+            .store
+            .record_discovered_files(&[FileCandidate {
+                path: "src/plugin_hooks.rs".to_string(),
+                score: 1,
+                language: Some("rust".to_string()),
+                size_bytes: Some(128),
+            }])
+            .await
+            .unwrap();
+        let symbol = CodeSymbol {
+            path: "src/plugin_hooks.rs".to_string(),
+            name: "PluginHooks".to_string(),
+            kind: "struct".to_string(),
+            language: Some("rust".to_string()),
+            line_start: 1,
+            line_end: Some(3),
+            signature: "pub struct PluginHooks".to_string(),
+        };
+        let reference = CodeReference {
+            path: "src/main.rs".to_string(),
+            language: Some("rust".to_string()),
+            target_path: "src/plugin_hooks.rs".to_string(),
+            target_name: "PluginHooks".to_string(),
+            target_kind: "struct".to_string(),
+            kind: "type_reference".to_string(),
+            line_start: 9,
+            excerpt: "PluginHooks".to_string(),
+        };
+        local
+            .store
+            .record_code_index(
+                &[FileCandidate {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    score: 1,
+                    language: Some("rust".to_string()),
+                    size_bytes: Some(128),
+                }],
+                std::slice::from_ref(&symbol),
+                &[reference],
+            )
+            .await
+            .unwrap();
+        let session = local.store.start_session("sync api indexes").await.unwrap();
+        local
+            .store
+            .end_session(Some("api index sync complete"))
+            .await
+            .unwrap();
+        let local_conn = local.store.connect().await.unwrap();
+        let tables = vec![
+            planned_sync_table_result(SyncTableKind::Memories, 1),
+            planned_sync_table_result(SyncTableKind::MemoryEmbeddings, 1),
+            planned_sync_table_result(SyncTableKind::DiscoveredFiles, 1),
+            planned_sync_table_result(SyncTableKind::CodeSymbols, 1),
+            planned_sync_table_result(SyncTableKind::CodeReferences, 1),
+            planned_sync_table_result(SyncTableKind::Sessions, 1),
+        ];
+
+        let payloads = local
+            .store
+            .sync_api_table_payloads(&local_conn, &tables, true)
+            .await
+            .unwrap();
+        let (_, status, response_payloads) = remote
+            .store
+            .apply_api_sync_push_payloads(&payloads, false)
+            .await
+            .unwrap();
+        let remote_conn = remote.store.connect().await.unwrap();
+
+        assert_eq!(status, "accepted");
+        assert!(
+            response_payloads
+                .iter()
+                .all(|payload| payload.result.conflict_count == 0)
+        );
+        assert_eq!(
+            table_row_count(&remote_conn, "memory_embeddings")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            table_row_count(&remote_conn, "discovered_files")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            table_row_count(&remote_conn, "code_symbols").await.unwrap(),
+            1
+        );
+        assert_eq!(
+            table_row_count(&remote_conn, "code_references")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(table_row_count(&remote_conn, "sessions").await.unwrap(), 1);
+        assert_eq!(session.task, "sync api indexes");
+    }
+
+    #[tokio::test]
+    async fn api_pull_returns_and_applies_index_embedding_and_session_payloads() {
+        let remote = TestStore::new("hugr_api_pull_index_remote");
+        let local = TestStore::new("hugr_api_pull_index_local");
+        remote
+            .store
+            .remember("api pull index memory")
+            .await
+            .unwrap();
+        let symbol = CodeSymbol {
+            path: "src/plugin_hooks.rs".to_string(),
+            name: "PluginHooks".to_string(),
+            kind: "struct".to_string(),
+            language: Some("rust".to_string()),
+            line_start: 1,
+            line_end: Some(3),
+            signature: "pub struct PluginHooks".to_string(),
+        };
+        let reference = CodeReference {
+            path: "src/main.rs".to_string(),
+            language: Some("rust".to_string()),
+            target_path: "src/plugin_hooks.rs".to_string(),
+            target_name: "PluginHooks".to_string(),
+            target_kind: "struct".to_string(),
+            kind: "type_reference".to_string(),
+            line_start: 9,
+            excerpt: "PluginHooks".to_string(),
+        };
+        remote
+            .store
+            .record_code_index(
+                &[FileCandidate {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    score: 1,
+                    language: Some("rust".to_string()),
+                    size_bytes: Some(128),
+                }],
+                &[symbol],
+                &[reference],
+            )
+            .await
+            .unwrap();
+        remote
+            .store
+            .start_session("pull api indexes")
+            .await
+            .unwrap();
+        remote
+            .store
+            .end_session(Some("pull api indexes complete"))
+            .await
+            .unwrap();
+        local.store.init().await.unwrap();
+        let local_conn = local.store.connect().await.unwrap();
+        let request_payloads = vec![
+            SyncApiTablePayload {
+                result: planned_sync_table_result(SyncTableKind::Memories, 0),
+                records: Vec::new(),
+            },
+            SyncApiTablePayload {
+                result: planned_sync_table_result(SyncTableKind::MemoryEmbeddings, 0),
+                records: Vec::new(),
+            },
+            SyncApiTablePayload {
+                result: planned_sync_table_result(SyncTableKind::DiscoveredFiles, 0),
+                records: Vec::new(),
+            },
+            SyncApiTablePayload {
+                result: planned_sync_table_result(SyncTableKind::CodeSymbols, 0),
+                records: Vec::new(),
+            },
+            SyncApiTablePayload {
+                result: planned_sync_table_result(SyncTableKind::CodeReferences, 0),
+                records: Vec::new(),
+            },
+            SyncApiTablePayload {
+                result: planned_sync_table_result(SyncTableKind::Sessions, 0),
+                records: Vec::new(),
+            },
+        ];
+
+        let (_, status, response_payloads) = remote
+            .store
+            .api_sync_pull_payloads(&request_payloads, false)
+            .await
+            .unwrap();
+        let applied = apply_api_pull_payloads(&local_conn, &response_payloads)
+            .await
+            .unwrap();
+
+        assert_eq!(status, "accepted");
+        assert!(applied.iter().all(|table| table.conflict_count == 0));
+        assert_eq!(
+            table_row_count(&local_conn, "memory_embeddings")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            table_row_count(&local_conn, "discovered_files")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            table_row_count(&local_conn, "code_symbols").await.unwrap(),
+            1
+        );
+        assert_eq!(
+            table_row_count(&local_conn, "code_references")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(table_row_count(&local_conn, "sessions").await.unwrap(), 1);
     }
 
     #[tokio::test]
@@ -6774,6 +8441,79 @@ mod tests {
         .await
         .map(|_| ())
         .map_err(|error| error.to_string())
+    }
+
+    async fn insert_source_for_sync(
+        conn: &Connection,
+        id: &str,
+        kind: &str,
+        locator: &str,
+        created_at_ms: i64,
+    ) {
+        conn.execute(
+            "
+            INSERT INTO sources (id, kind, locator, created_at_ms)
+            VALUES (?1, ?2, ?3, ?4)
+            ",
+            params![
+                id.to_string(),
+                kind.to_string(),
+                locator.to_string(),
+                created_at_ms
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn insert_entity_for_sync(
+        conn: &Connection,
+        id: &str,
+        kind: &str,
+        name: &str,
+        locator: Option<&str>,
+        created_at_ms: i64,
+    ) {
+        conn.execute(
+            "
+            INSERT INTO entities (id, kind, name, locator, created_at_ms)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ",
+            params![
+                id.to_string(),
+                kind.to_string(),
+                name.to_string(),
+                locator.map(|value| value.to_string()),
+                created_at_ms
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn insert_edge_for_sync(
+        conn: &Connection,
+        id: &str,
+        from_id: &str,
+        to_id: &str,
+        kind: &str,
+        created_at_ms: i64,
+    ) {
+        conn.execute(
+            "
+            INSERT INTO edges (id, from_id, to_id, kind, created_at_ms)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ",
+            params![
+                id.to_string(),
+                from_id.to_string(),
+                to_id.to_string(),
+                kind.to_string(),
+                created_at_ms
+            ],
+        )
+        .await
+        .unwrap();
     }
 
     async fn memory_text(conn: &Connection, id: &str) -> String {
