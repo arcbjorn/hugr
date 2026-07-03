@@ -17,8 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const HUGR_DIR: &str = ".hugr";
 const HUGR_DB: &str = "hugr.db";
 const LOCAL_PROJECT_ID: &str = "project_local";
-const HUGR_API_CONTRACT_VERSION: &str = "hugr-api-v1";
-const HUGR_API_ROUTES: &[&str] = &[
+pub(crate) const HUGR_API_CONTRACT_VERSION: &str = "hugr-api-v1";
+pub(crate) const HUGR_API_ROUTES: &[&str] = &[
     "GET /v1/sync/status",
     "POST /v1/sync/push",
     "POST /v1/sync/pull",
@@ -1461,6 +1461,20 @@ impl Store {
         }
 
         Ok(history)
+    }
+
+    pub(crate) async fn record_api_sync_run(
+        &self,
+        operation: &str,
+        status: &str,
+        tables: &[SyncTableResult],
+    ) -> Result<String, String> {
+        self.init().await?;
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let now = now_ms()?;
+        self.record_sync_run(&conn, operation, "hugr_api", status, now, now, tables)
+            .await
     }
 
     pub async fn sync_push(&self, dry_run: bool) -> Result<SyncPushResult, String> {
@@ -5138,6 +5152,36 @@ mod tests {
         assert_eq!(history[0].operation, "pull");
         assert_eq!(history[0].tables[0].table, "sessions");
         assert_eq!(history[0].tables[0].updated_count, 1);
+    }
+
+    #[tokio::test]
+    async fn records_hugr_api_sync_runs() {
+        let test = TestStore::new("hugr_api_sync_history");
+        let table = SyncTableResult {
+            class: "memories".to_string(),
+            table: "memories".to_string(),
+            row_count: 2,
+            inserted_count: 0,
+            updated_count: 0,
+            skipped_count: 0,
+            conflict_count: 0,
+            executed: true,
+            conflicts: Vec::new(),
+        };
+
+        let run_id = test
+            .store
+            .record_api_sync_run("push", "accepted", &[table])
+            .await
+            .unwrap();
+        let history = test.store.sync_history(5).await.unwrap();
+
+        assert_eq!(history[0].id, run_id);
+        assert_eq!(history[0].operation, "push");
+        assert_eq!(history[0].backend, "hugr_api");
+        assert_eq!(history[0].status, "accepted");
+        assert_eq!(history[0].tables[0].table, "memories");
+        assert!(history[0].tables[0].executed);
     }
 
     #[tokio::test]
