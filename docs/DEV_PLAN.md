@@ -35,7 +35,7 @@ Implemented:
 - durable session tables and CLI workflow
 - recent session facts in context packs
 - stdio MCP server with core Hugr tools
-- `hugr daemon` local HTTP runtime with `/health`, `/status`, file watching, and debounced background indexing
+- `hugr daemon` local HTTP runtime with `/health`, `/status`, file watching, debounced background indexing, and periodic memory-maintenance audits
 - `hugr index` for explicit project indexing
 - best-effort code symbol extraction stored in `code_symbols`
 - best-effort direct reference/call/import extraction stored in `code_references`
@@ -63,14 +63,14 @@ Implemented:
 Not implemented yet:
 
 - tree-sitter-backed Kotlin parsing; the current published `tree-sitter-kotlin` crate resolves to `tree-sitter <0.23` and conflicts with Hugr's `tree-sitter 0.26` parser stack
-- daemon background memory jobs
+- automatic session observation and memory promotion jobs
 - remote-only storage execution and the Hugr API sync backend
 
 ## Completion Gap Review
 
 The near-term plan is close to complete, but the broader vision and technical blueprint still require several product systems before Hugr is complete:
 
-- Daemon/runtime service: `hugr daemon` local HTTP transport, file watching, and debounced background indexing exist; background memory jobs remain.
+- Daemon/runtime service: `hugr daemon` local HTTP transport, file watching, debounced background indexing, and periodic memory-maintenance audits exist.
 - Remote/cloud execution: remote-only storage mode, hosted Hugr API backend, auth boundary, and API-backed sync.
 - Context pack persistence: durable `context_packs` storage and real sync behavior for the `context_packs` sync class.
 - Context graph expansion: use code/source/entity graph neighborhoods during `hugr context`, not only direct file/symbol/memory retrieval.
@@ -481,6 +481,7 @@ Recommended next commits:
 36. Done: `feat(parser): use tree-sitter swift`
 37. Done: `feat(daemon): add local runtime skeleton`
 38. Done: `feat(daemon): index on file changes`
+39. Done: `feat(daemon): audit memory in background`
 
 Each commit should leave the CLI usable.
 
@@ -497,6 +498,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add daemon background memory jobs.
+Add automatic session observation.
 
-That is the right next step because `hugr daemon` now has local HTTP status, recursive file watching, and debounced background index refreshes. The remaining daemon/runtime gap is running periodic or event-driven memory maintenance work in the background.
+That is the right next step because `hugr daemon` now has local HTTP status, recursive file watching, debounced background index refreshes, and periodic memory-maintenance audits. The next major product gap is capturing file edits, shell commands, git operations, test outcomes, failures, and discoveries without requiring manual `session event` calls.
