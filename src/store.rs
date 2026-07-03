@@ -140,6 +140,14 @@ pub struct Memory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPromotionResult {
+    pub session_id: String,
+    pub task: String,
+    pub fact_count: usize,
+    pub memory: Memory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgetResult {
     pub query: String,
     pub forgotten_count: usize,
@@ -273,43 +281,7 @@ impl Store {
     pub async fn remember(&self, text: &str) -> Result<Memory, String> {
         self.init().await?;
         let conn = self.connect().await?;
-        let created_at_ms = now_ms()?;
-        let memory = Memory {
-            id: format!("mem_{created_at_ms}"),
-            created_at_ms,
-            kind: "fact".to_string(),
-            text: text.trim().to_string(),
-        };
-
-        conn.execute(
-            "INSERT INTO memories (id, created_at_ms, kind, text) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                memory.id.clone(),
-                memory.created_at_ms,
-                memory.kind.clone(),
-                memory.text.clone()
-            ],
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-
-        let embedding = self.embedding_provider()?.embed(&memory.text)?;
-        let embedding_dimensions =
-            i64::try_from(embedding.dimensions()).map_err(|error| error.to_string())?;
-        let embedding_vector = embedding.to_vector_literal();
-        conn.execute(
-            "INSERT INTO memory_embeddings (memory_id, model, dimensions, embedding) VALUES (?1, ?2, ?3, vector(?4))",
-            params![
-                memory.id.clone(),
-                embedding.model,
-                embedding_dimensions,
-                embedding_vector
-            ],
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-
-        Ok(memory)
+        insert_memory(&conn, self.embedding_provider()?, text).await
     }
 
     pub async fn memories(&self) -> Result<Vec<Memory>, String> {
@@ -1026,8 +998,11 @@ impl Store {
         kind: &str,
         detail: &str,
     ) -> Result<Option<SessionEvent>, String> {
-        self.init().await?;
+        if !self.exists() {
+            return Ok(None);
+        }
         let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
         let Some(session_id) = active_session_id_optional(&conn).await? else {
             return Ok(None);
         };
@@ -1060,6 +1035,65 @@ impl Store {
         session_by_id(&conn, &session_id)
             .await?
             .ok_or_else(|| "ended session was not found".to_string())
+    }
+
+    pub async fn promote_latest_session(&self) -> Result<SessionPromotionResult, String> {
+        if !self.exists() {
+            return Err("no session available to promote".to_string());
+        }
+
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let session = latest_session(&conn)
+            .await?
+            .ok_or_else(|| "no session available to promote".to_string())?;
+        self.promote_session(&conn, session).await
+    }
+
+    pub(crate) async fn promote_next_unpromoted_session(
+        &self,
+    ) -> Result<Option<SessionPromotionResult>, String> {
+        if !self.exists() {
+            return Ok(None);
+        }
+
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let Some(session) = next_unpromoted_ended_session(&conn).await? else {
+            return Ok(None);
+        };
+
+        self.promote_session(&conn, session).await.map(Some)
+    }
+
+    async fn promote_session(
+        &self,
+        conn: &Connection,
+        session: Session,
+    ) -> Result<SessionPromotionResult, String> {
+        let facts = session_promotion_facts(conn, &session).await?;
+        if facts.is_empty() {
+            return Err("latest session has no events or summary to promote".to_string());
+        }
+
+        if let Some(memory) = promoted_memory_for_session(conn, &session.id).await? {
+            return Ok(SessionPromotionResult {
+                session_id: session.id,
+                task: session.task,
+                fact_count: facts.len(),
+                memory,
+            });
+        }
+
+        let memory_text = session_promotion_text(&session, &facts);
+        let memory = insert_memory(conn, self.embedding_provider()?, &memory_text).await?;
+        insert_session_promotion(conn, &session.id, &memory.id).await?;
+        Ok(SessionPromotionResult {
+            session_id: session.id,
+            task: session.task,
+            fact_count: facts.len(),
+            memory,
+        })
     }
 
     pub async fn recent_session_facts(
@@ -1808,6 +1842,50 @@ async fn table_count_where(
     usize_from_i64(row.get::<i64>(0).map_err(|error| error.to_string())?)
 }
 
+async fn insert_memory(
+    conn: &Connection,
+    embedding_provider: &SelectedEmbeddingProvider,
+    text: &str,
+) -> Result<Memory, String> {
+    let created_at_ms = now_ms()?;
+    let memory = Memory {
+        id: format!("mem_{created_at_ms}"),
+        created_at_ms,
+        kind: "fact".to_string(),
+        text: text.trim().to_string(),
+    };
+
+    conn.execute(
+        "INSERT INTO memories (id, created_at_ms, kind, text) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            memory.id.clone(),
+            memory.created_at_ms,
+            memory.kind.clone(),
+            memory.text.clone()
+        ],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+
+    let embedding = embedding_provider.embed(&memory.text)?;
+    let embedding_dimensions =
+        i64::try_from(embedding.dimensions()).map_err(|error| error.to_string())?;
+    let embedding_vector = embedding.to_vector_literal();
+    conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, model, dimensions, embedding) VALUES (?1, ?2, ?3, vector(?4))",
+        params![
+            memory.id.clone(),
+            embedding.model,
+            embedding_dimensions,
+            embedding_vector
+        ],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+
+    Ok(memory)
+}
+
 async fn active_memories(conn: &Connection) -> Result<Vec<Memory>, String> {
     let mut rows = conn
         .query(
@@ -1824,15 +1902,19 @@ async fn active_memories(conn: &Connection) -> Result<Vec<Memory>, String> {
     let mut memories = Vec::new();
 
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        memories.push(Memory {
-            id: row.get::<String>(0).map_err(|error| error.to_string())?,
-            created_at_ms: row.get::<i64>(1).map_err(|error| error.to_string())?,
-            kind: row.get::<String>(2).map_err(|error| error.to_string())?,
-            text: row.get::<String>(3).map_err(|error| error.to_string())?,
-        });
+        memories.push(memory_from_row(&row)?);
     }
 
     Ok(memories)
+}
+
+fn memory_from_row(row: &Row) -> Result<Memory, String> {
+    Ok(Memory {
+        id: row.get::<String>(0).map_err(|error| error.to_string())?,
+        created_at_ms: row.get::<i64>(1).map_err(|error| error.to_string())?,
+        kind: row.get::<String>(2).map_err(|error| error.to_string())?,
+        text: row.get::<String>(3).map_err(|error| error.to_string())?,
+    })
 }
 
 fn normalized_memory_text(text: &str) -> String {
@@ -3702,6 +3784,211 @@ async fn session_by_id(conn: &Connection, session_id: &str) -> Result<Option<Ses
     }))
 }
 
+async fn latest_session(conn: &Connection) -> Result<Option<Session>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT id, task, branch, started_at_ms, ended_at_ms, final_summary
+            FROM sessions
+            WHERE project_id = ?1
+            ORDER BY COALESCE(ended_at_ms, started_at_ms) DESC
+            LIMIT 1
+            ",
+            params![LOCAL_PROJECT_ID],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+
+    Ok(Some(Session {
+        id: row.get::<String>(0).map_err(|error| error.to_string())?,
+        task: row.get::<String>(1).map_err(|error| error.to_string())?,
+        branch: row
+            .get::<Option<String>>(2)
+            .map_err(|error| error.to_string())?,
+        started_at_ms: row.get::<i64>(3).map_err(|error| error.to_string())?,
+        ended_at_ms: row
+            .get::<Option<i64>>(4)
+            .map_err(|error| error.to_string())?,
+        final_summary: row
+            .get::<Option<String>>(5)
+            .map_err(|error| error.to_string())?,
+    }))
+}
+
+async fn next_unpromoted_ended_session(conn: &Connection) -> Result<Option<Session>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT id, task, branch, started_at_ms, ended_at_ms, final_summary
+            FROM sessions AS s
+            WHERE s.project_id = ?1
+              AND s.ended_at_ms IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM session_promotions AS p
+                  WHERE p.session_id = s.id
+              )
+              AND (
+                  TRIM(COALESCE(s.final_summary, '')) <> ''
+                  OR EXISTS (
+                      SELECT 1
+                      FROM session_events AS e
+                      WHERE e.session_id = s.id
+                  )
+              )
+            ORDER BY s.ended_at_ms ASC, s.started_at_ms ASC
+            LIMIT 1
+            ",
+            params![LOCAL_PROJECT_ID],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+
+    Ok(Some(Session {
+        id: row.get::<String>(0).map_err(|error| error.to_string())?,
+        task: row.get::<String>(1).map_err(|error| error.to_string())?,
+        branch: row
+            .get::<Option<String>>(2)
+            .map_err(|error| error.to_string())?,
+        started_at_ms: row.get::<i64>(3).map_err(|error| error.to_string())?,
+        ended_at_ms: row
+            .get::<Option<i64>>(4)
+            .map_err(|error| error.to_string())?,
+        final_summary: row
+            .get::<Option<String>>(5)
+            .map_err(|error| error.to_string())?,
+    }))
+}
+
+async fn session_events(
+    conn: &Connection,
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<SessionFact>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let limit = i64::try_from(limit).map_err(|error| error.to_string())?;
+    let mut rows = conn
+        .query(
+            "
+            SELECT session_id, kind, detail, created_at_ms
+            FROM session_events
+            WHERE session_id = ?1
+            ORDER BY created_at_ms ASC
+            LIMIT ?2
+            ",
+            params![session_id.to_string(), limit],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut facts = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        facts.push(SessionFact {
+            session_id: row.get::<String>(0).map_err(|error| error.to_string())?,
+            kind: row.get::<String>(1).map_err(|error| error.to_string())?,
+            detail: row.get::<String>(2).map_err(|error| error.to_string())?,
+            created_at_ms: row.get::<i64>(3).map_err(|error| error.to_string())?,
+        });
+    }
+
+    Ok(facts)
+}
+
+async fn session_promotion_facts(
+    conn: &Connection,
+    session: &Session,
+) -> Result<Vec<SessionFact>, String> {
+    let mut facts = session_events(conn, &session.id, 12).await?;
+    if let Some(summary) = session
+        .final_summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+    {
+        facts.push(SessionFact {
+            session_id: session.id.clone(),
+            kind: "summary".to_string(),
+            detail: summary.to_string(),
+            created_at_ms: session.ended_at_ms.unwrap_or(session.started_at_ms),
+        });
+    }
+    Ok(facts)
+}
+
+async fn promoted_memory_for_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<Memory>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT m.id, m.created_at_ms, m.kind, m.text
+            FROM session_promotions AS p
+            JOIN memories AS m ON m.id = p.memory_id
+            WHERE p.session_id = ?1
+            LIMIT 1
+            ",
+            params![session_id.to_string()],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+
+    memory_from_row(&row).map(Some)
+}
+
+async fn insert_session_promotion(
+    conn: &Connection,
+    session_id: &str,
+    memory_id: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "
+        INSERT INTO session_promotions (session_id, memory_id, promoted_at_ms)
+        VALUES (?1, ?2, ?3)
+        ",
+        params![session_id.to_string(), memory_id.to_string(), now_ms()?],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn session_promotion_text(session: &Session, facts: &[SessionFact]) -> String {
+    let facts = facts
+        .iter()
+        .map(session_promotion_fact_text)
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "Session '{}' produced durable findings: {}",
+        session.task, facts
+    )
+}
+
+fn session_promotion_fact_text(fact: &SessionFact) -> String {
+    let prefix = format!("{}:", fact.kind);
+    if fact.detail.starts_with(&prefix) {
+        fact.detail.clone()
+    } else {
+        format!("{}: {}", fact.kind, fact.detail)
+    }
+}
+
 fn session_fact_score(fact: &SessionFact, terms: &[String]) -> usize {
     let text = format!("{} {}", fact.kind, fact.detail).to_lowercase();
     terms
@@ -4311,6 +4598,7 @@ mod tests {
         assert!(object_exists(&conn, "table", "discovered_files").await);
         assert!(object_exists(&conn, "table", "sessions").await);
         assert!(object_exists(&conn, "table", "session_events").await);
+        assert!(object_exists(&conn, "table", "session_promotions").await);
         assert!(object_exists(&conn, "table", "code_symbols").await);
         assert!(object_exists(&conn, "table", "code_references").await);
         assert!(object_exists(&conn, "table", "sync_runs").await);
@@ -4342,7 +4630,8 @@ mod tests {
                 (4, "sessions".to_string()),
                 (5, "code_symbols".to_string()),
                 (6, "code_references".to_string()),
-                (7, "sync_history".to_string())
+                (7, "sync_history".to_string()),
+                (8, "session_promotions".to_string())
             ]
         );
     }
@@ -4895,6 +5184,107 @@ mod tests {
         assert!(facts.iter().any(|fact| {
             fact.kind == "daemon_observation" && fact.detail.contains("src/lib.rs")
         }));
+    }
+
+    #[tokio::test]
+    async fn promotes_latest_session_facts_to_memory() {
+        let test = TestStore::new("session_promotion");
+        test.store
+            .start_session("stabilize plugin registry")
+            .await
+            .unwrap();
+        test.store
+            .record_session_event("command", "command: cargo test; status: 0")
+            .await
+            .unwrap();
+
+        let promoted = test.store.promote_latest_session().await.unwrap();
+
+        assert_eq!(promoted.fact_count, 1);
+        assert_eq!(promoted.memory.kind, "fact");
+        assert!(promoted.memory.text.contains("stabilize plugin registry"));
+        assert!(
+            promoted
+                .memory
+                .text
+                .contains("command: cargo test; status: 0")
+        );
+        assert!(!promoted.memory.text.contains("command: command:"));
+
+        let memories = test
+            .store
+            .recall("plugin registry cargo test", 5)
+            .await
+            .unwrap();
+        assert!(
+            memories
+                .iter()
+                .any(|memory| memory.id == promoted.memory.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn promotes_latest_session_only_once() {
+        let test = TestStore::new("session_promotion_idempotent");
+        test.store
+            .start_session("stabilize plugin registry")
+            .await
+            .unwrap();
+        test.store
+            .record_session_event("command", "command: cargo test; status: 0")
+            .await
+            .unwrap();
+
+        let first = test.store.promote_latest_session().await.unwrap();
+        let second = test.store.promote_latest_session().await.unwrap();
+        let conn = test.store.connect().await.unwrap();
+
+        assert_eq!(second.memory.id, first.memory.id);
+        assert_eq!(table_row_count(&conn, "memories").await.unwrap(), 1);
+        assert_eq!(
+            table_row_count(&conn, "session_promotions").await.unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn promotes_next_unpromoted_ended_session() {
+        let test = TestStore::new("session_auto_promotion");
+        test.store
+            .start_session("capture plugin registry discovery")
+            .await
+            .unwrap();
+        test.store
+            .record_session_event("command", "command: cargo test plugin_registry; status: 0")
+            .await
+            .unwrap();
+        test.store
+            .end_session(Some("plugin registry tests passed"))
+            .await
+            .unwrap();
+
+        let promoted = test
+            .store
+            .promote_next_unpromoted_session()
+            .await
+            .unwrap()
+            .unwrap();
+        let skipped = test.store.promote_next_unpromoted_session().await.unwrap();
+
+        assert!(skipped.is_none());
+        assert_eq!(promoted.fact_count, 2);
+        assert!(
+            promoted
+                .memory
+                .text
+                .contains("plugin registry tests passed")
+        );
+        assert!(
+            promoted
+                .memory
+                .text
+                .contains("command: cargo test plugin_registry; status: 0")
+        );
     }
 
     async fn insert_memory_for_sync(
