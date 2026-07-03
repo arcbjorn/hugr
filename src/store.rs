@@ -9,11 +9,13 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HUGR_DIR: &str = ".hugr";
 const HUGR_DB: &str = "hugr.db";
 const LOCAL_PROJECT_ID: &str = "project_local";
+static SESSION_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StorageMode {
@@ -1016,32 +1018,22 @@ impl Store {
         self.init().await?;
         let conn = self.connect().await?;
         let session_id = active_session_id(&conn).await?;
-        let created_at_ms = now_ms()?;
-        let event = SessionEvent {
-            id: format!("evt_{created_at_ms}"),
-            session_id,
-            kind: kind.trim().to_string(),
-            detail: detail.trim().to_string(),
-            created_at_ms,
+        insert_session_event(&conn, session_id, kind, detail).await
+    }
+
+    pub(crate) async fn record_session_event_if_active(
+        &self,
+        kind: &str,
+        detail: &str,
+    ) -> Result<Option<SessionEvent>, String> {
+        self.init().await?;
+        let conn = self.connect().await?;
+        let Some(session_id) = active_session_id_optional(&conn).await? else {
+            return Ok(None);
         };
-
-        conn.execute(
-            "
-            INSERT INTO session_events (id, session_id, kind, detail, created_at_ms)
-            VALUES (?1, ?2, ?3, ?4, ?5)
-            ",
-            params![
-                event.id.clone(),
-                event.session_id.clone(),
-                event.kind.clone(),
-                event.detail.clone(),
-                event.created_at_ms
-            ],
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-
-        Ok(event)
+        insert_session_event(&conn, session_id, kind, detail)
+            .await
+            .map(Some)
     }
 
     pub async fn end_session(&self, summary: Option<&str>) -> Result<Session, String> {
@@ -3606,6 +3598,14 @@ fn current_branch() -> Result<Option<String>, String> {
 }
 
 async fn active_session_id(conn: &Connection) -> Result<String, String> {
+    let Some(session_id) = active_session_id_optional(conn).await? else {
+        return Err("no active session; run `hugr session start <task>` first".to_string());
+    };
+
+    Ok(session_id)
+}
+
+async fn active_session_id_optional(conn: &Connection) -> Result<Option<String>, String> {
     let mut rows = conn
         .query(
             "
@@ -3621,10 +3621,51 @@ async fn active_session_id(conn: &Connection) -> Result<String, String> {
         .map_err(|error| error.to_string())?;
 
     let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
-        return Err("no active session; run `hugr session start <task>` first".to_string());
+        return Ok(None);
     };
 
-    row.get::<String>(0).map_err(|error| error.to_string())
+    row.get::<String>(0)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+async fn insert_session_event(
+    conn: &Connection,
+    session_id: String,
+    kind: &str,
+    detail: &str,
+) -> Result<SessionEvent, String> {
+    let created_at_ms = now_ms()?;
+    let event = SessionEvent {
+        id: session_event_id(created_at_ms),
+        session_id,
+        kind: kind.trim().to_string(),
+        detail: detail.trim().to_string(),
+        created_at_ms,
+    };
+
+    conn.execute(
+        "
+        INSERT INTO session_events (id, session_id, kind, detail, created_at_ms)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ",
+        params![
+            event.id.clone(),
+            event.session_id.clone(),
+            event.kind.clone(),
+            event.detail.clone(),
+            event.created_at_ms
+        ],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+
+    Ok(event)
+}
+
+fn session_event_id(created_at_ms: i64) -> String {
+    let sequence = SESSION_EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("evt_{created_at_ms}_{sequence}")
 }
 
 async fn session_by_id(conn: &Connection, session_id: &str) -> Result<Option<Session>, String> {
@@ -4818,6 +4859,42 @@ mod tests {
 
         assert!(facts.iter().any(|fact| fact.kind == "test"));
         assert!(facts.iter().any(|fact| fact.kind == "summary"));
+    }
+
+    #[tokio::test]
+    async fn records_session_event_only_when_session_is_active() {
+        let test = TestStore::new("optional_session_event");
+
+        let skipped = test
+            .store
+            .record_session_event_if_active("daemon_observation", "files changed: src/lib.rs")
+            .await
+            .unwrap();
+        assert!(skipped.is_none());
+
+        let session = test
+            .store
+            .start_session("observe daemon edits")
+            .await
+            .unwrap();
+        let recorded = test
+            .store
+            .record_session_event_if_active("daemon_observation", "files changed: src/lib.rs")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(recorded.session_id, session.id);
+        assert_eq!(recorded.kind, "daemon_observation");
+
+        let facts = test
+            .store
+            .recent_session_facts("daemon edits", 5)
+            .await
+            .unwrap();
+        assert!(facts.iter().any(|fact| {
+            fact.kind == "daemon_observation" && fact.detail.contains("src/lib.rs")
+        }));
     }
 
     async fn insert_memory_for_sync(
