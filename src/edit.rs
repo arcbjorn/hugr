@@ -1608,22 +1608,23 @@ mod tests {
         let destination = "pub fn existing() {}\n";
         let caller = "use crate::lib::helper;\n\nfn main() {\n    let _ = helper();\n}\n";
         let target =
-            resolve_symbol_in_source("src/lib.rs", source, "helper", None, "move").unwrap();
+            resolve_symbol_in_source("src/plugin_hooks.rs", source, "helper", None, "move")
+                .unwrap();
         let references = vec![
             CodeReference {
                 path: "src/main.rs".to_string(),
                 language: Some("rust".to_string()),
-                target_path: "src/lib.rs".to_string(),
+                target_path: "src/plugin_hooks.rs".to_string(),
                 target_name: "helper".to_string(),
                 target_kind: "function".to_string(),
                 kind: "import".to_string(),
                 line_start: 1,
-                excerpt: "use crate::lib::helper;".to_string(),
+                excerpt: "use crate::plugin_hooks::helper;".to_string(),
             },
             CodeReference {
                 path: "src/main.rs".to_string(),
                 language: Some("rust".to_string()),
-                target_path: "src/lib.rs".to_string(),
+                target_path: "src/plugin_hooks.rs".to_string(),
                 target_name: "helper".to_string(),
                 target_kind: "function".to_string(),
                 kind: "call".to_string(),
@@ -1638,7 +1639,10 @@ mod tests {
             source,
             "src/helpers.rs",
             destination,
-            vec![("src/main.rs".to_string(), caller.to_string())],
+            vec![(
+                "src/main.rs".to_string(),
+                caller.replace("crate::lib::helper", "crate::plugin_hooks::helper"),
+            )],
             true,
         )
         .unwrap();
