@@ -466,11 +466,12 @@ fn plan_reference_rewrites(
         for reference in &references {
             line_numbers.insert(reference.line_start);
         }
-        let (rewritten, replacement_count) = replace_qualified_path_on_lines(
+        let (rewritten, replacement_count) = rewrite_rust_references_on_lines(
             &path,
             contents,
-            &old_qualified,
-            &new_qualified,
+            &old_module,
+            &new_module,
+            &target.name,
             &line_numbers,
         )?;
         if replacement_count == 0 {
@@ -516,33 +517,45 @@ fn rust_module_path_for_source(path: &str) -> Option<String> {
     Some(module)
 }
 
-fn replace_qualified_path_on_lines(
+fn rewrite_rust_references_on_lines(
     path: &str,
     contents: &str,
-    old_qualified: &str,
-    new_qualified: &str,
+    old_module: &str,
+    new_module: &str,
+    symbol_name: &str,
     line_numbers: &BTreeSet<i64>,
 ) -> Result<(String, usize), String> {
     let trailing_newline = contents.ends_with('\n');
     let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
     let mut replacement_count = 0;
+    let old_qualified = format!("{old_module}::{symbol_name}");
+    let new_qualified = format!("{new_module}::{symbol_name}");
+    let old_module_leaf = rust_module_leaf(old_module);
 
-    for line_number in line_numbers {
+    for line_number in line_numbers.iter().rev() {
         if *line_number < 1 {
             return Err(format!(
                 "move-symbol reference line {line_number} in {path} is invalid"
             ));
         }
         let index = usize::try_from(line_number - 1).map_err(|error| error.to_string())?;
-        let Some(line) = lines.get_mut(index) else {
+        let Some(line) = lines.get(index) else {
             return Err(format!(
                 "move-symbol reference line {line_number} is past end of {path}"
             ));
         };
-        let count = line.matches(old_qualified).count();
-        if count > 0 {
-            *line = line.replace(old_qualified, new_qualified);
-            replacement_count += count;
+        let (rewritten, line_replacements) = rewrite_rust_reference_line(
+            line,
+            old_module,
+            new_module,
+            &old_module_leaf,
+            symbol_name,
+            &old_qualified,
+            &new_qualified,
+        );
+        if line_replacements > 0 {
+            lines.splice(index..=index, rewritten);
+            replacement_count += line_replacements;
         }
     }
 
@@ -551,6 +564,150 @@ fn replace_qualified_path_on_lines(
         rendered.push('\n');
     }
     Ok((rendered, replacement_count))
+}
+
+fn rust_module_leaf(module_path: &str) -> String {
+    module_path
+        .rsplit("::")
+        .next()
+        .unwrap_or(module_path)
+        .to_string()
+}
+
+fn rewrite_rust_reference_line(
+    line: &str,
+    old_module: &str,
+    new_module: &str,
+    old_module_leaf: &str,
+    symbol_name: &str,
+    old_qualified: &str,
+    new_qualified: &str,
+) -> (Vec<String>, usize) {
+    let (rewritten, qualified_replacements) =
+        replace_rust_path_in_line(line, old_qualified, new_qualified);
+    if qualified_replacements > 0 {
+        return (vec![rewritten], qualified_replacements);
+    }
+
+    if let Some((rewritten, import_replacements)) =
+        rewrite_rust_braced_use_line(line, old_module, new_module, symbol_name)
+    {
+        return (rewritten, import_replacements);
+    }
+
+    let old_leaf_qualified = format!("{old_module_leaf}::{symbol_name}");
+    let (rewritten, leaf_replacements) =
+        replace_rust_path_in_line(line, &old_leaf_qualified, new_qualified);
+    (vec![rewritten], leaf_replacements)
+}
+
+fn replace_rust_path_in_line(line: &str, old_path: &str, new_path: &str) -> (String, usize) {
+    let mut rendered = String::new();
+    let mut cursor = 0;
+    let mut replacements = 0;
+
+    for (start, matched) in line.match_indices(old_path) {
+        let end = start + matched.len();
+        if !rust_path_boundary_before(line[..start].chars().next_back())
+            || !rust_path_boundary_after(line[end..].chars().next())
+        {
+            continue;
+        }
+        rendered.push_str(&line[cursor..start]);
+        rendered.push_str(new_path);
+        cursor = end;
+        replacements += 1;
+    }
+
+    if replacements == 0 {
+        return (line.to_string(), 0);
+    }
+    rendered.push_str(&line[cursor..]);
+    (rendered, replacements)
+}
+
+fn rust_path_boundary_before(char: Option<char>) -> bool {
+    char.is_none_or(|char| !(char.is_alphanumeric() || char == '_' || char == ':'))
+}
+
+fn rust_path_boundary_after(char: Option<char>) -> bool {
+    char.is_none_or(|char| !(char.is_alphanumeric() || char == '_'))
+}
+
+fn rewrite_rust_braced_use_line(
+    line: &str,
+    old_module: &str,
+    new_module: &str,
+    symbol_name: &str,
+) -> Option<(Vec<String>, usize)> {
+    let trimmed = line.trim();
+    if trimmed.contains("//") || !trimmed.ends_with(';') {
+        return None;
+    }
+
+    let marker = format!("{old_module}::{{");
+    let marker_start = line.find(&marker)?;
+    let brace_start = marker_start + old_module.len() + "::".len();
+    let brace_end = line[brace_start..].find('}')? + brace_start;
+    if !line[brace_end + 1..].trim().eq(";") {
+        return None;
+    }
+
+    let item_text = &line[brace_start + 1..brace_end];
+    let items = split_simple_rust_use_items(item_text)?;
+    let mut moved_items = Vec::new();
+    let mut kept_items = Vec::new();
+    for item in items {
+        if rust_use_item_imports_symbol(&item, symbol_name) {
+            moved_items.push(item);
+        } else {
+            kept_items.push(item);
+        }
+    }
+    if moved_items.is_empty() {
+        return None;
+    }
+
+    let before_module = &line[..marker_start];
+    let mut rewritten = Vec::new();
+    if !kept_items.is_empty() {
+        rewritten.push(format!(
+            "{before_module}{old_module}::{{{}}};",
+            kept_items.join(", ")
+        ));
+    }
+    rewritten.push(format!(
+        "{before_module}{new_module}::{{{}}};",
+        moved_items.join(", ")
+    ));
+    Some((rewritten, moved_items.len()))
+}
+
+fn split_simple_rust_use_items(items: &str) -> Option<Vec<String>> {
+    let mut parsed = Vec::new();
+    for item in items.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if item.contains('{') || item.contains('}') || item.contains("::") {
+            return None;
+        }
+        parsed.push(item.to_string());
+    }
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+fn rust_use_item_imports_symbol(item: &str, symbol_name: &str) -> bool {
+    let imported = item
+        .split_once(" as ")
+        .map(|(name, _alias)| name.trim())
+        .unwrap_or_else(|| item.trim());
+    imported == symbol_name
 }
 
 fn language_for_path(path: &str) -> Option<&'static str> {
@@ -1661,5 +1818,107 @@ mod tests {
                 .render_json()
                 .contains("\"rewritten_reference_count\":1")
         );
+    }
+
+    #[test]
+    fn plans_move_with_braced_rust_import_rewrite() {
+        let source = "pub fn helper() -> u8 {\n    1\n}\n\npub fn other() {}\n";
+        let destination = "pub fn existing() {}\n";
+        let caller =
+            "use crate::plugin_hooks::{helper, other};\n\nfn main() {\n    let _ = helper();\n}\n";
+        let target =
+            resolve_symbol_in_source("src/plugin_hooks.rs", source, "helper", None, "move")
+                .unwrap();
+        let references = vec![
+            CodeReference {
+                path: "src/main.rs".to_string(),
+                language: Some("rust".to_string()),
+                target_path: "src/plugin_hooks.rs".to_string(),
+                target_name: "helper".to_string(),
+                target_kind: "function".to_string(),
+                kind: "import".to_string(),
+                line_start: 1,
+                excerpt: "use crate::plugin_hooks::{helper, other};".to_string(),
+            },
+            CodeReference {
+                path: "src/main.rs".to_string(),
+                language: Some("rust".to_string()),
+                target_path: "src/plugin_hooks.rs".to_string(),
+                target_name: "helper".to_string(),
+                target_kind: "function".to_string(),
+                kind: "call".to_string(),
+                line_start: 4,
+                excerpt: "helper();".to_string(),
+            },
+        ];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "src/helpers.rs",
+            destination,
+            vec![("src/main.rs".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+        let caller_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/main.rs")
+            .unwrap();
+
+        assert!(
+            caller_file
+                .contents
+                .contains("use crate::plugin_hooks::{other};")
+        );
+        assert!(
+            caller_file
+                .contents
+                .contains("use crate::helpers::{helper};")
+        );
+        assert!(caller_file.contents.contains("helper();"));
+        assert_eq!(planned.summary.rewritten_reference_count, 1);
+    }
+
+    #[test]
+    fn plans_move_with_module_qualified_rust_call_rewrite() {
+        let source = "pub fn helper() -> u8 {\n    1\n}\n";
+        let destination = "pub fn existing() {}\n";
+        let caller = "fn main() {\n    let _ = plugin_hooks::helper();\n}\n";
+        let target =
+            resolve_symbol_in_source("src/plugin_hooks.rs", source, "helper", None, "move")
+                .unwrap();
+        let references = vec![CodeReference {
+            path: "src/main.rs".to_string(),
+            language: Some("rust".to_string()),
+            target_path: "src/plugin_hooks.rs".to_string(),
+            target_name: "helper".to_string(),
+            target_kind: "function".to_string(),
+            kind: "call".to_string(),
+            line_start: 2,
+            excerpt: "let _ = plugin_hooks::helper();".to_string(),
+        }];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "src/helpers.rs",
+            destination,
+            vec![("src/main.rs".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+        let caller_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/main.rs")
+            .unwrap();
+
+        assert!(caller_file.contents.contains("crate::helpers::helper();"));
+        assert!(!caller_file.contents.contains("plugin_hooks::helper"));
+        assert_eq!(planned.summary.rewritten_reference_count, 1);
     }
 }
