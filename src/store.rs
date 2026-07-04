@@ -1171,10 +1171,23 @@ impl Store {
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
         let timestamps = local_index_timestamps(&conn, &paths).await?;
+        let latest_context_pack_updated_at_ms =
+            local_latest_context_pack_updated_at_ms(&conn).await?;
+        let edit_events =
+            local_edit_freshness_events_after(&conn, latest_context_pack_updated_at_ms).await?;
+        let mut signals = freshness_signals_from_index_timestamps(
+            paths.clone(),
+            timestamps,
+            freshness_scan_limit(limit),
+        );
+        signals.extend(freshness_signals_from_edit_events(
+            &paths,
+            latest_context_pack_updated_at_ms,
+            &edit_events,
+            freshness_scan_limit(limit),
+        ));
 
-        Ok(freshness_signals_from_index_timestamps(
-            paths, timestamps, limit,
-        ))
+        Ok(finalize_freshness_signals(signals, limit))
     }
 
     pub async fn record_diagnostics(
@@ -3666,10 +3679,22 @@ fn context_freshness_signals_via_hugr_api(
 
     let snapshot = fetch_hugr_api_storage_snapshot(config)?;
     let timestamps = storage_index_timestamps(&snapshot, &paths)?;
+    let latest_context_pack_updated_at_ms = storage_latest_context_pack_updated_at_ms(&snapshot)?;
+    let edit_events =
+        storage_edit_freshness_events_after(&snapshot, latest_context_pack_updated_at_ms);
+    let mut signals = freshness_signals_from_index_timestamps(
+        paths.clone(),
+        timestamps,
+        freshness_scan_limit(limit),
+    );
+    signals.extend(freshness_signals_from_edit_events(
+        &paths,
+        latest_context_pack_updated_at_ms,
+        &edit_events,
+        freshness_scan_limit(limit),
+    ));
 
-    Ok(freshness_signals_from_index_timestamps(
-        paths, timestamps, limit,
-    ))
+    Ok(finalize_freshness_signals(signals, limit))
 }
 
 async fn local_index_timestamps(
@@ -3748,6 +3773,64 @@ async fn local_index_timestamps(
     Ok(timestamps)
 }
 
+async fn local_latest_context_pack_updated_at_ms(conn: &Connection) -> Result<Option<i64>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT updated_at_ms
+            FROM context_packs
+            WHERE project_id = ?1
+            ORDER BY updated_at_ms DESC
+            LIMIT 1
+            ",
+            params![LOCAL_PROJECT_ID],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    rows.next()
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|row| row.get::<i64>(0).map_err(|error| error.to_string()))
+        .transpose()
+}
+
+async fn local_edit_freshness_events_after(
+    conn: &Connection,
+    latest_context_pack_updated_at_ms: Option<i64>,
+) -> Result<Vec<EditFreshnessEvent>, String> {
+    let Some(latest_context_pack_updated_at_ms) = latest_context_pack_updated_at_ms else {
+        return Ok(Vec::new());
+    };
+
+    let mut rows = conn
+        .query(
+            "
+            SELECT e.detail, e.created_at_ms
+            FROM session_events AS e
+            JOIN sessions AS s ON s.id = e.session_id
+            WHERE s.project_id = ?1
+              AND e.kind = 'edit'
+              AND e.created_at_ms > ?2
+            ORDER BY e.created_at_ms DESC
+            LIMIT 200
+            ",
+            params![LOCAL_PROJECT_ID, latest_context_pack_updated_at_ms],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut events = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        events.push(EditFreshnessEvent {
+            detail: row.get::<String>(0).map_err(|error| error.to_string())?,
+            created_at_ms: row.get::<i64>(1).map_err(|error| error.to_string())?,
+        });
+    }
+
+    Ok(events)
+}
+
 fn storage_index_timestamps(
     snapshot: &HugrApiStorageSnapshot,
     paths: &[String],
@@ -3778,6 +3861,46 @@ fn storage_index_timestamps(
     Ok(timestamps)
 }
 
+fn storage_latest_context_pack_updated_at_ms(
+    snapshot: &HugrApiStorageSnapshot,
+) -> Result<Option<i64>, String> {
+    storage_payload_records(snapshot, SyncTableKind::ContextPacks)
+        .into_iter()
+        .map(|value| context_pack_sync_record_from_value(&value).map(|record| record.updated_at_ms))
+        .try_fold(None, |latest, updated_at_ms| {
+            updated_at_ms.map(|updated_at_ms| {
+                Some(
+                    latest
+                        .map(|latest: i64| latest.max(updated_at_ms))
+                        .unwrap_or(updated_at_ms),
+                )
+            })
+        })
+}
+
+fn storage_edit_freshness_events_after(
+    snapshot: &HugrApiStorageSnapshot,
+    latest_context_pack_updated_at_ms: Option<i64>,
+) -> Vec<EditFreshnessEvent> {
+    let Some(latest_context_pack_updated_at_ms) = latest_context_pack_updated_at_ms else {
+        return Vec::new();
+    };
+
+    let mut events = snapshot
+        .session_events
+        .iter()
+        .filter(|event| event.kind == "edit")
+        .filter(|event| event.created_at_ms > latest_context_pack_updated_at_ms)
+        .map(|event| EditFreshnessEvent {
+            detail: event.detail.clone(),
+            created_at_ms: event.created_at_ms,
+        })
+        .collect::<Vec<_>>();
+    events.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+    events.truncate(200);
+    events
+}
+
 fn freshness_paths(files: &[String], symbols: &[CodeSymbol]) -> Vec<String> {
     let mut paths = files
         .iter()
@@ -3788,6 +3911,10 @@ fn freshness_paths(files: &[String], symbols: &[CodeSymbol]) -> Vec<String> {
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn freshness_scan_limit(limit: usize) -> usize {
+    limit.saturating_mul(3).max(limit)
 }
 
 fn freshness_signals_from_index_timestamps(
@@ -3833,8 +3960,69 @@ fn freshness_signals_from_index_timestamps(
     signals
 }
 
+fn freshness_signals_from_edit_events(
+    paths: &[String],
+    latest_context_pack_updated_at_ms: Option<i64>,
+    edit_events: &[EditFreshnessEvent],
+    limit: usize,
+) -> Vec<FreshnessSignal> {
+    let Some(latest_context_pack_updated_at_ms) = latest_context_pack_updated_at_ms else {
+        return Vec::new();
+    };
+
+    let mut seen_paths = HashSet::new();
+    let mut signals = Vec::new();
+    for event in edit_events {
+        if event.created_at_ms <= latest_context_pack_updated_at_ms {
+            continue;
+        }
+
+        for path in paths {
+            if signals.len() >= limit {
+                return signals;
+            }
+            if !seen_paths.contains(path) && edit_event_mentions_path(&event.detail, path) {
+                seen_paths.insert(path.clone());
+                signals.push(FreshnessSignal {
+                    detail: format!(
+                        "{path} has a Hugr edit event after the latest persisted context pack ({} > {}): {}",
+                        event.created_at_ms,
+                        latest_context_pack_updated_at_ms,
+                        event.detail
+                    ),
+                    path: path.clone(),
+                    kind: "edit_after_context".to_string(),
+                    indexed_at_ms: Some(latest_context_pack_updated_at_ms),
+                    modified_at_ms: Some(event.created_at_ms),
+                });
+            }
+        }
+    }
+
+    signals
+}
+
+fn edit_event_mentions_path(detail: &str, path: &str) -> bool {
+    detail.contains(path)
+}
+
+fn finalize_freshness_signals(
+    mut signals: Vec<FreshnessSignal>,
+    limit: usize,
+) -> Vec<FreshnessSignal> {
+    signals.sort_by(|left, right| {
+        freshness_kind_rank(&right.kind)
+            .cmp(&freshness_kind_rank(&left.kind))
+            .then_with(|| right.modified_at_ms.cmp(&left.modified_at_ms))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    signals.truncate(limit);
+    signals
+}
+
 fn freshness_kind_rank(kind: &str) -> usize {
     match kind {
+        "edit_after_context" => 3,
         "stale_index" => 2,
         "missing_index" => 1,
         _ => 0,
@@ -6207,6 +6395,12 @@ struct DiagnosticSyncRecord {
     code: Option<String>,
     message: String,
     command: Option<String>,
+    created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditFreshnessEvent {
+    detail: String,
     created_at_ms: i64,
 }
 
@@ -10319,7 +10513,7 @@ mod tests {
     use libsql::{Connection, params};
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     struct TestStore {
         store: Store,
@@ -12439,6 +12633,46 @@ mod tests {
         assert_eq!(signals[0].path, source_path);
         assert_eq!(signals[0].kind, "missing_index");
         assert!(signals[0].modified_at_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn context_freshness_signals_report_edits_after_context() {
+        let test = TestStore::new("context_freshness_edit_after_context");
+        let source_dir = test.workspace.join("src");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source_path = source_dir.join("plugin_hooks.rs");
+        fs::write(&source_path, "pub fn run_after_config() {}\n").unwrap();
+        let source_path = source_path.to_string_lossy().to_string();
+
+        test.store
+            .record_context_pack("plugin hooks", "{}")
+            .await
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        test.store.start_session("edit plugin hooks").await.unwrap();
+        test.store
+            .record_session_event(
+                "edit",
+                &format!(
+                    "replace-symbol function run_after_config at {source_path}:1-1 -> {source_path}:1-1"
+                ),
+            )
+            .await
+            .unwrap();
+
+        let signals = test
+            .store
+            .context_freshness_signals(std::slice::from_ref(&source_path), &[], 10)
+            .await
+            .unwrap();
+        let edit_signal = signals
+            .iter()
+            .find(|signal| signal.kind == "edit_after_context")
+            .expect("edit-after-context signal should be present");
+
+        assert_eq!(edit_signal.path, source_path);
+        assert!(edit_signal.detail.contains("latest persisted context pack"));
+        assert!(edit_signal.indexed_at_ms < edit_signal.modified_at_ms);
     }
 
     #[tokio::test]
