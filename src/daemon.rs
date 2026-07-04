@@ -433,6 +433,10 @@ async fn response_for_request_with_api_token(
         return http_response(400, "application/json", r#"{"error":"bad_request"}"#);
     };
 
+    if parsed.path.starts_with("/v1/memories") {
+        return response_for_memory_api_request(&parsed, api_token.as_deref()).await;
+    }
+
     if parsed.path.starts_with("/v1/sync/") {
         return response_for_sync_api_request(&parsed, state, api_token.as_deref()).await;
     }
@@ -488,6 +492,48 @@ async fn response_for_sync_api_request(
             http_response(405, "application/json", r#"{"error":"method_not_allowed"}"#)
         }
         _ => http_response(404, "application/json", r#"{"error":"not_found"}"#),
+    }
+}
+
+async fn response_for_memory_api_request(request: &HttpRequest, api_token: Option<&str>) -> String {
+    if let Some(response) = sync_api_auth_failure_response(request, api_token) {
+        return response;
+    }
+
+    let route = request.path.split('?').next().unwrap_or(&request.path);
+    match (request.method.as_str(), route) {
+        ("GET", "/v1/memories") => match Store::open_current().api_memory_records().await {
+            Ok(records) => http_response(
+                200,
+                "application/json",
+                &render_memory_records_response_json(&records),
+            ),
+            Err(error) => http_response(500, "application/json", &render_error_json(&error)),
+        },
+        ("POST", "/v1/memories") => response_for_memory_api_apply(&request.body).await,
+        (_, "/v1/memories") => {
+            http_response(405, "application/json", r#"{"error":"method_not_allowed"}"#)
+        }
+        _ => http_response(404, "application/json", r#"{"error":"not_found"}"#),
+    }
+}
+
+async fn response_for_memory_api_apply(body: &str) -> String {
+    let request = match parse_memory_api_apply_request(body) {
+        Ok(request) => request,
+        Err(error) => return http_response(400, "application/json", &render_error_json(&error)),
+    };
+
+    match Store::open_current()
+        .apply_api_memory_storage_payloads(&request.table_payloads)
+        .await
+    {
+        Ok((status, payloads)) => http_response(
+            200,
+            "application/json",
+            &render_memory_apply_response_json(&status, &payloads),
+        ),
+        Err(error) => http_response(500, "application/json", &render_error_json(&error)),
     }
 }
 
@@ -635,6 +681,29 @@ fn request_header(request: &HttpRequest, name: &str) -> Option<String> {
 struct SyncApiOperationRequest {
     dry_run: bool,
     table_payloads: Vec<SyncApiTablePayload>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct MemoryApiApplyRequest {
+    table_payloads: Vec<SyncApiTablePayload>,
+}
+
+fn parse_memory_api_apply_request(body: &str) -> Result<MemoryApiApplyRequest, String> {
+    let value =
+        serde_json::from_str::<Value>(body).map_err(|error| format!("invalid JSON: {error}"))?;
+    let contract_version = json_string_field(&value, "contract_version")?;
+    if contract_version != HUGR_API_CONTRACT_VERSION {
+        return Err(format!(
+            "unsupported Hugr API contract version '{contract_version}'"
+        ));
+    }
+
+    Ok(MemoryApiApplyRequest {
+        table_payloads: json_array_field(&value, "tables")?
+            .iter()
+            .map(parse_sync_api_table_payload)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
 }
 
 fn parse_sync_api_operation_request(
@@ -825,6 +894,24 @@ fn render_sync_history_response_json(history: &[SyncRunHistory]) -> String {
     .to_string()
 }
 
+fn render_memory_records_response_json(records: &[Value]) -> String {
+    json!({
+        "status": "ok",
+        "contract_version": HUGR_API_CONTRACT_VERSION,
+        "records": records
+    })
+    .to_string()
+}
+
+fn render_memory_apply_response_json(status: &str, payloads: &[SyncApiTablePayload]) -> String {
+    json!({
+        "status": status,
+        "contract_version": HUGR_API_CONTRACT_VERSION,
+        "tables": payloads.iter().map(sync_api_table_payload_value).collect::<Vec<_>>()
+    })
+    .to_string()
+}
+
 fn sync_run_history_value(run: &SyncRunHistory) -> Value {
     json!({
         "id": run.id,
@@ -1004,8 +1091,8 @@ impl DaemonState {
 mod tests {
     use super::{
         DaemonState, HUGR_API_CONTRACT_VERSION, is_ignored_watch_path,
-        render_discovery_capture_detail, render_session_observation_detail, request_line_parts,
-        response_for_request_with_api_token,
+        parse_memory_api_apply_request, render_discovery_capture_detail,
+        render_session_observation_detail, request_line_parts, response_for_request_with_api_token,
     };
     use crate::indexer::{IndexClassification, IndexSummary};
     use crate::worktree::{ChangedFile, WorktreeState};
@@ -1093,6 +1180,48 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
         assert!(response.contains("hugr API auth token is not configured"));
+    }
+
+    #[tokio::test]
+    async fn memory_api_requires_configured_token() {
+        let response = response_for_request_with_api_token(
+            "GET /v1/memories HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            local_peer_addr(),
+            &DaemonState::default(),
+            None,
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(response.contains("hugr API auth token is not configured"));
+    }
+
+    #[test]
+    fn parses_memory_api_apply_request() {
+        let body = format!(
+            r#"{{
+                "contract_version": "{HUGR_API_CONTRACT_VERSION}",
+                "tables": [
+                    {{
+                        "class": "memories",
+                        "table": "memories",
+                        "row_count": 1,
+                        "inserted_count": 0,
+                        "updated_count": 0,
+                        "skipped_count": 0,
+                        "conflict_count": 0,
+                        "executed": false,
+                        "conflicts": [],
+                        "records": []
+                    }}
+                ]
+            }}"#
+        );
+
+        let parsed = parse_memory_api_apply_request(&body).unwrap();
+
+        assert_eq!(parsed.table_payloads.len(), 1);
+        assert_eq!(parsed.table_payloads[0].result.table, "memories");
     }
 
     #[tokio::test]
