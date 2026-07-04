@@ -1,5 +1,6 @@
-use crate::code::{self, CodeSymbol};
+use crate::code::{self, CodeReference, CodeSymbol};
 use crate::context::json_string;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::Path;
 
@@ -14,6 +15,19 @@ pub(crate) struct PlannedReplacement {
     pub summary: SymbolReplacement,
 }
 
+/// A reference-aware symbol rename that has been validated but not yet written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedRename {
+    pub files: Vec<PlannedRenameFile>,
+    pub summary: SymbolRename,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedRenameFile {
+    pub path: String,
+    pub contents: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SymbolReplacement {
     pub path: String,
@@ -24,6 +38,25 @@ pub(crate) struct SymbolReplacement {
     pub old_line_end: i64,
     pub new_line_start: i64,
     pub new_line_end: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SymbolRename {
+    pub target_path: String,
+    pub language: Option<String>,
+    pub old_name: String,
+    pub new_name: String,
+    pub kind: String,
+    pub line_start: i64,
+    pub line_end: i64,
+    pub reference_count: usize,
+    pub changed_files: Vec<SymbolRenameFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SymbolRenameFile {
+    pub path: String,
+    pub replacement_count: usize,
 }
 
 /// Plan a safe, symbol-aware replacement of one top-level symbol in a source file.
@@ -59,7 +92,7 @@ pub(crate) fn plan_replacement(
     let language_label = language.unwrap_or("unknown");
 
     let symbols = code::symbols_in_source(path, language, contents)?;
-    let target = resolve_target(&symbols, name, kind)?;
+    let target = resolve_target(&symbols, name, kind, "replace")?;
 
     let old_line_start = target.line_start;
     let old_line_end = target.line_end.unwrap_or(target.line_start);
@@ -87,6 +120,122 @@ pub(crate) fn plan_replacement(
     })
 }
 
+pub(crate) fn resolve_symbol_in_source(
+    path: &str,
+    contents: &str,
+    name: &str,
+    kind: Option<&str>,
+    action: &str,
+) -> Result<CodeSymbol, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("{action}-symbol requires a symbol name"));
+    }
+
+    let language = language_for_path(path);
+    let symbols = code::symbols_in_source(path, language, contents)?;
+    resolve_target(&symbols, name, kind, action)
+}
+
+pub(crate) fn plan_rename(
+    target: &CodeSymbol,
+    references: &[CodeReference],
+    files: Vec<(String, String)>,
+    new_name: &str,
+) -> Result<PlannedRename, String> {
+    let new_name = new_name.trim();
+    if !valid_identifier(new_name) {
+        return Err(
+            "rename-symbol requires a valid ASCII identifier for the new symbol name".to_string(),
+        );
+    }
+    if new_name == target.name {
+        return Err("rename-symbol new name must differ from the current name".to_string());
+    }
+
+    let mut contents_by_path = files.into_iter().collect::<BTreeMap<_, _>>();
+    if !contents_by_path.contains_key(&target.path) {
+        return Err(format!(
+            "rename-symbol requires source contents for target file {}",
+            target.path
+        ));
+    }
+
+    reject_target_name_collision(target, contents_by_path.get(&target.path).unwrap(), new_name)?;
+
+    let mut lines_by_path = BTreeMap::<String, BTreeSet<i64>>::new();
+    lines_by_path
+        .entry(target.path.clone())
+        .or_default()
+        .insert(target.line_start);
+    for reference in references
+        .iter()
+        .filter(|reference| reference.target_path == target.path)
+        .filter(|reference| reference.target_name == target.name)
+    {
+        lines_by_path
+            .entry(reference.path.clone())
+            .or_default()
+            .insert(reference.line_start);
+    }
+
+    let mut planned_files = Vec::new();
+    let mut changed_files = Vec::new();
+    for (path, line_numbers) in lines_by_path {
+        let Some(contents) = contents_by_path.remove(&path) else {
+            return Err(format!(
+                "rename-symbol missing source contents for referenced file {path}; rerun hugr index"
+            ));
+        };
+        let (renamed, replacement_count) =
+            replace_identifier_on_lines(&path, &contents, &target.name, new_name, &line_numbers)?;
+        if replacement_count == 0 {
+            return Err(format!(
+                "rename-symbol found no occurrences of '{}' in selected lines for {path}",
+                target.name
+            ));
+        }
+        let language = language_for_path(&path);
+        if !code::parses_cleanly(&path, language, &renamed)? {
+            return Err(format!(
+                "renamed source in {path} is not valid {} code; refusing to write partial refactor",
+                language.unwrap_or("unknown")
+            ));
+        }
+        planned_files.push(PlannedRenameFile {
+            path: path.clone(),
+            contents: renamed,
+        });
+        changed_files.push(SymbolRenameFile {
+            path,
+            replacement_count,
+        });
+    }
+
+    validate_renamed_target(target, new_name, &planned_files)?;
+    changed_files.sort_by(|left, right| left.path.cmp(&right.path));
+    planned_files.sort_by(|left, right| left.path.cmp(&right.path));
+
+    Ok(PlannedRename {
+        files: planned_files,
+        summary: SymbolRename {
+            target_path: target.path.clone(),
+            language: target.language.clone(),
+            old_name: target.name.clone(),
+            new_name: new_name.to_string(),
+            kind: target.kind.clone(),
+            line_start: target.line_start,
+            line_end: target.line_end.unwrap_or(target.line_start),
+            reference_count: references
+                .iter()
+                .filter(|reference| reference.target_path == target.path)
+                .filter(|reference| reference.target_name == target.name)
+                .count(),
+            changed_files,
+        },
+    })
+}
+
 fn language_for_path(path: &str) -> Option<&'static str> {
     crate::discovery::language_for(Path::new(path))
 }
@@ -95,6 +244,7 @@ fn resolve_target(
     symbols: &[CodeSymbol],
     name: &str,
     kind: Option<&str>,
+    action: &str,
 ) -> Result<CodeSymbol, String> {
     let kind = kind.map(str::trim).filter(|kind| !kind.is_empty());
     let matches = symbols
@@ -105,13 +255,18 @@ fn resolve_target(
         .collect::<Vec<_>>();
 
     match matches.as_slice() {
-        [] => Err(no_match_error(symbols, name, kind)),
+        [] => Err(no_match_error(symbols, name, kind, action)),
         [single] => Ok(single.clone()),
         many => Err(ambiguous_error(many, name)),
     }
 }
 
-fn no_match_error(symbols: &[CodeSymbol], name: &str, kind: Option<&str>) -> String {
+fn no_match_error(
+    symbols: &[CodeSymbol],
+    name: &str,
+    kind: Option<&str>,
+    action: &str,
+) -> String {
     let known = symbols
         .iter()
         .filter(|symbol| symbol.name == name)
@@ -120,15 +275,15 @@ fn no_match_error(symbols: &[CodeSymbol], name: &str, kind: Option<&str>) -> Str
 
     if let Some(kind) = kind {
         if known.is_empty() {
-            format!("no symbol named '{name}' found to replace")
+            format!("no symbol named '{name}' found to {action}")
         } else {
             format!(
-                "no {kind} named '{name}' found to replace; found {}",
+                "no {kind} named '{name}' found to {action}; found {}",
                 known.join(", ")
             )
         }
     } else {
-        format!("no symbol named '{name}' found to replace")
+        format!("no symbol named '{name}' found to {action}")
     }
 }
 
