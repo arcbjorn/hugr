@@ -17,6 +17,10 @@ pub enum Command {
         format: OutputFormat,
     },
     Index,
+    Symbols {
+        query: String,
+        format: OutputFormat,
+    },
     Impact {
         target: String,
         format: OutputFormat,
@@ -123,6 +127,13 @@ impl Command {
                 })
             }
             "index" => Ok(Self::Index),
+            "symbols" => {
+                let text = required_text_output(args, "symbols")?;
+                Ok(Self::Symbols {
+                    query: text.value,
+                    format: text.format,
+                })
+            }
             "impact" => {
                 let text = required_text_output(args, "impact")?;
                 Ok(Self::Impact {
@@ -550,7 +561,7 @@ fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions,
 }
 
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr impact [--json] <file-or-symbol>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
 }
 
 #[cfg(test)]
@@ -602,6 +613,23 @@ mod tests {
     fn parses_index_command() {
         let args = vec!["hugr".into(), "index".into()];
         assert_eq!(Command::parse(&args), Ok(Command::Index));
+    }
+
+    #[test]
+    fn parses_symbols_command() {
+        let args = vec![
+            "hugr".into(),
+            "symbols".into(),
+            "--json".into(),
+            "PluginHooks".into(),
+        ];
+        assert_eq!(
+            Command::parse(&args),
+            Ok(Command::Symbols {
+                query: "PluginHooks".into(),
+                format: OutputFormat::Json
+            })
+        );
     }
 
     #[test]
