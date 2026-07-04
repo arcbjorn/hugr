@@ -759,7 +759,7 @@ fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions,
 }
 
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr replace-symbol [--json] [--kind <kind>] <path> <symbol> (--body <source> | --body-file <path>)\n  hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>\n  hugr move-symbol [--json] [--kind <kind>] <source-path> <symbol> <destination-path>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr replace-symbol [--json] [--kind <kind>] <path> <symbol> (--body <source> | --body-file <path>)\n  hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>\n  hugr move-symbol [--json] [--kind <kind>] [--rewrite-references] <source-path> <symbol> <destination-path>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
 }
 
 #[cfg(test)]
@@ -940,7 +940,30 @@ mod tests {
                 name: "helper".into(),
                 destination_path: "src/helpers.rs".into(),
                 kind: Some("function".into()),
+                rewrite_references: false,
                 format: OutputFormat::Json,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_move_symbol_with_reference_rewrite() {
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "move-symbol".into(),
+                "--rewrite-references".into(),
+                "src/lib.rs".into(),
+                "helper".into(),
+                "src/helpers.rs".into(),
+            ]),
+            Ok(Command::MoveSymbol {
+                source_path: "src/lib.rs".into(),
+                name: "helper".into(),
+                destination_path: "src/helpers.rs".into(),
+                kind: None,
+                rewrite_references: true,
+                format: OutputFormat::Markdown,
             })
         );
     }
