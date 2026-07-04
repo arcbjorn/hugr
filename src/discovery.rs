@@ -300,7 +300,7 @@ fn normalized_relative_path(path: &Path) -> String {
         .join("/")
 }
 
-fn language_for(path: &Path) -> Option<&'static str> {
+pub(crate) fn language_for(path: &Path) -> Option<&'static str> {
     match path.extension().and_then(|extension| extension.to_str())? {
         "rs" => Some("rust"),
         "toml" => Some("toml"),
