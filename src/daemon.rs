@@ -437,6 +437,10 @@ async fn response_for_request_with_api_token(
         return response_for_memory_api_request(&parsed, api_token.as_deref()).await;
     }
 
+    if parsed.path.starts_with("/v1/storage") {
+        return response_for_storage_api_request(&parsed, api_token.as_deref()).await;
+    }
+
     if parsed.path.starts_with("/v1/sync/") {
         return response_for_sync_api_request(&parsed, state, api_token.as_deref()).await;
     }
@@ -532,6 +536,65 @@ async fn response_for_memory_api_apply(body: &str) -> String {
             200,
             "application/json",
             &render_memory_apply_response_json(&status, &payloads),
+        ),
+        Err(error) => http_response(500, "application/json", &render_error_json(&error)),
+    }
+}
+
+async fn response_for_storage_api_request(
+    request: &HttpRequest,
+    api_token: Option<&str>,
+) -> String {
+    if let Some(response) = sync_api_auth_failure_response(request, api_token) {
+        return response;
+    }
+
+    let route = request.path.split('?').next().unwrap_or(&request.path);
+    match (request.method.as_str(), route) {
+        ("GET", "/v1/storage") => match Store::open_current().api_storage_records().await {
+            Ok((payloads, session_events, session_promotions)) => http_response(
+                200,
+                "application/json",
+                &render_storage_records_response_json(
+                    &payloads,
+                    &session_events,
+                    &session_promotions,
+                ),
+            ),
+            Err(error) => http_response(500, "application/json", &render_error_json(&error)),
+        },
+        ("POST", "/v1/storage") => response_for_storage_api_apply(&request.body).await,
+        (_, "/v1/storage") => {
+            http_response(405, "application/json", r#"{"error":"method_not_allowed"}"#)
+        }
+        _ => http_response(404, "application/json", r#"{"error":"not_found"}"#),
+    }
+}
+
+async fn response_for_storage_api_apply(body: &str) -> String {
+    let request = match parse_storage_api_apply_request(body) {
+        Ok(request) => request,
+        Err(error) => return http_response(400, "application/json", &render_error_json(&error)),
+    };
+
+    match Store::open_current()
+        .apply_api_storage_payloads(
+            &request.table_payloads,
+            &request.session_events,
+            &request.session_promotions,
+            &request.replace_code_index_paths,
+        )
+        .await
+    {
+        Ok((status, payloads, session_events_table, session_promotions_table)) => http_response(
+            200,
+            "application/json",
+            &render_storage_apply_response_json(
+                &status,
+                &payloads,
+                &session_events_table,
+                &session_promotions_table,
+            ),
         ),
         Err(error) => http_response(500, "application/json", &render_error_json(&error)),
     }
@@ -688,6 +751,14 @@ struct MemoryApiApplyRequest {
     table_payloads: Vec<SyncApiTablePayload>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct StorageApiApplyRequest {
+    table_payloads: Vec<SyncApiTablePayload>,
+    session_events: Vec<Value>,
+    session_promotions: Vec<Value>,
+    replace_code_index_paths: Vec<String>,
+}
+
 fn parse_memory_api_apply_request(body: &str) -> Result<MemoryApiApplyRequest, String> {
     let value =
         serde_json::from_str::<Value>(body).map_err(|error| format!("invalid JSON: {error}"))?;
@@ -703,6 +774,27 @@ fn parse_memory_api_apply_request(body: &str) -> Result<MemoryApiApplyRequest, S
             .iter()
             .map(parse_sync_api_table_payload)
             .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn parse_storage_api_apply_request(body: &str) -> Result<StorageApiApplyRequest, String> {
+    let value =
+        serde_json::from_str::<Value>(body).map_err(|error| format!("invalid JSON: {error}"))?;
+    let contract_version = json_string_field(&value, "contract_version")?;
+    if contract_version != HUGR_API_CONTRACT_VERSION {
+        return Err(format!(
+            "unsupported Hugr API contract version '{contract_version}'"
+        ));
+    }
+
+    Ok(StorageApiApplyRequest {
+        table_payloads: json_array_field(&value, "tables")?
+            .iter()
+            .map(parse_sync_api_table_payload)
+            .collect::<Result<Vec<_>, _>>()?,
+        session_events: optional_json_array_field(&value, "session_events"),
+        session_promotions: optional_json_array_field(&value, "session_promotions"),
+        replace_code_index_paths: optional_string_array_field(&value, "replace_code_index_paths")?,
     })
 }
 
@@ -776,6 +868,32 @@ fn json_array_field<'a>(value: &'a Value, field: &str) -> Result<&'a Vec<Value>,
         .get(field)
         .and_then(Value::as_array)
         .ok_or_else(|| format!("Hugr API request missing array field '{field}'"))
+}
+
+fn optional_json_array_field(value: &Value, field: &str) -> Vec<Value> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn optional_string_array_field(value: &Value, field: &str) -> Result<Vec<String>, String> {
+    let Some(values) = value.get(field) else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = values.as_array() else {
+        return Err(format!("Hugr API request field '{field}' must be an array"));
+    };
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("Hugr API request field '{field}' must contain strings"))
+        })
+        .collect()
 }
 
 fn json_string_field(value: &Value, field: &str) -> Result<String, String> {
@@ -908,6 +1026,37 @@ fn render_memory_apply_response_json(status: &str, payloads: &[SyncApiTablePaylo
         "status": status,
         "contract_version": HUGR_API_CONTRACT_VERSION,
         "tables": payloads.iter().map(sync_api_table_payload_value).collect::<Vec<_>>()
+    })
+    .to_string()
+}
+
+fn render_storage_records_response_json(
+    payloads: &[SyncApiTablePayload],
+    session_events: &[Value],
+    session_promotions: &[Value],
+) -> String {
+    json!({
+        "status": "ok",
+        "contract_version": HUGR_API_CONTRACT_VERSION,
+        "tables": payloads.iter().map(sync_api_table_payload_value).collect::<Vec<_>>(),
+        "session_events": session_events,
+        "session_promotions": session_promotions
+    })
+    .to_string()
+}
+
+fn render_storage_apply_response_json(
+    status: &str,
+    payloads: &[SyncApiTablePayload],
+    session_events_table: &SyncTableResult,
+    session_promotions_table: &SyncTableResult,
+) -> String {
+    json!({
+        "status": status,
+        "contract_version": HUGR_API_CONTRACT_VERSION,
+        "tables": payloads.iter().map(sync_api_table_payload_value).collect::<Vec<_>>(),
+        "session_events_table": sync_table_result_value(session_events_table),
+        "session_promotions_table": sync_table_result_value(session_promotions_table)
     })
     .to_string()
 }
@@ -1091,8 +1240,9 @@ impl DaemonState {
 mod tests {
     use super::{
         DaemonState, HUGR_API_CONTRACT_VERSION, is_ignored_watch_path,
-        parse_memory_api_apply_request, render_discovery_capture_detail,
-        render_session_observation_detail, request_line_parts, response_for_request_with_api_token,
+        parse_memory_api_apply_request, parse_storage_api_apply_request,
+        render_discovery_capture_detail, render_session_observation_detail, request_line_parts,
+        response_for_request_with_api_token,
     };
     use crate::indexer::{IndexClassification, IndexSummary};
     use crate::worktree::{ChangedFile, WorktreeState};
@@ -1222,6 +1372,54 @@ mod tests {
 
         assert_eq!(parsed.table_payloads.len(), 1);
         assert_eq!(parsed.table_payloads[0].result.table, "memories");
+    }
+
+    #[test]
+    fn parses_storage_api_apply_request() {
+        let body = format!(
+            r#"{{
+                "contract_version": "{HUGR_API_CONTRACT_VERSION}",
+                "replace_code_index_paths": ["src/lib.rs"],
+                "session_events": [
+                    {{
+                        "id": "evt_1_0",
+                        "session_id": "ses_1",
+                        "kind": "note",
+                        "detail": "indexed",
+                        "created_at_ms": 2
+                    }}
+                ],
+                "session_promotions": [
+                    {{
+                        "session_id": "ses_1",
+                        "memory_id": "mem_1",
+                        "promoted_at_ms": 3
+                    }}
+                ],
+                "tables": [
+                    {{
+                        "class": "entities",
+                        "table": "code_symbols",
+                        "row_count": 1,
+                        "inserted_count": 0,
+                        "updated_count": 0,
+                        "skipped_count": 0,
+                        "conflict_count": 0,
+                        "executed": false,
+                        "conflicts": [],
+                        "records": []
+                    }}
+                ]
+            }}"#
+        );
+
+        let parsed = parse_storage_api_apply_request(&body).unwrap();
+
+        assert_eq!(parsed.table_payloads.len(), 1);
+        assert_eq!(parsed.table_payloads[0].result.table, "code_symbols");
+        assert_eq!(parsed.session_events.len(), 1);
+        assert_eq!(parsed.session_promotions.len(), 1);
+        assert_eq!(parsed.replace_code_index_paths, vec!["src/lib.rs"]);
     }
 
     #[tokio::test]
