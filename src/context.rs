@@ -9,6 +9,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 4000;
+const LARGE_SYMBOL_LINE_THRESHOLD: i64 = 80;
+const VERY_LARGE_SYMBOL_LINE_THRESHOLD: i64 = 200;
+const REFACTOR_SURFACE_FILE_THRESHOLD: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextPack {
@@ -1365,6 +1368,14 @@ fn build_risk_signals(
         }
     }
 
+    if let Some(signal) = refactor_surface_signal(graph_neighbors) {
+        signals.push(signal);
+    }
+
+    if let Some(signal) = large_symbol_health_signal(symbols) {
+        signals.push(signal);
+    }
+
     let stale_index_paths = freshness_signals
         .iter()
         .filter(|signal| signal.kind == "stale_index")
@@ -1471,6 +1482,107 @@ fn build_risk_signals(
             .then_with(|| left.kind.cmp(&right.kind))
     });
     signals
+}
+
+fn refactor_surface_signal(graph_neighbors: &[ContextGraphNeighbor]) -> Option<ContextRiskSignal> {
+    let reference_neighbors = graph_neighbors
+        .iter()
+        .filter(|neighbor| {
+            matches!(
+                neighbor.kind.as_str(),
+                "incoming_reference" | "outgoing_reference" | "path_reference"
+            )
+        })
+        .collect::<Vec<_>>();
+    if reference_neighbors.is_empty() {
+        return None;
+    }
+
+    let mut files = reference_neighbors
+        .iter()
+        .flat_map(|neighbor| [neighbor.path.as_deref(), neighbor.target_path.as_deref()])
+        .flatten()
+        .filter(|path| !path.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+
+    if files.len() < REFACTOR_SURFACE_FILE_THRESHOLD {
+        return None;
+    }
+
+    let reference_labels = reference_neighbors
+        .iter()
+        .map(|neighbor| neighbor.label.clone())
+        .collect::<Vec<_>>();
+    let severity = if files.len() >= 5 || reference_neighbors.len() >= 8 {
+        "high"
+    } else {
+        "medium"
+    };
+
+    Some(context_risk_signal(
+        severity,
+        "refactor_surface",
+        format!(
+            "code graph references span {} files: {}; sample references: {}",
+            files.len(),
+            summarize_values(&files, 4),
+            summarize_values(&reference_labels, 2)
+        ),
+        700 + files.len() * 25 + reference_neighbors.len() * 10,
+        "code graph neighbors cross multiple files",
+    ))
+}
+
+fn large_symbol_health_signal(symbols: &[ContextSymbol]) -> Option<ContextRiskSignal> {
+    let mut large_symbols = symbols
+        .iter()
+        .filter_map(|symbol| {
+            let line_end = symbol.line_end?;
+            let span = line_end.checked_sub(symbol.line_start)?.checked_add(1)?;
+            (span >= LARGE_SYMBOL_LINE_THRESHOLD).then_some((span, symbol))
+        })
+        .collect::<Vec<_>>();
+
+    large_symbols.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.path.cmp(&right.1.path))
+            .then_with(|| left.1.name.cmp(&right.1.name))
+            .then_with(|| left.1.kind.cmp(&right.1.kind))
+    });
+
+    let highest_span = large_symbols.first().map(|(span, _)| *span)?;
+    let summaries = large_symbols
+        .iter()
+        .map(|(span, symbol)| {
+            let line_end = symbol.line_end.unwrap_or(symbol.line_start);
+            format!(
+                "{} {} spans {span} lines at {}:{}-{}",
+                symbol.kind, symbol.name, symbol.path, symbol.line_start, line_end
+            )
+        })
+        .collect::<Vec<_>>();
+    let severity = if highest_span >= VERY_LARGE_SYMBOL_LINE_THRESHOLD {
+        "high"
+    } else {
+        "medium"
+    };
+    let bounded_span = highest_span.min(250) as usize;
+
+    Some(context_risk_signal(
+        severity,
+        "large_symbol",
+        format!(
+            "large indexed symbols may need careful edits: {}",
+            summarize_values(&summaries, 3)
+        ),
+        690 + bounded_span + large_symbols.len() * 15,
+        "indexed symbol line ranges exceed deterministic size threshold",
+    ))
 }
 
 fn context_risk_signal(
@@ -2205,6 +2317,56 @@ mod tests {
     }
 
     #[test]
+    fn cross_file_references_render_as_refactor_surface_risks() {
+        let pack =
+            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
+                "refactor plugin hooks",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                Vec::new(),
+                vec![
+                    GraphNeighbor {
+                        kind: "incoming_reference".to_string(),
+                        label: "src/main.rs:8 references function run_after_config".to_string(),
+                        detail: "call reference to function run_after_config".to_string(),
+                        path: Some("src/main.rs".to_string()),
+                        target_path: Some("src/plugin_hooks.rs".to_string()),
+                        target_name: Some("run_after_config".to_string()),
+                        line_start: Some(8),
+                    },
+                    GraphNeighbor {
+                        kind: "incoming_reference".to_string(),
+                        label: "src/worker.rs:14 references function run_after_config".to_string(),
+                        detail: "call reference to function run_after_config".to_string(),
+                        path: Some("src/worker.rs".to_string()),
+                        target_path: Some("src/plugin_hooks.rs".to_string()),
+                        target_name: Some("run_after_config".to_string()),
+                        line_start: Some(14),
+                    },
+                ],
+                Vec::new(),
+                Vec::new(),
+            );
+
+        let markdown = pack.render_markdown();
+        let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
+        let risk_kinds = parsed["risk_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|risk| risk["kind"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(risk_kinds.contains(&"refactor_surface"));
+        assert!(markdown.contains("risk:refactor_surface [risk]"));
+        assert!(markdown.contains("code graph references span 3 files"));
+    }
+
+    #[test]
     fn freshness_signals_render_as_risk_signals() {
         let pack =
             ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
@@ -2244,6 +2406,44 @@ mod tests {
 
         assert!(pack.render_markdown().contains("risk:stale_index [risk]"));
         assert!(risk_kinds.contains(&"stale_index"));
+    }
+
+    #[test]
+    fn large_symbols_render_as_code_health_risks() {
+        let pack = ContextPack::with_sessions_symbols_tests_and_branch(
+            "refactor plugin hooks",
+            vec!["src/plugin_hooks.rs".to_string()],
+            Vec::new(),
+            Vec::new(),
+            vec![CodeSymbol {
+                path: "src/plugin_hooks.rs".to_string(),
+                language: Some("rust".to_string()),
+                name: "run_after_config".to_string(),
+                kind: "function".to_string(),
+                line_start: 12,
+                line_end: Some(105),
+                signature: "pub fn run_after_config()".to_string(),
+            }],
+            vec![TestCandidate {
+                path: "tests/plugin_hooks.rs".to_string(),
+                reason: "repository tests directory match".to_string(),
+                score: 50,
+            }],
+            None,
+        );
+
+        let markdown = pack.render_markdown();
+        let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
+        let risk_kinds = parsed["risk_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|risk| risk["kind"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(risk_kinds.contains(&"large_symbol"));
+        assert!(markdown.contains("risk:large_symbol [risk]"));
+        assert!(markdown.contains("function run_after_config spans 94 lines"));
     }
 
     #[test]
