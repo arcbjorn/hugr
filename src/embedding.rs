@@ -19,7 +19,6 @@ impl Embedding {
         self.vector.len()
     }
 
-    #[cfg(test)]
     pub fn to_f32_blob(&self) -> Vec<u8> {
         let mut blob = Vec::with_capacity(self.vector.len() * 4);
         for value in &self.vector {
