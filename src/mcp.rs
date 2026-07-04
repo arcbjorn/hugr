@@ -113,6 +113,7 @@ async fn handle_tool_call(params: Value) -> Result<Value, String> {
         "hugr_impact" => tool_impact(&arguments).await,
         "hugr_replace_symbol" => tool_replace_symbol(&arguments).await,
         "hugr_rename_symbol" => tool_rename_symbol(&arguments).await,
+        "hugr_move_symbol" => tool_move_symbol(&arguments).await,
         "hugr_forget" => tool_forget(&arguments).await,
         unknown => Err(format!("unknown tool '{unknown}'")),
     }
@@ -409,6 +410,76 @@ async fn tool_rename_symbol(arguments: &Value) -> Result<Value, String> {
     Ok(tool_result(summary.render_markdown(), structured))
 }
 
+async fn tool_move_symbol(arguments: &Value) -> Result<Value, String> {
+    let source_path = required_string(arguments, "source_path")?;
+    let name = required_string(arguments, "name")?;
+    let destination_path = required_string(arguments, "destination_path")?;
+    let kind = optional_string(arguments, "kind")?;
+
+    let store = Store::open_current();
+    if !store.supports_local_source_edits()? {
+        return Err(
+            "hugr_move_symbol edits the local working tree and is not available in remote Hugr API mode"
+                .to_string(),
+        );
+    }
+
+    indexer::index_project(5000).await?;
+
+    let source_contents = std::fs::read_to_string(&source_path)
+        .map_err(|error| format!("hugr_move_symbol cannot read {source_path}: {error}"))?;
+    let destination_contents = read_optional_destination(&destination_path, "hugr_move_symbol")?;
+    let target = edit::resolve_symbol_in_source(
+        &source_path,
+        &source_contents,
+        &name,
+        kind.as_deref(),
+        "move",
+    )?;
+    let references = store
+        .references_to_symbols(std::slice::from_ref(&target), 2000)
+        .await?;
+    let planned = edit::plan_move(
+        &target,
+        &references,
+        &source_contents,
+        &destination_path,
+        &destination_contents,
+    )?;
+
+    for file in &planned.files {
+        std::fs::write(&file.path, &file.contents)
+            .map_err(|error| format!("hugr_move_symbol cannot write {}: {error}", file.path))?;
+    }
+
+    indexer::index_project(5000).await?;
+
+    let summary = &planned.summary;
+    let detail = format!(
+        "move-symbol {} {} from {}:{}-{} to {}",
+        summary.kind,
+        summary.name,
+        summary.source_path,
+        summary.old_line_start,
+        summary.old_line_end,
+        summary.destination_path
+    );
+    store
+        .record_session_event_if_active("edit", &detail)
+        .await?;
+
+    let structured = serde_json::from_str(&summary.render_json()).unwrap_or_else(|_| json!({}));
+    Ok(tool_result(summary.render_markdown(), structured))
+}
+
+fn read_optional_destination(path: &str, command: &str) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(format!("{command} cannot read {path}: {error}")),
+    }
+}
+
 fn tools() -> Vec<Value> {
     vec![
         tool_schema(
@@ -476,6 +547,15 @@ fn tools() -> Vec<Value> {
                 ("new_name", "string"),
             ],
         ),
+        tool_schema(
+            "hugr_move_symbol",
+            "Safely move one unreferenced local symbol from a source file to a destination file. Refuses inbound references, language mismatches, destination collisions, and files that fail to parse after the move.",
+            &[
+                ("source_path", "string"),
+                ("name", "string"),
+                ("destination_path", "string"),
+            ],
+        ),
     ]
 }
 
@@ -526,7 +606,7 @@ fn tool_schema(name: &str, description: &str, properties: &[(&str, &str)]) -> Va
         );
     }
 
-    if name == "hugr_replace_symbol" || name == "hugr_rename_symbol" {
+    if name == "hugr_replace_symbol" || name == "hugr_rename_symbol" || name == "hugr_move_symbol" {
         props.insert(
             "kind".to_string(),
             json!({
@@ -812,6 +892,7 @@ mod tests {
         assert!(names.contains(&"hugr_symbols"));
         assert!(names.contains(&"hugr_replace_symbol"));
         assert!(names.contains(&"hugr_rename_symbol"));
+        assert!(names.contains(&"hugr_move_symbol"));
     }
 
     #[test]
