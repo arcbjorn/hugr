@@ -19,6 +19,10 @@ const SYNC_HISTORY_VERSION: i64 = 7;
 const SYNC_HISTORY_NAME: &str = "sync_history";
 const SESSION_PROMOTIONS_VERSION: i64 = 8;
 const SESSION_PROMOTIONS_NAME: &str = "session_promotions";
+const CONTEXT_PACKS_VERSION: i64 = 9;
+const CONTEXT_PACKS_NAME: &str = "context_packs";
+const DIAGNOSTICS_VERSION: i64 = 10;
+const DIAGNOSTICS_NAME: &str = "diagnostics";
 
 pub async fn migrate(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
@@ -129,6 +133,30 @@ pub async fn migrate(conn: &Connection) -> Result<(), String> {
                 SESSION_PROMOTIONS_NAME,
                 now_ms()?
             ],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    if !applied.contains(&CONTEXT_PACKS_VERSION) {
+        conn.execute_batch(context_packs_sql())
+            .await
+            .map_err(|error| error.to_string())?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![CONTEXT_PACKS_VERSION, CONTEXT_PACKS_NAME, now_ms()?],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    if !applied.contains(&DIAGNOSTICS_VERSION) {
+        conn.execute_batch(diagnostics_sql())
+            .await
+            .map_err(|error| error.to_string())?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![DIAGNOSTICS_VERSION, DIAGNOSTICS_NAME, now_ms()?],
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -302,6 +330,46 @@ fn session_promotions_sql() -> &'static str {
 
     CREATE INDEX IF NOT EXISTS session_promotions_memory_idx
     ON session_promotions(memory_id);
+    "
+}
+
+fn context_packs_sql() -> &'static str {
+    "
+    CREATE TABLE IF NOT EXISTS context_packs (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS context_packs_project_updated_idx
+    ON context_packs(project_id, updated_at_ms DESC);
+    "
+}
+
+fn diagnostics_sql() -> &'static str {
+    "
+    CREATE TABLE IF NOT EXISTS diagnostics (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        path TEXT,
+        line_start INTEGER,
+        line_end INTEGER,
+        severity TEXT NOT NULL,
+        code TEXT,
+        message TEXT NOT NULL,
+        command TEXT,
+        created_at_ms INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS diagnostics_project_created_idx
+    ON diagnostics(project_id, created_at_ms DESC);
+
+    CREATE INDEX IF NOT EXISTS diagnostics_project_path_idx
+    ON diagnostics(project_id, path, line_start);
     "
 }
 
