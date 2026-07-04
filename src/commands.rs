@@ -3,6 +3,7 @@ use crate::code::CodeSymbol;
 use crate::context::{ContextPack, json_string};
 use crate::daemon;
 use crate::discovery;
+use crate::edit;
 use crate::impact as impact_analysis;
 use crate::indexer;
 use crate::mcp;
@@ -29,6 +30,13 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::Index => index().await,
         Command::Symbols { query, format } => symbols(&query, format).await,
         Command::Impact { target, format } => impact(&target, format).await,
+        Command::ReplaceSymbol {
+            path,
+            name,
+            kind,
+            body,
+            format,
+        } => replace_symbol(&path, &name, kind.as_deref(), &body, format).await,
         Command::ProjectStatus => project_status().await,
         Command::SessionStart { task } => session_start(&task).await,
         Command::SessionEvent { kind, detail } => session_event(&kind, &detail).await,
@@ -255,6 +263,54 @@ async fn impact(target: &str, format: OutputFormat) -> Result<(), String> {
         println!("{}", report.render_json());
     } else {
         print!("{}", report.render_markdown());
+    }
+
+    Ok(())
+}
+
+async fn replace_symbol(
+    path: &str,
+    name: &str,
+    kind: Option<&str>,
+    body: &str,
+    format: OutputFormat,
+) -> Result<(), String> {
+    let store = Store::open_current();
+    if !store.supports_local_source_edits()? {
+        return Err(
+            "hugr replace-symbol edits the local working tree and is not available in remote Hugr API mode"
+                .to_string(),
+        );
+    }
+
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| format!("hugr replace-symbol cannot read {path}: {error}"))?;
+    let planned = edit::plan_replacement(path, &contents, name, kind, body)?;
+
+    std::fs::write(path, &planned.contents)
+        .map_err(|error| format!("hugr replace-symbol cannot write {path}: {error}"))?;
+
+    // Refresh the index so symbols, impact, and context reflect the edit immediately.
+    indexer::index_project(5000).await?;
+
+    let summary = &planned.summary;
+    let detail = format!(
+        "replace-symbol {} {} at {}:{}-{} -> {}:{}-{}",
+        summary.kind,
+        summary.name,
+        summary.path,
+        summary.old_line_start,
+        summary.old_line_end,
+        summary.path,
+        summary.new_line_start,
+        summary.new_line_end
+    );
+    store.record_session_event_if_active("edit", &detail).await?;
+
+    if format == OutputFormat::Json {
+        println!("{}", summary.render_json());
+    } else {
+        print!("{}", summary.render_markdown());
     }
 
     Ok(())
