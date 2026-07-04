@@ -28,6 +28,19 @@ pub(crate) struct PlannedRenameFile {
     pub contents: String,
 }
 
+/// A multi-file symbol move that has been validated but not yet written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedMove {
+    pub files: Vec<PlannedMoveFile>,
+    pub summary: SymbolMove,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedMoveFile {
+    pub path: String,
+    pub contents: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SymbolReplacement {
     pub path: String,
@@ -57,6 +70,25 @@ pub(crate) struct SymbolRename {
 pub(crate) struct SymbolRenameFile {
     pub path: String,
     pub replacement_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SymbolMove {
+    pub source_path: String,
+    pub destination_path: String,
+    pub language: Option<String>,
+    pub name: String,
+    pub kind: String,
+    pub old_line_start: i64,
+    pub old_line_end: i64,
+    pub moved_line_count: usize,
+    pub changed_files: Vec<SymbolMoveFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SymbolMoveFile {
+    pub path: String,
+    pub action: String,
 }
 
 /// Plan a safe, symbol-aware replacement of one top-level symbol in a source file.
@@ -161,7 +193,11 @@ pub(crate) fn plan_rename(
         ));
     }
 
-    reject_target_name_collision(target, contents_by_path.get(&target.path).unwrap(), new_name)?;
+    reject_target_name_collision(
+        target,
+        contents_by_path.get(&target.path).unwrap(),
+        new_name,
+    )?;
 
     let mut lines_by_path = BTreeMap::<String, BTreeSet<i64>>::new();
     lines_by_path
@@ -236,6 +272,102 @@ pub(crate) fn plan_rename(
     })
 }
 
+pub(crate) fn plan_move(
+    target: &CodeSymbol,
+    references: &[CodeReference],
+    source_contents: &str,
+    destination_path: &str,
+    destination_contents: &str,
+) -> Result<PlannedMove, String> {
+    let destination_path = destination_path.trim();
+    if destination_path.is_empty() {
+        return Err("move-symbol requires a destination path".to_string());
+    }
+    if destination_path == target.path {
+        return Err("move-symbol destination must differ from the source path".to_string());
+    }
+
+    let source_language = language_for_path(&target.path);
+    let destination_language = language_for_path(destination_path);
+    if source_language != destination_language {
+        return Err(format!(
+            "move-symbol requires source and destination languages to match (source: {}, destination: {})",
+            source_language.unwrap_or("unknown"),
+            destination_language.unwrap_or("unknown")
+        ));
+    }
+
+    let inbound_references = references
+        .iter()
+        .filter(|reference| reference.target_path == target.path)
+        .filter(|reference| reference.target_name == target.name)
+        .count();
+    if inbound_references > 0 {
+        return Err(format!(
+            "move-symbol refuses to move '{}' because it has {inbound_references} indexed inbound reference(s); update references first or use a future reference-rewriting move",
+            target.name
+        ));
+    }
+
+    let old_line_start = target.line_start;
+    let old_line_end = target.line_end.unwrap_or(target.line_start);
+    validate_span(old_line_start, old_line_end, &target.path)?;
+
+    reject_destination_symbol_collision(destination_path, destination_contents, target)?;
+
+    let moved_body = extract_line_range(source_contents, old_line_start, old_line_end, &target.path)?;
+    let source_after = remove_line_range(source_contents, old_line_start, old_line_end, &target.path)?;
+    let destination_after = append_symbol_body(destination_contents, &moved_body);
+
+    if !code::parses_cleanly(&target.path, source_language, &source_after)? {
+        return Err(format!(
+            "source file {} would not parse after moving '{}'",
+            target.path, target.name
+        ));
+    }
+    if !code::parses_cleanly(destination_path, destination_language, &destination_after)? {
+        return Err(format!(
+            "destination file {destination_path} would not parse after moving '{}'",
+            target.name
+        ));
+    }
+
+    validate_moved_symbol_in_destination(destination_path, &destination_after, target)?;
+
+    Ok(PlannedMove {
+        files: vec![
+            PlannedMoveFile {
+                path: target.path.clone(),
+                contents: source_after,
+            },
+            PlannedMoveFile {
+                path: destination_path.to_string(),
+                contents: destination_after,
+            },
+        ],
+        summary: SymbolMove {
+            source_path: target.path.clone(),
+            destination_path: destination_path.to_string(),
+            language: target.language.clone(),
+            name: target.name.clone(),
+            kind: target.kind.clone(),
+            old_line_start,
+            old_line_end,
+            moved_line_count: moved_body.lines().count(),
+            changed_files: vec![
+                SymbolMoveFile {
+                    path: target.path.clone(),
+                    action: "removed".to_string(),
+                },
+                SymbolMoveFile {
+                    path: destination_path.to_string(),
+                    action: "appended".to_string(),
+                },
+            ],
+        },
+    })
+}
+
 fn language_for_path(path: &str) -> Option<&'static str> {
     crate::discovery::language_for(Path::new(path))
 }
@@ -261,12 +393,7 @@ fn resolve_target(
     }
 }
 
-fn no_match_error(
-    symbols: &[CodeSymbol],
-    name: &str,
-    kind: Option<&str>,
-    action: &str,
-) -> String {
+fn no_match_error(symbols: &[CodeSymbol], name: &str, kind: Option<&str>, action: &str) -> String {
     let known = symbols
         .iter()
         .filter(|symbol| symbol.name == name)
@@ -467,6 +594,245 @@ fn splice_lines(
     Ok((rendered, new_line_end))
 }
 
+fn extract_line_range(
+    contents: &str,
+    line_start: i64,
+    line_end: i64,
+    path: &str,
+) -> Result<String, String> {
+    let start = usize::try_from(line_start - 1).map_err(|error| error.to_string())?;
+    let end = usize::try_from(line_end - 1).map_err(|error| error.to_string())?;
+    let lines = contents.lines().collect::<Vec<_>>();
+    if end >= lines.len() {
+        return Err(format!(
+            "symbol span ends at line {line_end} but {path} has {} lines",
+            lines.len()
+        ));
+    }
+    Ok(lines[start..=end].join("\n"))
+}
+
+fn remove_line_range(
+    contents: &str,
+    line_start: i64,
+    line_end: i64,
+    path: &str,
+) -> Result<String, String> {
+    let start = usize::try_from(line_start - 1).map_err(|error| error.to_string())?;
+    let end = usize::try_from(line_end - 1).map_err(|error| error.to_string())?;
+    let trailing_newline = contents.ends_with('\n');
+    let lines = contents.lines().collect::<Vec<_>>();
+    if end >= lines.len() {
+        return Err(format!(
+            "symbol span ends at line {line_end} but {path} has {} lines",
+            lines.len()
+        ));
+    }
+
+    let mut result = Vec::with_capacity(lines.len().saturating_sub(end - start + 1));
+    result.extend_from_slice(&lines[..start]);
+    result.extend_from_slice(&lines[end + 1..]);
+
+    let mut rendered = result.join("\n");
+    if trailing_newline && !rendered.is_empty() {
+        rendered.push('\n');
+    }
+    Ok(rendered)
+}
+
+fn append_symbol_body(destination_contents: &str, moved_body: &str) -> String {
+    let moved_body = moved_body.trim_end_matches(['\n', '\r']);
+    if destination_contents.trim().is_empty() {
+        return format!("{moved_body}\n");
+    }
+
+    let mut rendered = destination_contents.trim_end_matches('\n').to_string();
+    rendered.push_str("\n\n");
+    rendered.push_str(moved_body);
+    rendered.push('\n');
+    rendered
+}
+
+fn valid_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|char| char.is_ascii_alphanumeric() || char == '_')
+}
+
+fn reject_destination_symbol_collision(
+    destination_path: &str,
+    destination_contents: &str,
+    target: &CodeSymbol,
+) -> Result<(), String> {
+    let language = language_for_path(destination_path);
+    let symbols = code::symbols_in_source(destination_path, language, destination_contents)?;
+    if symbols
+        .iter()
+        .any(|symbol| symbol.name == target.name && symbol.kind == target.kind)
+    {
+        return Err(format!(
+            "move-symbol would collide with existing {} '{}' in {}",
+            target.kind, target.name, destination_path
+        ));
+    }
+    Ok(())
+}
+
+fn reject_target_name_collision(
+    target: &CodeSymbol,
+    contents: &str,
+    new_name: &str,
+) -> Result<(), String> {
+    let language = language_for_path(&target.path);
+    let symbols = code::symbols_in_source(&target.path, language, contents)?;
+    if symbols.iter().any(|symbol| {
+        symbol.name == new_name
+            && symbol.kind == target.kind
+            && !(symbol.path == target.path
+                && symbol.line_start == target.line_start
+                && symbol.kind == target.kind)
+    }) {
+        return Err(format!(
+            "rename-symbol would collide with existing {} '{}' in {}",
+            target.kind, new_name, target.path
+        ));
+    }
+    Ok(())
+}
+
+fn validate_moved_symbol_in_destination(
+    destination_path: &str,
+    destination_contents: &str,
+    target: &CodeSymbol,
+) -> Result<(), String> {
+    let language = language_for_path(destination_path);
+    let symbols = code::symbols_in_source(destination_path, language, destination_contents)?;
+    let matches = symbols
+        .iter()
+        .filter(|symbol| symbol.name == target.name && symbol.kind == target.kind)
+        .count();
+    if matches != 1 {
+        return Err(format!(
+            "move-symbol could not verify moved {} '{}' in {}",
+            target.kind, target.name, destination_path
+        ));
+    }
+    Ok(())
+}
+
+fn replace_identifier_on_lines(
+    path: &str,
+    contents: &str,
+    old_name: &str,
+    new_name: &str,
+    line_numbers: &BTreeSet<i64>,
+) -> Result<(String, usize), String> {
+    let trailing_newline = contents.ends_with('\n');
+    let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut replacement_count = 0;
+
+    for line_number in line_numbers {
+        if *line_number < 1 {
+            return Err(format!(
+                "rename-symbol reference line {line_number} in {path} is invalid"
+            ));
+        }
+        let index = usize::try_from(line_number - 1).map_err(|error| error.to_string())?;
+        let Some(line) = lines.get_mut(index) else {
+            return Err(format!(
+                "rename-symbol reference line {line_number} is past end of {path}"
+            ));
+        };
+        let (renamed, line_replacements) = replace_identifier_in_line(line, old_name, new_name);
+        if line_replacements == 0 {
+            return Err(format!(
+                "rename-symbol found no '{}' identifier on {path}:{line_number}; rerun hugr index",
+                old_name
+            ));
+        }
+        *line = renamed;
+        replacement_count += line_replacements;
+    }
+
+    let mut rendered = lines.join("\n");
+    if trailing_newline {
+        rendered.push('\n');
+    }
+    Ok((rendered, replacement_count))
+}
+
+fn replace_identifier_in_line(line: &str, old_name: &str, new_name: &str) -> (String, usize) {
+    let mut rendered = String::new();
+    let mut cursor = 0;
+    let mut replacements = 0;
+
+    for (start, matched) in line.match_indices(old_name) {
+        let end = start + matched.len();
+        if !identifier_boundary(line[..start].chars().next_back())
+            || !identifier_boundary(line[end..].chars().next())
+        {
+            continue;
+        }
+        rendered.push_str(&line[cursor..start]);
+        rendered.push_str(new_name);
+        cursor = end;
+        replacements += 1;
+    }
+
+    if replacements == 0 {
+        return (line.to_string(), 0);
+    }
+    rendered.push_str(&line[cursor..]);
+    (rendered, replacements)
+}
+
+fn identifier_boundary(char: Option<char>) -> bool {
+    char.is_none_or(|char| !(char.is_alphanumeric() || char == '_'))
+}
+
+fn validate_renamed_target(
+    target: &CodeSymbol,
+    new_name: &str,
+    planned_files: &[PlannedRenameFile],
+) -> Result<(), String> {
+    let target_file = planned_files
+        .iter()
+        .find(|file| file.path == target.path)
+        .ok_or_else(|| {
+            format!(
+                "rename-symbol did not produce rewritten target file {}",
+                target.path
+            )
+        })?;
+    let language = language_for_path(&target.path);
+    let symbols = code::symbols_in_source(&target.path, language, &target_file.contents)?;
+    let renamed = symbols.iter().filter(|symbol| {
+        symbol.name == new_name
+            && symbol.kind == target.kind
+            && symbol.line_start == target.line_start
+    });
+    if renamed.count() != 1 {
+        return Err(format!(
+            "rename-symbol could not verify renamed {} '{}' at {}:{}",
+            target.kind, new_name, target.path, target.line_start
+        ));
+    }
+    if symbols.iter().any(|symbol| {
+        symbol.name == target.name
+            && symbol.kind == target.kind
+            && symbol.line_start == target.line_start
+    }) {
+        return Err(format!(
+            "rename-symbol left old {} '{}' at {}:{}",
+            target.kind, target.name, target.path, target.line_start
+        ));
+    }
+    Ok(())
+}
+
 impl SymbolReplacement {
     pub(crate) fn render_markdown(&self) -> String {
         let mut rendered = String::new();
@@ -510,9 +876,134 @@ impl SymbolReplacement {
     }
 }
 
+impl SymbolRename {
+    pub(crate) fn render_markdown(&self) -> String {
+        let mut rendered = String::new();
+        rendered.push_str("# Hugr Symbol Rename\n\n");
+        let _ = writeln!(
+            rendered,
+            "## Symbol\n{} {} -> {}",
+            self.kind, self.old_name, self.new_name
+        );
+        let _ = writeln!(
+            rendered,
+            "\n## Location\n{}:{}-{}",
+            self.target_path, self.line_start, self.line_end
+        );
+        let _ = writeln!(
+            rendered,
+            "\n## Language\n{}",
+            self.language.as_deref().unwrap_or("unknown")
+        );
+        let _ = writeln!(
+            rendered,
+            "\n## References\n{} indexed reference(s)",
+            self.reference_count
+        );
+        rendered.push_str("\n## Changed Files\n");
+        for file in &self.changed_files {
+            let _ = writeln!(
+                rendered,
+                "- {}: {} replacement(s)",
+                file.path, file.replacement_count
+            );
+        }
+        rendered
+    }
+
+    pub(crate) fn render_json(&self) -> String {
+        let changed_files = self
+            .changed_files
+            .iter()
+            .map(|file| {
+                format!(
+                    "{{\"path\":{},\"replacement_count\":{}}}",
+                    json_string(&file.path),
+                    file.replacement_count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"target_path\":{},\"language\":{},\"old_name\":{},\"new_name\":{},\
+             \"kind\":{},\"line_start\":{},\"line_end\":{},\"reference_count\":{},\
+             \"changed_files\":[{}]}}",
+            json_string(&self.target_path),
+            self.language
+                .as_deref()
+                .map(json_string)
+                .unwrap_or_else(|| "null".to_string()),
+            json_string(&self.old_name),
+            json_string(&self.new_name),
+            json_string(&self.kind),
+            self.line_start,
+            self.line_end,
+            self.reference_count,
+            changed_files
+        )
+    }
+}
+
+impl SymbolMove {
+    pub(crate) fn render_markdown(&self) -> String {
+        let mut rendered = String::new();
+        rendered.push_str("# Hugr Symbol Move\n\n");
+        let _ = writeln!(rendered, "## Symbol\n{} {}", self.kind, self.name);
+        let _ = writeln!(
+            rendered,
+            "\n## Move\n{}:{}-{} -> {}",
+            self.source_path, self.old_line_start, self.old_line_end, self.destination_path
+        );
+        let _ = writeln!(
+            rendered,
+            "\n## Language\n{}",
+            self.language.as_deref().unwrap_or("unknown")
+        );
+        let _ = writeln!(rendered, "\n## Lines\n{}", self.moved_line_count);
+        rendered.push_str("\n## Changed Files\n");
+        for file in &self.changed_files {
+            let _ = writeln!(rendered, "- {}: {}", file.path, file.action);
+        }
+        rendered
+    }
+
+    pub(crate) fn render_json(&self) -> String {
+        let changed_files = self
+            .changed_files
+            .iter()
+            .map(|file| {
+                format!(
+                    "{{\"path\":{},\"action\":{}}}",
+                    json_string(&file.path),
+                    json_string(&file.action)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"source_path\":{},\"destination_path\":{},\"language\":{},\"name\":{},\
+             \"kind\":{},\"old_line_start\":{},\"old_line_end\":{},\
+             \"moved_line_count\":{},\"changed_files\":[{}]}}",
+            json_string(&self.source_path),
+            json_string(&self.destination_path),
+            self.language
+                .as_deref()
+                .map(json_string)
+                .unwrap_or_else(|| "null".to_string()),
+            json_string(&self.name),
+            json_string(&self.kind),
+            self.old_line_start,
+            self.old_line_end,
+            self.moved_line_count,
+            changed_files
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::plan_replacement;
+    use super::{plan_rename, plan_replacement, resolve_symbol_in_source};
+    use crate::code::CodeReference;
 
     const RUST_SOURCE: &str =
         "pub struct Registry;\n\npub fn greet() -> u8 {\n    1\n}\n\npub fn other() {}\n";
@@ -696,5 +1187,204 @@ mod tests {
         assert!(json.contains("\"kind\":\"function\""));
         assert!(json.contains("\"old_line_start\":3"));
         assert!(json.contains("\"new_line_end\":5"));
+    }
+
+    #[test]
+    fn plans_reference_aware_symbol_rename() {
+        let target_source = "pub fn run_after_config() -> u8 {\n    1\n}\n";
+        let caller_source = "use crate::plugin_hooks::run_after_config;\n\nfn main() {\n    run_after_config();\n}\n";
+        let target = resolve_symbol_in_source(
+            "src/plugin_hooks.rs",
+            target_source,
+            "run_after_config",
+            None,
+            "rename",
+        )
+        .unwrap();
+        let references = vec![
+            CodeReference {
+                path: "src/main.rs".to_string(),
+                language: Some("rust".to_string()),
+                target_path: "src/plugin_hooks.rs".to_string(),
+                target_name: "run_after_config".to_string(),
+                target_kind: "function".to_string(),
+                kind: "import".to_string(),
+                line_start: 1,
+                excerpt: "use crate::plugin_hooks::run_after_config;".to_string(),
+            },
+            CodeReference {
+                path: "src/main.rs".to_string(),
+                language: Some("rust".to_string()),
+                target_path: "src/plugin_hooks.rs".to_string(),
+                target_name: "run_after_config".to_string(),
+                target_kind: "function".to_string(),
+                kind: "call".to_string(),
+                line_start: 4,
+                excerpt: "run_after_config();".to_string(),
+            },
+        ];
+
+        let planned = plan_rename(
+            &target,
+            &references,
+            vec![
+                ("src/plugin_hooks.rs".to_string(), target_source.to_string()),
+                ("src/main.rs".to_string(), caller_source.to_string()),
+            ],
+            "run_before_config",
+        )
+        .unwrap();
+
+        let target_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/plugin_hooks.rs")
+            .unwrap();
+        let caller_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/main.rs")
+            .unwrap();
+
+        assert!(target_file.contents.contains("run_before_config"));
+        assert!(!target_file.contents.contains("run_after_config"));
+        assert!(caller_file.contents.contains("run_before_config();"));
+        assert!(!caller_file.contents.contains("run_after_config"));
+        assert_eq!(planned.summary.old_name, "run_after_config");
+        assert_eq!(planned.summary.new_name, "run_before_config");
+        assert_eq!(planned.summary.reference_count, 2);
+        assert_eq!(planned.summary.changed_files.len(), 2);
+        assert!(
+            planned
+                .summary
+                .render_markdown()
+                .contains("run_after_config -> run_before_config")
+        );
+        assert!(
+            planned
+                .summary
+                .render_json()
+                .contains("\"new_name\":\"run_before_config\"")
+        );
+    }
+
+    #[test]
+    fn rejects_rename_with_invalid_identifier() {
+        let target =
+            resolve_symbol_in_source("src/lib.rs", RUST_SOURCE, "greet", None, "rename").unwrap();
+        let error = plan_rename(
+            &target,
+            &[],
+            vec![("src/lib.rs".to_string(), RUST_SOURCE.to_string())],
+            "not-valid",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("valid ASCII identifier"), "{error}");
+    }
+
+    #[test]
+    fn rejects_rename_when_reference_line_is_stale() {
+        let target =
+            resolve_symbol_in_source("src/lib.rs", RUST_SOURCE, "greet", None, "rename").unwrap();
+        let references = vec![CodeReference {
+            path: "src/main.rs".to_string(),
+            language: Some("rust".to_string()),
+            target_path: "src/lib.rs".to_string(),
+            target_name: "greet".to_string(),
+            target_kind: "function".to_string(),
+            kind: "call".to_string(),
+            line_start: 1,
+            excerpt: "greet();".to_string(),
+        }];
+        let error = plan_rename(
+            &target,
+            &references,
+            vec![
+                ("src/lib.rs".to_string(), RUST_SOURCE.to_string()),
+                (
+                    "src/main.rs".to_string(),
+                    "fn main() { other(); }\n".to_string(),
+                ),
+            ],
+            "welcome",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("rerun hugr index"), "{error}");
+    }
+
+    #[test]
+    fn plans_unreferenced_symbol_move_between_files() {
+        let source = "pub fn helper() -> u8 {\n    1\n}\n\npub fn other() {}\n";
+        let destination = "pub fn existing() {}\n";
+        let target =
+            resolve_symbol_in_source("src/lib.rs", source, "helper", None, "move").unwrap();
+
+        let planned =
+            plan_move(&target, &[], source, "src/helpers.rs", destination).unwrap();
+        let source_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/lib.rs")
+            .unwrap();
+        let destination_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/helpers.rs")
+            .unwrap();
+
+        assert!(!source_file.contents.contains("helper"));
+        assert!(source_file.contents.contains("pub fn other() {}"));
+        assert!(destination_file.contents.contains("pub fn existing() {}"));
+        assert!(destination_file.contents.contains("pub fn helper() -> u8"));
+        assert_eq!(planned.summary.source_path, "src/lib.rs");
+        assert_eq!(planned.summary.destination_path, "src/helpers.rs");
+        assert_eq!(planned.summary.moved_line_count, 3);
+        assert!(planned.summary.render_markdown().contains("src/lib.rs:1-3 -> src/helpers.rs"));
+        assert!(planned.summary.render_json().contains("\"destination_path\":\"src/helpers.rs\""));
+    }
+
+    #[test]
+    fn rejects_move_when_inbound_references_exist() {
+        let target =
+            resolve_symbol_in_source("src/lib.rs", RUST_SOURCE, "greet", None, "move").unwrap();
+        let references = vec![CodeReference {
+            path: "src/main.rs".to_string(),
+            language: Some("rust".to_string()),
+            target_path: "src/lib.rs".to_string(),
+            target_name: "greet".to_string(),
+            target_kind: "function".to_string(),
+            kind: "call".to_string(),
+            line_start: 1,
+            excerpt: "greet();".to_string(),
+        }];
+
+        let error = plan_move(
+            &target,
+            &references,
+            RUST_SOURCE,
+            "src/helpers.rs",
+            "pub fn existing() {}\n",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("indexed inbound reference"), "{error}");
+    }
+
+    #[test]
+    fn rejects_move_when_destination_has_same_symbol() {
+        let target =
+            resolve_symbol_in_source("src/lib.rs", RUST_SOURCE, "greet", None, "move").unwrap();
+        let error = plan_move(
+            &target,
+            &[],
+            RUST_SOURCE,
+            "src/helpers.rs",
+            "pub fn greet() {}\n",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("would collide"), "{error}");
     }
 }
