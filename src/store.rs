@@ -19,6 +19,8 @@ const HUGR_DB: &str = "hugr.db";
 const LOCAL_PROJECT_ID: &str = "project_local";
 pub(crate) const HUGR_API_CONTRACT_VERSION: &str = "hugr-api-v1";
 pub(crate) const HUGR_API_ROUTES: &[&str] = &[
+    "GET /v1/memories",
+    "POST /v1/memories",
     "GET /v1/sync/status",
     "POST /v1/sync/push",
     "POST /v1/sync/pull",
@@ -1318,8 +1320,7 @@ impl Store {
     ) -> Result<Memory, String> {
         let (memory, payloads) =
             hugr_api_remember_payloads(self.embedding_provider()?, text, options)?;
-        let result = execute_hugr_api_push(config, false, &payloads)?;
-        ensure_hugr_api_memory_operation_accepted("remember", &result.status, &result.tables)?;
+        post_hugr_api_memory_payloads(config, "remember", &payloads)?;
         Ok(memory)
     }
 
@@ -1658,6 +1659,56 @@ impl Store {
         };
 
         Ok((run_id, status, response_payloads))
+    }
+
+    pub(crate) async fn api_memory_records(&self) -> Result<Vec<serde_json::Value>, String> {
+        self.init().await?;
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        memory_sync_records(&conn).await
+    }
+
+    pub(crate) async fn apply_api_memory_storage_payloads(
+        &self,
+        payloads: &[SyncApiTablePayload],
+    ) -> Result<(String, Vec<SyncApiTablePayload>), String> {
+        self.init().await?;
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let mut applied_payloads = Vec::new();
+
+        for payload in payloads {
+            let result = match SyncTableKind::from_table_name(&payload.result.table) {
+                Some(table)
+                    if matches!(
+                        table,
+                        SyncTableKind::Projects
+                            | SyncTableKind::Memories
+                            | SyncTableKind::MemoryEmbeddings
+                    ) && payload.records.is_empty()
+                        && payload.result.row_count > 0 =>
+                {
+                    missing_api_row_payload_result(&payload.result)
+                }
+                Some(SyncTableKind::Projects) => {
+                    apply_api_push_project_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::Memories) => {
+                    apply_api_push_memory_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::MemoryEmbeddings) => {
+                    apply_api_push_memory_embedding_records(&conn, &payload.records).await?
+                }
+                Some(_) | None => unsupported_api_table_result(&payload.result),
+            };
+            applied_payloads.push(SyncApiTablePayload {
+                result,
+                records: Vec::new(),
+            });
+        }
+
+        let status = api_sync_status_for_payloads(&applied_payloads);
+        Ok((status, applied_payloads))
     }
 
     pub async fn sync_push(&self, dry_run: bool) -> Result<SyncPushResult, String> {
@@ -2160,6 +2211,462 @@ async fn execute_hugr_api_pull(
         backend: config.backend.as_str().to_string(),
         status: parsed.status,
         tables,
+    })
+}
+
+fn hugr_api_remember_payloads(
+    embedding_provider: &SelectedEmbeddingProvider,
+    text: &str,
+    options: MemoryWriteOptions,
+) -> Result<(Memory, Vec<SyncApiTablePayload>), String> {
+    let options = normalize_memory_write_options(options)?;
+    let now = now_ms()?;
+    let project = project_from_input(current_project_input()?, now);
+    let structured_payload = memory_write_payload(&options, Some(&project));
+    let memory = Memory {
+        id: format!("mem_{now}"),
+        created_at_ms: now,
+        kind: "fact".to_string(),
+        text: text.trim().to_string(),
+        structured_payload: structured_payload.clone(),
+    };
+    let memory_record = MemorySyncRecord {
+        id: memory.id.clone(),
+        created_at_ms: memory.created_at_ms,
+        kind: memory.kind.clone(),
+        text: memory.text.clone(),
+        confidence: options.confidence.unwrap_or(1.0),
+        valid_from: None,
+        valid_to: None,
+        superseded_by: None,
+        sensitivity: options
+            .sensitivity
+            .clone()
+            .unwrap_or_else(|| "normal".to_string()),
+        structured_payload,
+    };
+    let embedding = embedding_provider.embed(&memory.text)?;
+    let embedding_record = MemoryEmbeddingSyncRecord {
+        memory_id: memory.id.clone(),
+        model: embedding.model.clone(),
+        dimensions: embedding_dimensions_i64(&embedding)?,
+        embedding: embedding.to_f32_blob(),
+    };
+    let payloads = vec![
+        api_payload_for_records(
+            SyncTableKind::Projects,
+            vec![project_sync_record_value(&project)],
+        ),
+        api_payload_for_records(
+            SyncTableKind::Memories,
+            vec![memory_sync_record_value(&memory_record)],
+        ),
+        api_payload_for_records(
+            SyncTableKind::MemoryEmbeddings,
+            vec![memory_embedding_sync_record_value(&embedding_record)],
+        ),
+    ];
+
+    Ok((memory, payloads))
+}
+
+fn project_from_input(input: ProjectInput, now: i64) -> Project {
+    Project {
+        id: input.id,
+        name: input.name,
+        root_path: input.root_path,
+        git_remote: input.git_remote,
+        default_branch: input.default_branch,
+        created_at_ms: now,
+        updated_at_ms: now,
+    }
+}
+
+fn embedding_dimensions_i64(embedding: &Embedding) -> Result<i64, String> {
+    i64::try_from(embedding.dimensions()).map_err(|error| error.to_string())
+}
+
+fn api_payload_for_records(
+    table: SyncTableKind,
+    records: Vec<serde_json::Value>,
+) -> SyncApiTablePayload {
+    SyncApiTablePayload {
+        result: planned_sync_table_result(table, records.len()),
+        records,
+    }
+}
+
+fn project_sync_record_value(project: &Project) -> serde_json::Value {
+    json!({
+        "id": &project.id,
+        "name": &project.name,
+        "root_path": &project.root_path,
+        "git_remote": &project.git_remote,
+        "default_branch": &project.default_branch,
+        "created_at_ms": project.created_at_ms,
+        "updated_at_ms": project.updated_at_ms
+    })
+}
+
+fn memory_sync_record_value(record: &MemorySyncRecord) -> serde_json::Value {
+    json!({
+        "id": &record.id,
+        "created_at_ms": record.created_at_ms,
+        "kind": &record.kind,
+        "text": &record.text,
+        "confidence": record.confidence,
+        "valid_from": &record.valid_from,
+        "valid_to": &record.valid_to,
+        "superseded_by": &record.superseded_by,
+        "sensitivity": &record.sensitivity,
+        "structured_payload": &record.structured_payload
+    })
+}
+
+fn memory_embedding_sync_record_value(record: &MemoryEmbeddingSyncRecord) -> serde_json::Value {
+    json!({
+        "memory_id": &record.memory_id,
+        "model": &record.model,
+        "dimensions": record.dimensions,
+        "embedding": &record.embedding
+    })
+}
+
+fn hugr_api_active_memories(config: &StorageConfig) -> Result<Vec<Memory>, String> {
+    Ok(fetch_hugr_api_memory_records(config)?
+        .iter()
+        .filter(|record| record.valid_to.is_none())
+        .map(memory_from_sync_record)
+        .collect())
+}
+
+fn recall_via_hugr_api(
+    config: &StorageConfig,
+    query: &str,
+    terms: &[String],
+    limit: usize,
+) -> Result<Vec<Memory>, String> {
+    let memories = hugr_api_active_memories(config)?;
+    Ok(rank_memories_by_query(memories, terms, query, limit))
+}
+
+fn forget_via_hugr_api(
+    config: &StorageConfig,
+    query: &str,
+    terms: &[String],
+    limit: usize,
+) -> Result<ForgetResult, String> {
+    let records = fetch_hugr_api_memory_records(config)?;
+    let mut matches = records
+        .into_iter()
+        .filter(|record| record.valid_to.is_none())
+        .filter_map(|record| {
+            let memory = memory_from_sync_record(&record);
+            let score = recall_score(&memory, terms, query);
+            (score > 0).then_some((score, record, memory))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.2.created_at_ms.cmp(&left.2.created_at_ms))
+    });
+    matches.truncate(limit.max(1));
+
+    let forgotten_at = now_ms()?.to_string();
+    let memories = matches
+        .iter()
+        .map(|(_, _, memory)| memory.clone())
+        .collect::<Vec<_>>();
+    let updates = matches
+        .into_iter()
+        .map(|(_, mut record, _)| {
+            record.valid_to = Some(forgotten_at.clone());
+            memory_sync_record_value(&record)
+        })
+        .collect::<Vec<_>>();
+    post_hugr_api_memory_payloads(
+        config,
+        "forget",
+        &[api_payload_for_records(SyncTableKind::Memories, updates)],
+    )?;
+
+    Ok(ForgetResult {
+        query: query.to_string(),
+        forgotten_count: memories.len(),
+        forgotten_at,
+        memories,
+    })
+}
+
+fn memory_maintenance_report_via_hugr_api(
+    config: &StorageConfig,
+) -> Result<MemoryMaintenanceReport, String> {
+    let records = fetch_hugr_api_memory_records(config)?;
+    Ok(memory_maintenance_report_from_records(&records))
+}
+
+fn consolidate_duplicate_memories_via_hugr_api(
+    config: &StorageConfig,
+) -> Result<MemoryConsolidationResult, String> {
+    let records = fetch_hugr_api_memory_records(config)?;
+    let report = memory_maintenance_report_from_records(&records);
+    let executed_at = now_ms()?.to_string();
+    let mut records_by_id = records
+        .into_iter()
+        .map(|record| (record.id.clone(), record))
+        .collect::<HashMap<_, _>>();
+    let mut kept_memories = Vec::new();
+    let mut retired_memories = Vec::new();
+    let mut updates = Vec::new();
+
+    for group in &report.duplicate_groups {
+        let Some((kept, retired)) = group.memories.split_first() else {
+            continue;
+        };
+        kept_memories.push(kept.clone());
+        for memory in retired {
+            let Some(record) = records_by_id.get_mut(&memory.id) else {
+                continue;
+            };
+            record.valid_to = Some(executed_at.clone());
+            record.superseded_by = Some(kept.id.clone());
+            updates.push(memory_sync_record_value(record));
+            retired_memories.push(memory.clone());
+        }
+    }
+    post_hugr_api_memory_payloads(
+        config,
+        "consolidate duplicates",
+        &[api_payload_for_records(SyncTableKind::Memories, updates)],
+    )?;
+
+    Ok(MemoryConsolidationResult {
+        executed_at,
+        duplicate_groups: report.duplicate_groups,
+        kept_memories,
+        retired_memories,
+    })
+}
+
+fn retire_stale_memories_via_hugr_api(
+    config: &StorageConfig,
+) -> Result<StaleRetirementResult, String> {
+    let records = fetch_hugr_api_memory_records(config)?;
+    let report = memory_maintenance_report_from_records(&records);
+    let executed_at = now_ms()?.to_string();
+    let mut records_by_id = records
+        .into_iter()
+        .map(|record| (record.id.clone(), record))
+        .collect::<HashMap<_, _>>();
+    let mut kept_memories = Vec::new();
+    let mut retired_memories = Vec::new();
+    let mut seen_kept = HashSet::new();
+    let mut seen_retired = HashSet::new();
+    let mut updates = Vec::new();
+
+    for candidate in &report.stale_candidates {
+        if seen_kept.insert(candidate.newer_memory.id.clone()) {
+            kept_memories.push(candidate.newer_memory.clone());
+        }
+        if !seen_retired.insert(candidate.older_memory.id.clone()) {
+            continue;
+        }
+        let Some(record) = records_by_id.get_mut(&candidate.older_memory.id) else {
+            continue;
+        };
+        record.valid_to = Some(executed_at.clone());
+        record.superseded_by = Some(candidate.newer_memory.id.clone());
+        updates.push(memory_sync_record_value(record));
+        retired_memories.push(candidate.older_memory.clone());
+    }
+    post_hugr_api_memory_payloads(
+        config,
+        "retire stale memories",
+        &[api_payload_for_records(SyncTableKind::Memories, updates)],
+    )?;
+
+    Ok(StaleRetirementResult {
+        executed_at,
+        stale_candidates: report.stale_candidates,
+        kept_memories,
+        retired_memories,
+    })
+}
+
+fn memory_maintenance_report_from_records(records: &[MemorySyncRecord]) -> MemoryMaintenanceReport {
+    let active = records
+        .iter()
+        .filter(|record| record.valid_to.is_none())
+        .map(memory_from_sync_record)
+        .collect::<Vec<_>>();
+    let retired_count = records
+        .iter()
+        .filter(|record| record.valid_to.is_some())
+        .count();
+    let mut grouped = HashMap::<String, Vec<Memory>>::new();
+
+    for memory in &active {
+        grouped
+            .entry(normalized_memory_text(&memory.text))
+            .or_default()
+            .push(memory.clone());
+    }
+
+    let mut duplicate_groups = grouped
+        .into_iter()
+        .filter_map(|(normalized_text, mut memories)| {
+            (memories.len() > 1).then(|| {
+                memories.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+                DuplicateMemoryGroup {
+                    normalized_text,
+                    memories,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    duplicate_groups.sort_by(|left, right| {
+        right
+            .memories
+            .len()
+            .cmp(&left.memories.len())
+            .then_with(|| left.normalized_text.cmp(&right.normalized_text))
+    });
+
+    MemoryMaintenanceReport {
+        active_count: active.len(),
+        retired_count,
+        duplicate_groups,
+        stale_candidates: stale_memory_candidates(&active),
+    }
+}
+
+fn rank_memories_by_query(
+    memories: Vec<Memory>,
+    terms: &[String],
+    query: &str,
+    limit: usize,
+) -> Vec<Memory> {
+    let mut matches = memories
+        .into_iter()
+        .filter_map(|memory| {
+            let score = recall_score(&memory, terms, query);
+            (score > 0).then_some((score, memory))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.created_at_ms.cmp(&left.1.created_at_ms))
+    });
+    matches.truncate(limit);
+    matches.into_iter().map(|(_, memory)| memory).collect()
+}
+
+fn memory_from_sync_record(record: &MemorySyncRecord) -> Memory {
+    Memory {
+        id: record.id.clone(),
+        created_at_ms: record.created_at_ms,
+        kind: record.kind.clone(),
+        text: record.text.clone(),
+        structured_payload: record.structured_payload.clone(),
+    }
+}
+
+fn fetch_hugr_api_memory_records(config: &StorageConfig) -> Result<Vec<MemorySyncRecord>, String> {
+    let response = get_hugr_api_json(config, "/v1/memories")?;
+    parse_hugr_api_memory_records_response(&response)
+}
+
+fn post_hugr_api_memory_payloads(
+    config: &StorageConfig,
+    operation: &str,
+    payloads: &[SyncApiTablePayload],
+) -> Result<Vec<SyncTableResult>, String> {
+    if payloads.iter().all(|payload| payload.records.is_empty()) {
+        return Ok(Vec::new());
+    }
+
+    let body = hugr_api_memory_apply_request(payloads);
+    let response = post_hugr_api_json(config, "/v1/memories", &body)?;
+    let parsed = parse_hugr_api_memory_apply_response(&response)?;
+    ensure_hugr_api_memory_operation_accepted(operation, &parsed.status, &parsed.tables)?;
+    Ok(parsed.tables)
+}
+
+fn hugr_api_memory_apply_request(payloads: &[SyncApiTablePayload]) -> serde_json::Value {
+    json!({
+        "contract_version": HUGR_API_CONTRACT_VERSION,
+        "tables": payloads.iter().map(sync_api_table_payload_value).collect::<Vec<_>>()
+    })
+}
+
+fn ensure_hugr_api_memory_operation_accepted(
+    operation: &str,
+    status: &str,
+    tables: &[SyncTableResult],
+) -> Result<(), String> {
+    if status == "accepted" && tables.iter().all(|table| table.conflict_count == 0) {
+        return Ok(());
+    }
+
+    let conflicts = tables
+        .iter()
+        .filter(|table| table.conflict_count > 0)
+        .map(|table| format!("{}:{}", table.table, table.conflict_count))
+        .collect::<Vec<_>>();
+    let details = if conflicts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", conflicts.join(", "))
+    };
+    Err(format!(
+        "remote Hugr API {operation} returned status '{status}'{details}"
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HugrApiMemoryApplyResponse {
+    status: String,
+    tables: Vec<SyncTableResult>,
+}
+
+fn parse_hugr_api_memory_records_response(response: &str) -> Result<Vec<MemorySyncRecord>, String> {
+    let value = serde_json::from_str::<serde_json::Value>(response)
+        .map_err(|error| format!("invalid Hugr API memory response: {error}"))?;
+    reject_hugr_api_error(&value)?;
+    let contract_version = json_string_field(&value, "contract_version")?;
+    if contract_version != HUGR_API_CONTRACT_VERSION {
+        return Err(format!(
+            "unsupported Hugr API contract version '{contract_version}'"
+        ));
+    }
+    json_array_field(&value, "records")?
+        .iter()
+        .map(memory_sync_record_from_value)
+        .collect()
+}
+
+fn parse_hugr_api_memory_apply_response(
+    response: &str,
+) -> Result<HugrApiMemoryApplyResponse, String> {
+    let value = serde_json::from_str::<serde_json::Value>(response)
+        .map_err(|error| format!("invalid Hugr API memory response: {error}"))?;
+    reject_hugr_api_error(&value)?;
+    let contract_version = json_string_field(&value, "contract_version")?;
+    if contract_version != HUGR_API_CONTRACT_VERSION {
+        return Err(format!(
+            "unsupported Hugr API contract version '{contract_version}'"
+        ));
+    }
+    Ok(HugrApiMemoryApplyResponse {
+        status: json_string_field(&value, "status")?,
+        tables: json_array_field(&value, "tables")?
+            .iter()
+            .map(parse_sync_table_result)
+            .collect::<Result<Vec<_>, _>>()?,
     })
 }
 
@@ -6579,13 +7086,17 @@ mod tests {
         HUGR_API_CONTRACT_VERSION, HUGR_API_ROUTES, LOCAL_PROJECT_ID, Memory, MemorySource,
         MemoryWriteOptions, StorageConfig, StorageMode, Store, SyncApiTablePayload, SyncBackend,
         SyncClass, SyncConflictSummary, SyncTableKind, SyncTableResult, apply_api_pull_payloads,
-        fts_query, hugr_api_route_url, hugr_api_sync_request, parse_hugr_api_history_response,
+        fts_query, hugr_api_memory_apply_request, hugr_api_remember_payloads, hugr_api_route_url,
+        hugr_api_sync_request, parse_hugr_api_history_response,
+        parse_hugr_api_memory_apply_response, parse_hugr_api_memory_records_response,
         parse_hugr_api_sync_response, planned_sync_table_result, query_terms, recall_score,
-        table_row_count,
+        sync_table_result_value, table_row_count,
     };
     use crate::code::{CodeReference, CodeSymbol};
     use crate::discovery::FileCandidate;
-    use crate::embedding::{DEFAULT_EMBEDDING_DIMENSIONS, DETERMINISTIC_MODEL};
+    use crate::embedding::{
+        DEFAULT_EMBEDDING_DIMENSIONS, DETERMINISTIC_MODEL, SelectedEmbeddingProvider,
+    };
     use libsql::{Connection, params};
     use std::fs;
     use std::path::PathBuf;
@@ -6916,6 +7427,108 @@ mod tests {
         assert_eq!(parsed.tables[0].table, "memories");
         assert_eq!(parsed.tables[0].inserted_count, 1);
         assert_eq!(parsed.tables[0].conflicts[0].count, 1);
+    }
+
+    #[test]
+    fn remote_remember_payloads_include_project_memory_and_embedding() {
+        let options = MemoryWriteOptions {
+            source: Some(MemorySource {
+                kind: "url".to_string(),
+                locator: "https://example.test/remote".to_string(),
+            }),
+            confidence: Some(0.8),
+            sensitivity: Some("private".to_string()),
+            valid_from: Some("now".to_string()),
+            valid_to: None,
+        };
+        let (memory, payloads) = hugr_api_remember_payloads(
+            &SelectedEmbeddingProvider::default(),
+            "  remote remember payload  ",
+            options,
+        )
+        .unwrap();
+
+        assert_eq!(memory.text, "remote remember payload");
+        assert_eq!(payloads.len(), 3);
+        assert_eq!(payloads[0].result.table, "projects");
+        assert_eq!(payloads[1].result.table, "memories");
+        assert_eq!(payloads[2].result.table, "memory_embeddings");
+        assert_eq!(payloads[1].records[0]["id"], serde_json::json!(memory.id));
+        assert_eq!(payloads[1].records[0]["confidence"], serde_json::json!(0.8));
+        assert_eq!(
+            payloads[1].records[0]["sensitivity"],
+            serde_json::json!("private")
+        );
+        assert!(payloads[1].records[0]["valid_from"].is_null());
+        let structured_payload = serde_json::from_str::<serde_json::Value>(
+            payloads[1].records[0]["structured_payload"]
+                .as_str()
+                .expect("structured payload should be a JSON string"),
+        )
+        .unwrap();
+        assert_eq!(
+            structured_payload["source"]["locator"],
+            serde_json::json!("https://example.test/remote")
+        );
+        assert_eq!(
+            structured_payload["metadata"]["validity"]["valid_from"],
+            serde_json::json!("now")
+        );
+        assert_eq!(
+            payloads[2].records[0]["embedding"]
+                .as_array()
+                .expect("embedding should be encoded as bytes")
+                .len(),
+            DEFAULT_EMBEDDING_DIMENSIONS * 4
+        );
+    }
+
+    #[test]
+    fn builds_and_parses_hugr_api_memory_route_payloads() {
+        let payload = SyncApiTablePayload {
+            result: planned_sync_table_result(SyncTableKind::Memories, 1),
+            records: vec![serde_json::json!({
+                "id": "mem_1",
+                "created_at_ms": 1,
+                "kind": "fact",
+                "text": "remote memory",
+                "confidence": 1.0,
+                "valid_from": null,
+                "valid_to": null,
+                "superseded_by": null,
+                "sensitivity": "normal",
+                "structured_payload": null
+            })],
+        };
+        let request = hugr_api_memory_apply_request(std::slice::from_ref(&payload));
+
+        assert_eq!(
+            request["contract_version"],
+            serde_json::json!(HUGR_API_CONTRACT_VERSION)
+        );
+        assert!(request.get("operation").is_none());
+        assert_eq!(request["tables"][0]["table"], serde_json::json!("memories"));
+
+        let records_response = serde_json::json!({
+            "status": "ok",
+            "contract_version": HUGR_API_CONTRACT_VERSION,
+            "records": payload.records
+        })
+        .to_string();
+        let records = parse_hugr_api_memory_records_response(&records_response).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "mem_1");
+        assert_eq!(records[0].text, "remote memory");
+
+        let apply_response = serde_json::json!({
+            "status": "accepted",
+            "contract_version": HUGR_API_CONTRACT_VERSION,
+            "tables": [sync_table_result_value(&payload.result)]
+        })
+        .to_string();
+        let parsed = parse_hugr_api_memory_apply_response(&apply_response).unwrap();
+        assert_eq!(parsed.status, "accepted");
+        assert_eq!(parsed.tables[0].table, "memories");
     }
 
     #[test]
