@@ -310,3 +310,77 @@ fn write_client_source(client_dir: &Path) {
     )
     .expect("source file should be written");
 }
+
+#[test]
+fn replace_symbol_edits_local_source_and_refreshes_index() {
+    let hugr = env!("CARGO_BIN_EXE_hugr");
+    let workspace = temp_workspace("replace_symbol");
+    let src_dir = workspace.join("src");
+    fs::create_dir_all(&src_dir).expect("src dir should be created");
+    let source = src_dir.join("lib.rs");
+    fs::write(
+        &source,
+        "pub struct Registry;\n\npub fn greet() -> u8 {\n    1\n}\n\npub fn other() {}\n",
+    )
+    .expect("source file should be written");
+
+    let init = run_local_hugr(hugr, &workspace, &["init"]);
+    assert!(init.status.success(), "init failed: {init:?}");
+
+    let replace = run_local_hugr(
+        hugr,
+        &workspace,
+        &[
+            "replace-symbol",
+            "--json",
+            "src/lib.rs",
+            "greet",
+            "--body",
+            "pub fn greet() -> u8 {\n    let value = 42;\n    value\n}",
+        ],
+    );
+    assert!(replace.status.success(), "replace failed: {replace:?}");
+    let replace_json = String::from_utf8(replace.stdout).unwrap();
+    assert!(replace_json.contains("\"name\":\"greet\""));
+    assert!(replace_json.contains("\"old_line_end\":5"));
+    assert!(replace_json.contains("\"new_line_end\":6"));
+
+    let edited = fs::read_to_string(&source).unwrap();
+    assert!(edited.contains("let value = 42;"), "body not replaced: {edited}");
+    assert!(edited.contains("pub struct Registry;"), "struct clobbered: {edited}");
+    assert!(edited.contains("pub fn other() {}"), "sibling clobbered: {edited}");
+
+    // The index refresh baked into replace-symbol should surface the new line span.
+    let symbols = run_local_hugr(hugr, &workspace, &["symbols", "--json", "greet"]);
+    assert!(symbols.status.success(), "symbols failed: {symbols:?}");
+    let symbols_json = String::from_utf8(symbols.stdout).unwrap();
+    assert!(symbols_json.contains("\"line_end\":6"), "stale index: {symbols_json}");
+
+    // A rename attempt is refused and leaves the file untouched.
+    let rename = run_local_hugr(
+        hugr,
+        &workspace,
+        &[
+            "replace-symbol",
+            "src/lib.rs",
+            "greet",
+            "--body",
+            "pub fn renamed() {}",
+        ],
+    );
+    assert!(!rename.status.success(), "rename should fail: {rename:?}");
+    let rename_stderr = String::from_utf8(rename.stderr).unwrap();
+    assert!(rename_stderr.contains("does not define"), "unexpected error: {rename_stderr}");
+    let after_refusal = fs::read_to_string(&source).unwrap();
+    assert_eq!(after_refusal, edited, "refused edit must not modify the file");
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+fn run_local_hugr(hugr: &str, dir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(hugr)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("hugr command should run")
+}
