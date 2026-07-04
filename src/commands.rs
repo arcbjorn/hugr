@@ -49,6 +49,7 @@ pub async fn execute(command: Command) -> Result<(), String> {
             name,
             destination_path,
             kind,
+            rewrite_references,
             format,
         } => {
             move_symbol(
@@ -56,6 +57,7 @@ pub async fn execute(command: Command) -> Result<(), String> {
                 &name,
                 &destination_path,
                 kind.as_deref(),
+                rewrite_references,
                 format,
             )
             .await
@@ -423,6 +425,7 @@ async fn move_symbol(
     name: &str,
     destination_path: &str,
     kind: Option<&str>,
+    rewrite_references: bool,
     format: OutputFormat,
 ) -> Result<(), String> {
     let store = Store::open_current();
@@ -442,12 +445,19 @@ async fn move_symbol(
     let references = store
         .references_to_symbols(std::slice::from_ref(&target), 2000)
         .await?;
+    let reference_files = if rewrite_references {
+        read_reference_files(&references, source_path, destination_path, "hugr move-symbol")?
+    } else {
+        Vec::new()
+    };
     let planned = edit::plan_move(
         &target,
         &references,
         &source_contents,
         destination_path,
         &destination_contents,
+        reference_files,
+        rewrite_references,
     )?;
 
     for file in &planned.files {
@@ -486,6 +496,31 @@ fn read_optional_destination(path: &str, command: &str) -> Result<String, String
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
         Err(error) => Err(format!("{command} cannot read {path}: {error}")),
     }
+}
+
+fn read_reference_files(
+    references: &[crate::code::CodeReference],
+    source_path: &str,
+    destination_path: &str,
+    command: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let mut paths = references
+        .iter()
+        .map(|reference| reference.path.clone())
+        .filter(|path| path != source_path && path != destination_path)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    paths
+        .into_iter()
+        .map(|path| {
+            std::fs::read_to_string(&path)
+                .map(|contents| (path.clone(), contents))
+                .map_err(|error| format!("{command} cannot read {path}: {error}"))
+        })
+        .collect()
 }
 
 async fn project_status() -> Result<(), String> {
