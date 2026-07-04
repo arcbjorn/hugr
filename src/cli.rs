@@ -25,6 +25,13 @@ pub enum Command {
         target: String,
         format: OutputFormat,
     },
+    ReplaceSymbol {
+        path: String,
+        name: String,
+        kind: Option<String>,
+        body: String,
+        format: OutputFormat,
+    },
     ProjectStatus,
     SessionStart {
         task: String,
@@ -141,6 +148,7 @@ impl Command {
                     format: text.format,
                 })
             }
+            "replace-symbol" => parse_replace_symbol_command(args),
             "project" => parse_project_command(args),
             "session" => parse_session_command(args),
             "sync" => parse_sync_command(args),
@@ -391,6 +399,87 @@ fn parse_run_command(args: &[String]) -> Result<Command, String> {
     }
 }
 
+fn parse_replace_symbol_command(args: &[String]) -> Result<Command, String> {
+    let mut positional = Vec::new();
+    let mut kind = None;
+    let mut body = None;
+    let mut body_file = None;
+    let mut format = OutputFormat::Markdown;
+    let mut index = 2;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--json" {
+            format = OutputFormat::Json;
+        } else if arg == "--kind" {
+            index += 1;
+            kind = Some(required_option_value(
+                args.get(index).map(String::as_str),
+                "hugr replace-symbol --kind",
+            )?);
+        } else if let Some(value) = arg.strip_prefix("--kind=") {
+            kind = Some(required_option_value(
+                Some(value),
+                "hugr replace-symbol --kind",
+            )?);
+        } else if arg == "--body" {
+            index += 1;
+            body = Some(
+                args.get(index)
+                    .cloned()
+                    .ok_or_else(|| "hugr replace-symbol --body requires a value".to_string())?,
+            );
+        } else if let Some(value) = arg.strip_prefix("--body=") {
+            body = Some(value.to_string());
+        } else if arg == "--body-file" {
+            index += 1;
+            body_file = Some(required_option_value(
+                args.get(index).map(String::as_str),
+                "hugr replace-symbol --body-file",
+            )?);
+        } else if let Some(value) = arg.strip_prefix("--body-file=") {
+            body_file = Some(required_option_value(
+                Some(value),
+                "hugr replace-symbol --body-file",
+            )?);
+        } else if arg.starts_with("--") {
+            return Err(format!("unknown option '{arg}'"));
+        } else {
+            positional.push(arg.clone());
+        }
+
+        index += 1;
+    }
+
+    let [path, name] = positional.as_slice() else {
+        return Err("hugr replace-symbol requires <path> <symbol>".to_string());
+    };
+
+    let body = match (body, body_file) {
+        (Some(_), Some(_)) => {
+            return Err("hugr replace-symbol accepts --body or --body-file, not both".to_string());
+        }
+        (Some(body), None) => body,
+        (None, Some(file)) => std::fs::read_to_string(&file)
+            .map_err(|error| format!("hugr replace-symbol --body-file: {error}"))?,
+        (None, None) => {
+            return Err("hugr replace-symbol requires --body or --body-file".to_string());
+        }
+    };
+
+    if body.trim().is_empty() {
+        return Err("hugr replace-symbol requires a non-empty body".to_string());
+    }
+
+    Ok(Command::ReplaceSymbol {
+        path: path.clone(),
+        name: name.clone(),
+        kind,
+        body,
+        format,
+    })
+}
+
 fn parse_project_command(args: &[String]) -> Result<Command, String> {
     match args.get(2).map(String::as_str) {
         Some("status") => Ok(Command::ProjectStatus),
@@ -561,7 +650,7 @@ fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions,
 }
 
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr replace-symbol [--json] [--kind <kind>] <path> <symbol> (--body <source> | --body-file <path>)\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
 }
 
 #[cfg(test)]
@@ -646,6 +735,90 @@ mod tests {
                 target: "PluginHooks".into(),
                 format: OutputFormat::Json
             })
+        );
+    }
+
+    #[test]
+    fn parses_replace_symbol_command() {
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "replace-symbol".into(),
+                "--json".into(),
+                "--kind".into(),
+                "function".into(),
+                "src/lib.rs".into(),
+                "greet".into(),
+                "--body".into(),
+                "pub fn greet() {}".into(),
+            ]),
+            Ok(Command::ReplaceSymbol {
+                path: "src/lib.rs".into(),
+                name: "greet".into(),
+                kind: Some("function".into()),
+                body: "pub fn greet() {}".into(),
+                format: OutputFormat::Json,
+            })
+        );
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "replace-symbol".into(),
+                "src/lib.rs".into(),
+                "greet".into(),
+                "--body=pub fn greet() {}".into(),
+            ]),
+            Ok(Command::ReplaceSymbol {
+                path: "src/lib.rs".into(),
+                name: "greet".into(),
+                kind: None,
+                body: "pub fn greet() {}".into(),
+                format: OutputFormat::Markdown,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_replace_symbol_without_body() {
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "replace-symbol".into(),
+                "src/lib.rs".into(),
+                "greet".into(),
+            ]),
+            Err("hugr replace-symbol requires --body or --body-file".into())
+        );
+    }
+
+    #[test]
+    fn rejects_replace_symbol_with_both_body_sources() {
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "replace-symbol".into(),
+                "src/lib.rs".into(),
+                "greet".into(),
+                "--body".into(),
+                "pub fn greet() {}".into(),
+                "--body-file".into(),
+                "body.txt".into(),
+            ]),
+            Err("hugr replace-symbol accepts --body or --body-file, not both".into())
+        );
+    }
+
+    #[test]
+    fn rejects_replace_symbol_missing_positional() {
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "replace-symbol".into(),
+                "src/lib.rs".into(),
+                "--body".into(),
+                "pub fn greet() {}".into(),
+            ]),
+            Err("hugr replace-symbol requires <path> <symbol>".into())
         );
     }
 
