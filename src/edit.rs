@@ -466,8 +466,13 @@ fn plan_reference_rewrites(
         for reference in &references {
             line_numbers.insert(reference.line_start);
         }
-        let (rewritten, replacement_count) =
-            replace_qualified_path_on_lines(&path, contents, &old_qualified, &new_qualified, &line_numbers)?;
+        let (rewritten, replacement_count) = replace_qualified_path_on_lines(
+            &path,
+            contents,
+            &old_qualified,
+            &new_qualified,
+            &line_numbers,
+        )?;
         if replacement_count == 0 {
             return Err(format!(
                 "move-symbol --rewrite-references could not rewrite {old_qualified} in indexed references for {path}"
@@ -1646,9 +1651,11 @@ mod tests {
         assert!(caller_file.contents.contains("use crate::helpers::helper;"));
         assert!(caller_file.contents.contains("helper();"));
         assert_eq!(planned.summary.rewritten_reference_count, 1);
-        assert!(planned
-            .summary
-            .render_json()
-            .contains("\"rewritten_reference_count\":1"));
+        assert!(
+            planned
+                .summary
+                .render_json()
+                .contains("\"rewritten_reference_count\":1")
+        );
     }
 }
