@@ -1,6 +1,7 @@
 use crate::code::CodeSymbol;
 use crate::context::ContextPack;
 use crate::discovery;
+use crate::edit;
 use crate::impact;
 use crate::indexer;
 use crate::store::{
@@ -110,6 +111,7 @@ async fn handle_tool_call(params: Value) -> Result<Value, String> {
         "hugr_index" => tool_index(&arguments).await,
         "hugr_symbols" => tool_symbols(&arguments).await,
         "hugr_impact" => tool_impact(&arguments).await,
+        "hugr_replace_symbol" => tool_replace_symbol(&arguments).await,
         "hugr_forget" => tool_forget(&arguments).await,
         unknown => Err(format!("unknown tool '{unknown}'")),
     }
@@ -292,6 +294,46 @@ async fn tool_impact(arguments: &Value) -> Result<Value, String> {
     Ok(tool_result(report.render_markdown(), structured))
 }
 
+async fn tool_replace_symbol(arguments: &Value) -> Result<Value, String> {
+    let path = required_string(arguments, "path")?;
+    let name = required_string(arguments, "name")?;
+    let kind = optional_string(arguments, "kind")?;
+    let body = required_string(arguments, "body")?;
+
+    let store = Store::open_current();
+    if !store.supports_local_source_edits()? {
+        return Err(
+            "hugr_replace_symbol edits the local working tree and is not available in remote Hugr API mode"
+                .to_string(),
+        );
+    }
+
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|error| format!("hugr_replace_symbol cannot read {path}: {error}"))?;
+    let planned = edit::plan_replacement(&path, &contents, &name, kind.as_deref(), &body)?;
+
+    std::fs::write(&path, &planned.contents)
+        .map_err(|error| format!("hugr_replace_symbol cannot write {path}: {error}"))?;
+    indexer::index_project(5000).await?;
+
+    let summary = &planned.summary;
+    let detail = format!(
+        "replace-symbol {} {} at {}:{}-{} -> {}:{}-{}",
+        summary.kind,
+        summary.name,
+        summary.path,
+        summary.old_line_start,
+        summary.old_line_end,
+        summary.path,
+        summary.new_line_start,
+        summary.new_line_end
+    );
+    store.record_session_event_if_active("edit", &detail).await?;
+
+    let structured = serde_json::from_str(&summary.render_json()).unwrap_or_else(|_| json!({}));
+    Ok(tool_result(summary.render_markdown(), structured))
+}
+
 fn tools() -> Vec<Value> {
     vec![
         tool_schema(
@@ -345,6 +387,11 @@ fn tools() -> Vec<Value> {
             "Trace direct indexed references for a file or symbol.",
             &[("target", "string")],
         ),
+        tool_schema(
+            "hugr_replace_symbol",
+            "Safely replace one top-level symbol's source in a local file. Refuses ambiguous targets, renames, kind changes, and bodies that fail to parse.",
+            &[("path", "string"), ("name", "string"), ("body", "string")],
+        ),
     ]
 }
 
@@ -391,6 +438,15 @@ fn tool_schema(name: &str, description: &str, properties: &[(&str, &str)]) -> Va
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 50000
+            }),
+        );
+    }
+
+    if name == "hugr_replace_symbol" {
+        props.insert(
+            "kind".to_string(),
+            json!({
+                "type": "string"
             }),
         );
     }
@@ -670,6 +726,7 @@ mod tests {
         assert!(names.contains(&"hugr_session_end"));
         assert!(names.contains(&"hugr_forget"));
         assert!(names.contains(&"hugr_symbols"));
+        assert!(names.contains(&"hugr_replace_symbol"));
     }
 
     #[test]
