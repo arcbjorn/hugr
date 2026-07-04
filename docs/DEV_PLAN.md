@@ -62,7 +62,7 @@ Implemented:
 - Hugr API sync client transport for explicit push, pull, and history requests against the `/v1/sync/*` contract
 - `hugr daemon` exposes authenticated Hugr API sync routes for status, push, pull, and history, and records accepted API sync runs
 - Hugr API sync push and pull transfer and reconcile memory row payloads with the same overwrite/preserve behavior used by direct sync
-- Hugr API sync push and pull transfer and reconcile project metadata, source reference, entity, and graph edge row payloads
+- Hugr API sync push and pull transfer and reconcile all currently syncable safe row payload classes: project metadata, memories, embeddings, source references, discovered files, entities, code symbols, graph edges, code references, and finalized sessions
 - guarded `hugr sync push` dry-run and explicit execution path for safe sync classes
 - guarded `hugr sync pull` dry-run and explicit execution path for safe sync classes
 - `hugr sync history` with per-table sync counters and conflict summaries
@@ -80,14 +80,15 @@ Implemented:
 Not implemented yet:
 
 - tree-sitter-backed Kotlin parsing; the current published `tree-sitter-kotlin` crate resolves to `tree-sitter <0.23` and conflicts with Hugr's `tree-sitter 0.26` parser stack
-- row-level Hugr API sync reconciliation for remaining index/session/embedding safe sync classes and ordinary API-backed storage operations for remote-mode memory commands
+- ordinary API-backed storage operations for remote-mode memory commands
+- automated live client/server Hugr API contract tests
 
 ## Completion Gap Review
 
 The near-term plan is close to complete, but the broader vision and technical blueprint still require several product systems before Hugr is complete:
 
 - Daemon/runtime service: `hugr daemon` local HTTP transport, file watching, debounced background indexing, and periodic memory-maintenance audits exist.
-- Remote/cloud execution: direct remote libSQL/Turso storage mode exists; `hugr sync status` exposes the Hugr API contract metadata; explicit API sync push, pull, and history requests can use a configured hosted endpoint; and `hugr daemon` now exposes authenticated `/v1/sync/*` routes that accept memory, project, source-reference, entity, and edge row payloads, reconcile them, and persist accepted runs. Index, session, and embedding row payload reconciliation, live client/server integration tests, and ordinary API-backed storage commands are still missing.
+- Remote/cloud execution: direct remote libSQL/Turso storage mode exists; `hugr sync status` exposes the Hugr API contract metadata; explicit API sync push, pull, and history requests can use a configured hosted endpoint; and `hugr daemon` now exposes authenticated `/v1/sync/*` routes that accept and reconcile all currently syncable safe row payload classes, then persist accepted runs. Live client/server integration tests and ordinary API-backed storage commands are still missing.
 - Context pack persistence: durable `context_packs` storage and real sync behavior for the `context_packs` sync class.
 - Context graph expansion: use code/source/entity graph neighborhoods during `hugr context`, not only direct file/symbol/memory retrieval.
 - Structured memory provenance: promoted session memories preserve structured payloads in JSON, and CLI/MCP memory writes support manual source attachments plus confidence, sensitivity, validity metadata, and project scope.
@@ -416,7 +417,7 @@ Implemented first slice:
 - For `HUGR_SYNC_BACKEND=hugr_api`, `hugr sync status [--json]` exposes the configured endpoint, `hugr-api-v1` contract version, and the planned `/v1/sync/*` route surface.
 - For explicit API sync execution, Hugr posts contract JSON to `POST /v1/sync/push` and `POST /v1/sync/pull`, fetches `GET /v1/sync/history`, and parses hosted table counters plus memory row payloads into the existing sync result types.
 - `hugr daemon` serves authenticated `GET /v1/sync/status`, `POST /v1/sync/push`, `POST /v1/sync/pull`, and `GET /v1/sync/history` routes using `HUGR_API_TOKEN` or `HUGR_REMOTE_AUTH_TOKEN` as the bearer token.
-- Hosted API push and pull validate the contract version, transfer memory/project/source/entity/edge row payloads, apply supported rows server-side on push, return supported rows on pull, and persist accepted runs into sync history; row payload transfer for indexes, sessions, and embeddings remains pending and is reported as partial rather than silently accepted.
+- Hosted API push and pull validate the contract version, transfer project/memory/embedding/source/discovered-file/entity/code-symbol/edge/code-reference/finalized-session row payloads, apply supported rows server-side on push, return supported rows on pull, and persist accepted runs into sync history.
 - `hugr sync push [--dry-run|--execute] [--json]` counts configured sync-class tables locally by default, writes to direct libSQL/Turso when `--execute` and hybrid remote config are explicit, or posts to the Hugr API backend when selected.
 - `hugr sync pull [--dry-run|--execute] [--json]` counts configured sync-class tables locally by default, reads from direct libSQL/Turso when `--execute` and hybrid remote config are explicit, or posts to the Hugr API backend when selected.
 - Sync push currently covers project metadata, memories, embeddings, source references, entity/code-symbol indexes, graph/code-reference edges, and finalized session summaries. It does not sync raw session events, shell output, secrets, private notes, or full source without future explicit data sources.
@@ -520,6 +521,7 @@ Recommended next commits:
 53. Done: `feat(daemon): serve Hugr API sync routes`
 54. Done: `feat(sync): reconcile API memory rows`
 55. Done: `feat(sync): reconcile API graph rows`
+56. Done: `feat(sync): reconcile API index rows`
 
 Each commit should leave the CLI usable.
 
@@ -536,6 +538,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add row-level Hugr API sync reconciliation for index/session/embedding rows.
+Add API-backed storage operations for remote-mode memory commands.
 
-That is the right next step because memory, project, source-reference, entity, and graph edge rows now move through the Hugr API and reconcile with direct-sync-compatible behavior. The remaining remote/cloud gap is adding row payloads and API reconciliation for embeddings, discovered files, code symbols, code references, finalized sessions, live client/server contract tests, and remote-mode memory commands that do not depend on a local libSQL connection.
+That is the right next step because all currently syncable safe row payload classes now move through the Hugr API and reconcile with direct-sync-compatible behavior. The remaining remote/cloud gap is making ordinary remote-mode memory commands use the API instead of requiring a local libSQL connection, then adding automated live client/server contract coverage.
