@@ -4,6 +4,7 @@ mod commands;
 mod context;
 mod daemon;
 mod discovery;
+mod edit;
 mod embedding;
 mod impact;
 mod indexer;
