@@ -32,6 +32,20 @@ pub enum Command {
         body: String,
         format: OutputFormat,
     },
+    RenameSymbol {
+        path: String,
+        name: String,
+        new_name: String,
+        kind: Option<String>,
+        format: OutputFormat,
+    },
+    MoveSymbol {
+        source_path: String,
+        name: String,
+        destination_path: String,
+        kind: Option<String>,
+        format: OutputFormat,
+    },
     ProjectStatus,
     SessionStart {
         task: String,
@@ -149,6 +163,8 @@ impl Command {
                 })
             }
             "replace-symbol" => parse_replace_symbol_command(args),
+            "rename-symbol" => parse_rename_symbol_command(args),
+            "move-symbol" => parse_move_symbol_command(args),
             "project" => parse_project_command(args),
             "session" => parse_session_command(args),
             "sync" => parse_sync_command(args),
@@ -397,6 +413,89 @@ fn parse_run_command(args: &[String]) -> Result<Command, String> {
     } else {
         Ok(Command::Run { command })
     }
+}
+
+fn parse_move_symbol_command(args: &[String]) -> Result<Command, String> {
+    let mut positional = Vec::new();
+    let mut kind = None;
+    let mut format = OutputFormat::Markdown;
+    let mut index = 2;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--json" {
+            format = OutputFormat::Json;
+        } else if arg == "--kind" {
+            index += 1;
+            kind = Some(required_option_value(
+                args.get(index).map(String::as_str),
+                "hugr move-symbol --kind",
+            )?);
+        } else if let Some(value) = arg.strip_prefix("--kind=") {
+            kind = Some(required_option_value(Some(value), "hugr move-symbol --kind")?);
+        } else if arg.starts_with("--") {
+            return Err(format!("unknown option '{arg}'"));
+        } else {
+            positional.push(arg.clone());
+        }
+
+        index += 1;
+    }
+
+    let [source_path, name, destination_path] = positional.as_slice() else {
+        return Err("hugr move-symbol requires <source-path> <symbol> <destination-path>".to_string());
+    };
+
+    Ok(Command::MoveSymbol {
+        source_path: source_path.clone(),
+        name: name.clone(),
+        destination_path: destination_path.clone(),
+        kind,
+        format,
+    })
+}
+
+fn parse_rename_symbol_command(args: &[String]) -> Result<Command, String> {
+    let mut positional = Vec::new();
+    let mut kind = None;
+    let mut format = OutputFormat::Markdown;
+    let mut index = 2;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--json" {
+            format = OutputFormat::Json;
+        } else if arg == "--kind" {
+            index += 1;
+            kind = Some(required_option_value(
+                args.get(index).map(String::as_str),
+                "hugr rename-symbol --kind",
+            )?);
+        } else if let Some(value) = arg.strip_prefix("--kind=") {
+            kind = Some(required_option_value(
+                Some(value),
+                "hugr rename-symbol --kind",
+            )?);
+        } else if arg.starts_with("--") {
+            return Err(format!("unknown option '{arg}'"));
+        } else {
+            positional.push(arg.clone());
+        }
+
+        index += 1;
+    }
+
+    let [path, name, new_name] = positional.as_slice() else {
+        return Err("hugr rename-symbol requires <path> <symbol> <new-symbol>".to_string());
+    };
+
+    Ok(Command::RenameSymbol {
+        path: path.clone(),
+        name: name.clone(),
+        new_name: new_name.clone(),
+        kind,
+        format,
+    })
 }
 
 fn parse_replace_symbol_command(args: &[String]) -> Result<Command, String> {
@@ -650,7 +749,7 @@ fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions,
 }
 
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr replace-symbol [--json] [--kind <kind>] <path> <symbol> (--body <source> | --body-file <path>)\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr replace-symbol [--json] [--kind <kind>] <path> <symbol> (--body <source> | --body-file <path>)\n  hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>\n  hugr move-symbol [--json] [--kind <kind>] <source-path> <symbol> <destination-path>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
 }
 
 #[cfg(test)]
@@ -775,6 +874,77 @@ mod tests {
                 body: "pub fn greet() {}".into(),
                 format: OutputFormat::Markdown,
             })
+        );
+    }
+
+    #[test]
+    fn parses_rename_symbol_command() {
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "rename-symbol".into(),
+                "--json".into(),
+                "--kind".into(),
+                "function".into(),
+                "src/lib.rs".into(),
+                "greet".into(),
+                "welcome".into(),
+            ]),
+            Ok(Command::RenameSymbol {
+                path: "src/lib.rs".into(),
+                name: "greet".into(),
+                new_name: "welcome".into(),
+                kind: Some("function".into()),
+                format: OutputFormat::Json,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_rename_symbol_missing_positional() {
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "rename-symbol".into(),
+                "src/lib.rs".into(),
+                "greet".into(),
+            ]),
+            Err("hugr rename-symbol requires <path> <symbol> <new-symbol>".into())
+        );
+    }
+
+    #[test]
+    fn parses_move_symbol_command() {
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "move-symbol".into(),
+                "--json".into(),
+                "--kind=function".into(),
+                "src/lib.rs".into(),
+                "helper".into(),
+                "src/helpers.rs".into(),
+            ]),
+            Ok(Command::MoveSymbol {
+                source_path: "src/lib.rs".into(),
+                name: "helper".into(),
+                destination_path: "src/helpers.rs".into(),
+                kind: Some("function".into()),
+                format: OutputFormat::Json,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_move_symbol_missing_positional() {
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "move-symbol".into(),
+                "src/lib.rs".into(),
+                "helper".into(),
+            ]),
+            Err("hugr move-symbol requires <source-path> <symbol> <destination-path>".into())
         );
     }
 
