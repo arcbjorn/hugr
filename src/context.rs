@@ -1372,8 +1372,34 @@ fn build_risk_signals(
         signals.push(signal);
     }
 
+    if let Some(signal) = public_api_surface_signal(symbols, graph_neighbors) {
+        signals.push(signal);
+    }
+
+    if let Some(signal) = unreferenced_private_symbol_signal(symbols, graph_neighbors) {
+        signals.push(signal);
+    }
+
     if let Some(signal) = large_symbol_health_signal(symbols) {
         signals.push(signal);
+    }
+
+    let edit_after_context = freshness_signals
+        .iter()
+        .filter(|signal| signal.kind == "edit_after_context")
+        .map(|signal| format!("{}: {}", signal.path, signal.detail))
+        .collect::<Vec<_>>();
+    if !edit_after_context.is_empty() {
+        signals.push(context_risk_signal(
+            "medium",
+            "stale_after_edit",
+            format!(
+                "Hugr edit events occurred after the latest persisted context pack: {}",
+                summarize_values(&edit_after_context, 3)
+            ),
+            760 + edit_after_context.len() * 25,
+            "session edit events are newer than persisted context evidence",
+        ));
     }
 
     let stale_index_paths = freshness_signals
@@ -1534,6 +1560,163 @@ fn refactor_surface_signal(graph_neighbors: &[ContextGraphNeighbor]) -> Option<C
         700 + files.len() * 25 + reference_neighbors.len() * 10,
         "code graph neighbors cross multiple files",
     ))
+}
+
+fn unreferenced_private_symbol_signal(
+    symbols: &[ContextSymbol],
+    graph_neighbors: &[ContextGraphNeighbor],
+) -> Option<ContextRiskSignal> {
+    let mut unreferenced_symbols = symbols
+        .iter()
+        .filter(|symbol| symbol_kind_can_be_unreferenced(symbol))
+        .filter(|symbol| !symbol_looks_public_or_exported(symbol))
+        .filter(|symbol| !symbol_likely_entrypoint(symbol))
+        .filter(|symbol| incoming_reference_count(symbol, graph_neighbors) == 0)
+        .collect::<Vec<_>>();
+
+    if unreferenced_symbols.is_empty() {
+        return None;
+    }
+
+    unreferenced_symbols.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+
+    let summaries = unreferenced_symbols
+        .iter()
+        .map(|symbol| {
+            format!(
+                "{} {} at {}:{}",
+                symbol.kind, symbol.name, symbol.path, symbol.line_start
+            )
+        })
+        .collect::<Vec<_>>();
+
+    Some(context_risk_signal(
+        "low",
+        "unreferenced_private_symbol",
+        format!(
+            "private indexed symbols have no incoming references in the code graph: {}",
+            summarize_values(&summaries, 4)
+        ),
+        520 + unreferenced_symbols.len() * 15,
+        "selected private symbols have no incoming indexed references",
+    ))
+}
+
+fn symbol_kind_can_be_unreferenced(symbol: &ContextSymbol) -> bool {
+    matches!(symbol.kind.as_str(), "function" | "method")
+}
+
+fn symbol_likely_entrypoint(symbol: &ContextSymbol) -> bool {
+    let lower = symbol.name.to_lowercase();
+    lower == "main"
+        || lower == "init"
+        || lower == "new"
+        || lower == "default"
+        || lower.starts_with("test_")
+        || lower.ends_with("_test")
+}
+
+fn public_api_surface_signal(
+    symbols: &[ContextSymbol],
+    graph_neighbors: &[ContextGraphNeighbor],
+) -> Option<ContextRiskSignal> {
+    let mut public_symbols = symbols
+        .iter()
+        .filter(|symbol| symbol_looks_public_or_exported(symbol))
+        .map(|symbol| (incoming_reference_count(symbol, graph_neighbors), symbol))
+        .collect::<Vec<_>>();
+    if public_symbols.is_empty() {
+        return None;
+    }
+
+    public_symbols.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.path.cmp(&right.1.path))
+            .then_with(|| left.1.name.cmp(&right.1.name))
+            .then_with(|| left.1.kind.cmp(&right.1.kind))
+    });
+
+    let total_references = public_symbols
+        .iter()
+        .map(|(reference_count, _)| *reference_count)
+        .sum::<usize>();
+    let summaries = public_symbols
+        .iter()
+        .map(|(reference_count, symbol)| {
+            let references = if *reference_count == 0 {
+                "no incoming indexed references".to_string()
+            } else {
+                format!("{reference_count} incoming indexed reference(s)")
+            };
+            format!(
+                "{} {} at {}:{} ({references})",
+                symbol.kind, symbol.name, symbol.path, symbol.line_start
+            )
+        })
+        .collect::<Vec<_>>();
+    let severity = if public_symbols.len() >= 4 || total_references >= 4 {
+        "high"
+    } else {
+        "medium"
+    };
+
+    Some(context_risk_signal(
+        severity,
+        "public_api_surface",
+        format!(
+            "public or exported symbols are in scope: {}",
+            summarize_values(&summaries, 3)
+        ),
+        650 + public_symbols.len() * 25 + total_references * 15,
+        "symbol signatures suggest public or exported API",
+    ))
+}
+
+fn symbol_looks_public_or_exported(symbol: &ContextSymbol) -> bool {
+    let signature = symbol.signature.trim_start();
+    let lower = signature.to_lowercase();
+    let starts_with_public_keyword = [
+        "pub ",
+        "pub(",
+        "public ",
+        "open ",
+        "export ",
+        "export\t",
+        "export default ",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix));
+
+    starts_with_public_keyword
+        || symbol
+            .language
+            .as_deref()
+            .is_some_and(|language| language == "go" && starts_with_uppercase(&symbol.name))
+}
+
+fn starts_with_uppercase(value: &str) -> bool {
+    value.chars().next().is_some_and(char::is_uppercase)
+}
+
+fn incoming_reference_count(
+    symbol: &ContextSymbol,
+    graph_neighbors: &[ContextGraphNeighbor],
+) -> usize {
+    graph_neighbors
+        .iter()
+        .filter(|neighbor| neighbor.kind == "incoming_reference")
+        .filter(|neighbor| {
+            neighbor.target_path.as_deref() == Some(symbol.path.as_str())
+                && neighbor.target_name.as_deref() == Some(symbol.name.as_str())
+        })
+        .count()
 }
 
 fn large_symbol_health_signal(symbols: &[ContextSymbol]) -> Option<ContextRiskSignal> {
@@ -2367,6 +2550,122 @@ mod tests {
     }
 
     #[test]
+    fn public_symbols_render_as_api_surface_risks() {
+        let pack =
+            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
+                "change plugin hook api",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![
+                    CodeSymbol {
+                        path: "src/plugin_hooks.rs".to_string(),
+                        language: Some("rust".to_string()),
+                        name: "run_after_config".to_string(),
+                        kind: "function".to_string(),
+                        line_start: 12,
+                        line_end: Some(16),
+                        signature: "pub fn run_after_config()".to_string(),
+                    },
+                    CodeSymbol {
+                        path: "src/plugin_hooks.rs".to_string(),
+                        language: Some("rust".to_string()),
+                        name: "private_helper".to_string(),
+                        kind: "function".to_string(),
+                        line_start: 18,
+                        line_end: Some(20),
+                        signature: "fn private_helper()".to_string(),
+                    },
+                ],
+                Vec::new(),
+                None,
+                Vec::new(),
+                vec![
+                    GraphNeighbor {
+                        kind: "incoming_reference".to_string(),
+                        label: "src/main.rs:8 references function run_after_config".to_string(),
+                        detail: "call reference to function run_after_config".to_string(),
+                        path: Some("src/main.rs".to_string()),
+                        target_path: Some("src/plugin_hooks.rs".to_string()),
+                        target_name: Some("run_after_config".to_string()),
+                        line_start: Some(8),
+                    },
+                    GraphNeighbor {
+                        kind: "incoming_reference".to_string(),
+                        label: "src/worker.rs:14 references function run_after_config".to_string(),
+                        detail: "call reference to function run_after_config".to_string(),
+                        path: Some("src/worker.rs".to_string()),
+                        target_path: Some("src/plugin_hooks.rs".to_string()),
+                        target_name: Some("run_after_config".to_string()),
+                        line_start: Some(14),
+                    },
+                ],
+                Vec::new(),
+                Vec::new(),
+            );
+
+        let markdown = pack.render_markdown();
+        let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
+        let risk_kinds = parsed["risk_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|risk| risk["kind"].as_str())
+            .collect::<Vec<_>>();
+        let public_api_summary = parsed["risk_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|risk| risk["kind"].as_str() == Some("public_api_surface"))
+            .and_then(|risk| risk["summary"].as_str())
+            .unwrap();
+
+        assert!(risk_kinds.contains(&"public_api_surface"));
+        assert!(markdown.contains("risk:public_api_surface [risk]"));
+        assert!(public_api_summary.contains("function run_after_config"));
+        assert!(!public_api_summary.contains("private_helper"));
+    }
+
+    #[test]
+    fn unreferenced_private_symbols_render_as_health_risks() {
+        let pack =
+            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
+                "clean plugin helper",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![CodeSymbol {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    language: Some("rust".to_string()),
+                    name: "private_helper".to_string(),
+                    kind: "function".to_string(),
+                    line_start: 18,
+                    line_end: Some(20),
+                    signature: "fn private_helper()".to_string(),
+                }],
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            );
+
+        let markdown = pack.render_markdown();
+        let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
+        let risk_kinds = parsed["risk_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|risk| risk["kind"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(risk_kinds.contains(&"unreferenced_private_symbol"));
+        assert!(markdown.contains("risk:unreferenced_private_symbol [risk]"));
+        assert!(markdown.contains("function private_helper at src/plugin_hooks.rs:18"));
+    }
+
+    #[test]
     fn freshness_signals_render_as_risk_signals() {
         let pack =
             ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
@@ -2406,6 +2705,47 @@ mod tests {
 
         assert!(pack.render_markdown().contains("risk:stale_index [risk]"));
         assert!(risk_kinds.contains(&"stale_index"));
+    }
+
+    #[test]
+    fn edit_freshness_signals_render_as_stale_after_edit_risks() {
+        let pack =
+            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
+                "refresh plugin hooks",
+                vec![FileCandidate {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    score: 5,
+                    language: Some("rust".to_string()),
+                    size_bytes: Some(100),
+                }],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+                vec![FreshnessSignal {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    kind: "edit_after_context".to_string(),
+                    detail: "src/plugin_hooks.rs has a Hugr edit event after context".to_string(),
+                    indexed_at_ms: Some(10),
+                    modified_at_ms: Some(20),
+                }],
+                Vec::new(),
+            );
+
+        let markdown = pack.render_markdown();
+        let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
+        let risk_kinds = parsed["risk_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|risk| risk["kind"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(risk_kinds.contains(&"stale_after_edit"));
+        assert!(markdown.contains("risk:stale_after_edit [risk]"));
     }
 
     #[test]
