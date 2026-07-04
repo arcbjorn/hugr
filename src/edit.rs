@@ -82,6 +82,7 @@ pub(crate) struct SymbolMove {
     pub old_line_start: i64,
     pub old_line_end: i64,
     pub moved_line_count: usize,
+    pub rewritten_reference_count: usize,
     pub changed_files: Vec<SymbolMoveFile>,
 }
 
@@ -278,6 +279,8 @@ pub(crate) fn plan_move(
     source_contents: &str,
     destination_path: &str,
     destination_contents: &str,
+    reference_files: Vec<(String, String)>,
+    rewrite_references: bool,
 ) -> Result<PlannedMove, String> {
     let destination_path = destination_path.trim();
     if destination_path.is_empty() {
@@ -301,10 +304,12 @@ pub(crate) fn plan_move(
         .iter()
         .filter(|reference| reference.target_path == target.path)
         .filter(|reference| reference.target_name == target.name)
-        .count();
-    if inbound_references > 0 {
+        .cloned()
+        .collect::<Vec<_>>();
+    let inbound_reference_count = inbound_references.len();
+    if inbound_reference_count > 0 && !rewrite_references {
         return Err(format!(
-            "move-symbol refuses to move '{}' because it has {inbound_references} indexed inbound reference(s); update references first or use a future reference-rewriting move",
+            "move-symbol refuses to move '{}' because it has {inbound_reference_count} indexed inbound reference(s); pass --rewrite-references to rewrite supported references",
             target.name
         ));
     }
@@ -314,6 +319,19 @@ pub(crate) fn plan_move(
     validate_span(old_line_start, old_line_end, &target.path)?;
 
     reject_destination_symbol_collision(destination_path, destination_contents, target)?;
+
+    let reference_rewrite = if rewrite_references {
+        plan_reference_rewrites(
+            target,
+            destination_path,
+            source_language,
+            destination_language,
+            &inbound_references,
+            reference_files,
+        )?
+    } else {
+        PlannedReferenceRewrite::default()
+    };
 
     let moved_body =
         extract_line_range(source_contents, old_line_start, old_line_end, &target.path)?;
@@ -336,17 +354,34 @@ pub(crate) fn plan_move(
 
     validate_moved_symbol_in_destination(destination_path, &destination_after, target)?;
 
+    let mut files = vec![
+        PlannedMoveFile {
+            path: target.path.clone(),
+            contents: source_after,
+        },
+        PlannedMoveFile {
+            path: destination_path.to_string(),
+            contents: destination_after,
+        },
+    ];
+    files.extend(reference_rewrite.files);
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let mut changed_files = vec![
+        SymbolMoveFile {
+            path: target.path.clone(),
+            action: "removed".to_string(),
+        },
+        SymbolMoveFile {
+            path: destination_path.to_string(),
+            action: "appended".to_string(),
+        },
+    ];
+    changed_files.extend(reference_rewrite.changed_files);
+    changed_files.sort_by(|left, right| left.path.cmp(&right.path));
+
     Ok(PlannedMove {
-        files: vec![
-            PlannedMoveFile {
-                path: target.path.clone(),
-                contents: source_after,
-            },
-            PlannedMoveFile {
-                path: destination_path.to_string(),
-                contents: destination_after,
-            },
-        ],
+        files,
         summary: SymbolMove {
             source_path: target.path.clone(),
             destination_path: destination_path.to_string(),
@@ -356,18 +391,161 @@ pub(crate) fn plan_move(
             old_line_start,
             old_line_end,
             moved_line_count: moved_body.lines().count(),
-            changed_files: vec![
-                SymbolMoveFile {
-                    path: target.path.clone(),
-                    action: "removed".to_string(),
-                },
-                SymbolMoveFile {
-                    path: destination_path.to_string(),
-                    action: "appended".to_string(),
-                },
-            ],
+            rewritten_reference_count: reference_rewrite.rewritten_reference_count,
+            changed_files,
         },
     })
+}
+
+#[derive(Debug, Default)]
+struct PlannedReferenceRewrite {
+    files: Vec<PlannedMoveFile>,
+    changed_files: Vec<SymbolMoveFile>,
+    rewritten_reference_count: usize,
+}
+
+fn plan_reference_rewrites(
+    target: &CodeSymbol,
+    destination_path: &str,
+    source_language: Option<&str>,
+    destination_language: Option<&str>,
+    inbound_references: &[CodeReference],
+    reference_files: Vec<(String, String)>,
+) -> Result<PlannedReferenceRewrite, String> {
+    if inbound_references.is_empty() {
+        return Ok(PlannedReferenceRewrite::default());
+    }
+    if source_language != Some("rust") || destination_language != Some("rust") {
+        return Err(
+            "move-symbol --rewrite-references currently supports Rust source files only"
+                .to_string(),
+        );
+    }
+    if inbound_references
+        .iter()
+        .any(|reference| reference.path == target.path || reference.path == destination_path)
+    {
+        return Err(
+            "move-symbol --rewrite-references does not yet support references from the source or destination file"
+                .to_string(),
+        );
+    }
+
+    let old_module = rust_module_path_for_source(&target.path).ok_or_else(|| {
+        format!(
+            "move-symbol --rewrite-references cannot derive a Rust module path for {}",
+            target.path
+        )
+    })?;
+    let new_module = rust_module_path_for_source(destination_path).ok_or_else(|| {
+        format!(
+            "move-symbol --rewrite-references cannot derive a Rust module path for {destination_path}"
+        )
+    })?;
+    let old_qualified = format!("{old_module}::{}", target.name);
+    let new_qualified = format!("{new_module}::{}", target.name);
+    let reference_contents = reference_files.into_iter().collect::<BTreeMap<_, _>>();
+    let mut references_by_path = BTreeMap::<String, Vec<CodeReference>>::new();
+    for reference in inbound_references {
+        references_by_path
+            .entry(reference.path.clone())
+            .or_default()
+            .push(reference.clone());
+    }
+
+    let mut files = Vec::new();
+    let mut changed_files = Vec::new();
+    let mut rewritten_reference_count = 0;
+    for (path, references) in references_by_path {
+        let Some(contents) = reference_contents.get(&path) else {
+            return Err(format!(
+                "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
+            ));
+        };
+        let mut line_numbers = BTreeSet::new();
+        for reference in &references {
+            line_numbers.insert(reference.line_start);
+        }
+        let (rewritten, replacement_count) =
+            replace_qualified_path_on_lines(&path, contents, &old_qualified, &new_qualified, &line_numbers)?;
+        if replacement_count == 0 {
+            return Err(format!(
+                "move-symbol --rewrite-references could not rewrite {old_qualified} in indexed references for {path}"
+            ));
+        }
+        if !code::parses_cleanly(&path, language_for_path(&path), &rewritten)? {
+            return Err(format!(
+                "referencing file {path} would not parse after moving '{}'",
+                target.name
+            ));
+        }
+        rewritten_reference_count += replacement_count;
+        files.push(PlannedMoveFile {
+            path: path.clone(),
+            contents: rewritten,
+        });
+        changed_files.push(SymbolMoveFile {
+            path,
+            action: "rewrote references".to_string(),
+        });
+    }
+
+    Ok(PlannedReferenceRewrite {
+        files,
+        changed_files,
+        rewritten_reference_count,
+    })
+}
+
+fn rust_module_path_for_source(path: &str) -> Option<String> {
+    let without_prefix = path.strip_prefix("src/")?;
+    let without_extension = without_prefix.strip_suffix(".rs")?;
+    let module = match without_extension {
+        "lib" | "main" => "crate".to_string(),
+        value if value.ends_with("/mod") => {
+            let value = value.trim_end_matches("/mod");
+            format!("crate::{}", value.replace('/', "::"))
+        }
+        value => format!("crate::{}", value.replace('/', "::")),
+    };
+    Some(module)
+}
+
+fn replace_qualified_path_on_lines(
+    path: &str,
+    contents: &str,
+    old_qualified: &str,
+    new_qualified: &str,
+    line_numbers: &BTreeSet<i64>,
+) -> Result<(String, usize), String> {
+    let trailing_newline = contents.ends_with('\n');
+    let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut replacement_count = 0;
+
+    for line_number in line_numbers {
+        if *line_number < 1 {
+            return Err(format!(
+                "move-symbol reference line {line_number} in {path} is invalid"
+            ));
+        }
+        let index = usize::try_from(line_number - 1).map_err(|error| error.to_string())?;
+        let Some(line) = lines.get_mut(index) else {
+            return Err(format!(
+                "move-symbol reference line {line_number} is past end of {path}"
+            ));
+        };
+        let count = line.matches(old_qualified).count();
+        if count > 0 {
+            *line = line.replace(old_qualified, new_qualified);
+            replacement_count += count;
+        }
+    }
+
+    let mut rendered = lines.join("\n");
+    if trailing_newline {
+        rendered.push('\n');
+    }
+    Ok((rendered, replacement_count))
 }
 
 fn language_for_path(path: &str) -> Option<&'static str> {
@@ -962,6 +1140,11 @@ impl SymbolMove {
             self.language.as_deref().unwrap_or("unknown")
         );
         let _ = writeln!(rendered, "\n## Lines\n{}", self.moved_line_count);
+        let _ = writeln!(
+            rendered,
+            "\n## Rewritten References\n{}",
+            self.rewritten_reference_count
+        );
         rendered.push_str("\n## Changed Files\n");
         for file in &self.changed_files {
             let _ = writeln!(rendered, "- {}: {}", file.path, file.action);
@@ -985,7 +1168,8 @@ impl SymbolMove {
         format!(
             "{{\"source_path\":{},\"destination_path\":{},\"language\":{},\"name\":{},\
              \"kind\":{},\"old_line_start\":{},\"old_line_end\":{},\
-             \"moved_line_count\":{},\"changed_files\":[{}]}}",
+             \"moved_line_count\":{},\"rewritten_reference_count\":{},\
+             \"changed_files\":[{}]}}",
             json_string(&self.source_path),
             json_string(&self.destination_path),
             self.language
@@ -997,6 +1181,7 @@ impl SymbolMove {
             self.old_line_start,
             self.old_line_end,
             self.moved_line_count,
+            self.rewritten_reference_count,
             changed_files
         )
     }
@@ -1323,7 +1508,16 @@ mod tests {
         let target =
             resolve_symbol_in_source("src/lib.rs", source, "helper", None, "move").unwrap();
 
-        let planned = plan_move(&target, &[], source, "src/helpers.rs", destination).unwrap();
+        let planned = plan_move(
+            &target,
+            &[],
+            source,
+            "src/helpers.rs",
+            destination,
+            Vec::new(),
+            false,
+        )
+        .unwrap();
         let source_file = planned
             .files
             .iter()
@@ -1377,6 +1571,8 @@ mod tests {
             RUST_SOURCE,
             "src/helpers.rs",
             "pub fn existing() {}\n",
+            Vec::new(),
+            false,
         )
         .unwrap_err();
 
@@ -1393,9 +1589,66 @@ mod tests {
             RUST_SOURCE,
             "src/helpers.rs",
             "pub fn greet() {}\n",
+            Vec::new(),
+            false,
         )
         .unwrap_err();
 
         assert!(error.contains("would collide"), "{error}");
+    }
+
+    #[test]
+    fn plans_move_with_rust_reference_rewrites() {
+        let source = "pub fn helper() -> u8 {\n    1\n}\n\npub fn other() {}\n";
+        let destination = "pub fn existing() {}\n";
+        let caller = "use crate::lib::helper;\n\nfn main() {\n    let _ = helper();\n}\n";
+        let target =
+            resolve_symbol_in_source("src/lib.rs", source, "helper", None, "move").unwrap();
+        let references = vec![
+            CodeReference {
+                path: "src/main.rs".to_string(),
+                language: Some("rust".to_string()),
+                target_path: "src/lib.rs".to_string(),
+                target_name: "helper".to_string(),
+                target_kind: "function".to_string(),
+                kind: "import".to_string(),
+                line_start: 1,
+                excerpt: "use crate::lib::helper;".to_string(),
+            },
+            CodeReference {
+                path: "src/main.rs".to_string(),
+                language: Some("rust".to_string()),
+                target_path: "src/lib.rs".to_string(),
+                target_name: "helper".to_string(),
+                target_kind: "function".to_string(),
+                kind: "call".to_string(),
+                line_start: 4,
+                excerpt: "helper();".to_string(),
+            },
+        ];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "src/helpers.rs",
+            destination,
+            vec![("src/main.rs".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+        let caller_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/main.rs")
+            .unwrap();
+
+        assert!(caller_file.contents.contains("use crate::helpers::helper;"));
+        assert!(caller_file.contents.contains("helper();"));
+        assert_eq!(planned.summary.rewritten_reference_count, 1);
+        assert!(planned
+            .summary
+            .render_json()
+            .contains("\"rewritten_reference_count\":1"));
     }
 }
