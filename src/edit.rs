@@ -315,8 +315,10 @@ pub(crate) fn plan_move(
 
     reject_destination_symbol_collision(destination_path, destination_contents, target)?;
 
-    let moved_body = extract_line_range(source_contents, old_line_start, old_line_end, &target.path)?;
-    let source_after = remove_line_range(source_contents, old_line_start, old_line_end, &target.path)?;
+    let moved_body =
+        extract_line_range(source_contents, old_line_start, old_line_end, &target.path)?;
+    let source_after =
+        remove_line_range(source_contents, old_line_start, old_line_end, &target.path)?;
     let destination_after = append_symbol_body(destination_contents, &moved_body);
 
     if !code::parses_cleanly(&target.path, source_language, &source_after)? {
@@ -1002,7 +1004,7 @@ impl SymbolMove {
 
 #[cfg(test)]
 mod tests {
-    use super::{plan_rename, plan_replacement, resolve_symbol_in_source};
+    use super::{plan_move, plan_rename, plan_replacement, resolve_symbol_in_source};
     use crate::code::CodeReference;
 
     const RUST_SOURCE: &str =
@@ -1321,8 +1323,7 @@ mod tests {
         let target =
             resolve_symbol_in_source("src/lib.rs", source, "helper", None, "move").unwrap();
 
-        let planned =
-            plan_move(&target, &[], source, "src/helpers.rs", destination).unwrap();
+        let planned = plan_move(&target, &[], source, "src/helpers.rs", destination).unwrap();
         let source_file = planned
             .files
             .iter()
@@ -1341,8 +1342,18 @@ mod tests {
         assert_eq!(planned.summary.source_path, "src/lib.rs");
         assert_eq!(planned.summary.destination_path, "src/helpers.rs");
         assert_eq!(planned.summary.moved_line_count, 3);
-        assert!(planned.summary.render_markdown().contains("src/lib.rs:1-3 -> src/helpers.rs"));
-        assert!(planned.summary.render_json().contains("\"destination_path\":\"src/helpers.rs\""));
+        assert!(
+            planned
+                .summary
+                .render_markdown()
+                .contains("src/lib.rs:1-3 -> src/helpers.rs")
+        );
+        assert!(
+            planned
+                .summary
+                .render_json()
+                .contains("\"destination_path\":\"src/helpers.rs\"")
+        );
     }
 
     #[test]
