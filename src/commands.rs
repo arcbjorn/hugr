@@ -1,4 +1,5 @@
 use crate::cli::{Command, MemoryWriteArgs, OutputFormat, help_text};
+use crate::code::CodeSymbol;
 use crate::context::{ContextPack, json_string};
 use crate::daemon;
 use crate::discovery;
@@ -6,9 +7,10 @@ use crate::impact as impact_analysis;
 use crate::indexer;
 use crate::mcp;
 use crate::store::{
-    ForgetResult, Memory, MemoryConsolidationResult, MemoryMaintenanceReport, MemorySource,
-    MemoryWriteOptions, SessionPromotionResult, StaleRetirementResult, Store, SyncConflictSummary,
-    SyncExecutionPlan, SyncPullResult, SyncPushResult, SyncRunHistory, SyncTableResult,
+    DiagnosticInput, ForgetResult, Memory, MemoryConsolidationResult, MemoryMaintenanceReport,
+    MemorySource, MemoryWriteOptions, SessionPromotionResult, StaleRetirementResult, Store,
+    SyncConflictSummary, SyncExecutionPlan, SyncPullResult, SyncPushResult, SyncRunHistory,
+    SyncTableResult,
 };
 use crate::worktree;
 use std::collections::HashSet;
@@ -25,6 +27,7 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::Recall { query, format } => recall(&query, format).await,
         Command::Context { task, format } => context(&task, format).await,
         Command::Index => index().await,
+        Command::Symbols { query, format } => symbols(&query, format).await,
         Command::Impact { target, format } => impact(&target, format).await,
         Command::ProjectStatus => project_status().await,
         Command::SessionStart { task } => session_start(&task).await,
@@ -181,9 +184,16 @@ pub(crate) async fn compile_context_pack(task: &str) -> Result<ContextPack, Stri
         .map(|candidate| candidate.path.clone())
         .collect::<Vec<_>>();
     let affected_tests = store.likely_tests_for_files(&files, 5).await?;
+    let graph_neighbors = store
+        .context_graph_neighbors(task, &files, &symbols, 12)
+        .await?;
+    let freshness_signals = store
+        .context_freshness_signals(&files, &symbols, 12)
+        .await?;
+    let diagnostics = store.recent_diagnostics(task, &files, &symbols, 8).await?;
     let branch_state = worktree::inspect(Path::new("."));
-    Ok(
-        ContextPack::with_file_candidates_sessions_symbols_tests_branch_and_stale_risks(
+    let pack =
+        ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
             task,
             file_candidates,
             memories,
@@ -192,8 +202,14 @@ pub(crate) async fn compile_context_pack(task: &str) -> Result<ContextPack, Stri
             affected_tests,
             Some(branch_state),
             stale_candidates,
-        ),
-    )
+            graph_neighbors,
+            freshness_signals,
+            diagnostics,
+        );
+    store
+        .record_context_pack(&pack.task, &pack.render_json())
+        .await?;
+    Ok(pack)
 }
 
 async fn index() -> Result<(), String> {
@@ -213,6 +229,20 @@ async fn index() -> Result<(), String> {
         "symbol_kinds: {}",
         indexer::format_classifications(&summary.symbol_kinds)
     );
+    Ok(())
+}
+
+async fn symbols(query: &str, format: OutputFormat) -> Result<(), String> {
+    indexer::index_project(5000).await?;
+    let store = Store::open_current();
+    let symbols = store.symbols_for_target(query, 25).await?;
+
+    if format == OutputFormat::Json {
+        println!("{}", render_symbols_json(query, &symbols));
+    } else {
+        print!("{}", render_symbols_text(query, &symbols));
+    }
+
     Ok(())
 }
 
@@ -318,9 +348,14 @@ async fn run_observed_command(command: &[String]) -> Result<(), String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let detail = command_observation_detail(command, output.status.code(), &stdout, &stderr);
-    let _ = Store::open_current()
+    let store = Store::open_current();
+    let _ = store
         .record_session_event_if_active("command", &detail)
         .await?;
+    let diagnostics = command_diagnostics(command, &stdout, &stderr);
+    if !diagnostics.is_empty() {
+        let _ = store.record_diagnostics(&diagnostics).await?;
+    }
 
     if output.status.success() {
         Ok(())
@@ -435,6 +470,177 @@ fn output_tail(output: &str) -> Option<String> {
     let mut chars = output.chars().rev().take(300).collect::<Vec<_>>();
     chars.reverse();
     Some(chars.into_iter().collect::<String>())
+}
+
+fn command_diagnostics(command: &[String], stdout: &str, stderr: &str) -> Vec<DiagnosticInput> {
+    let command_text = command.join(" ");
+    let mut diagnostics = parse_diagnostics_from_output("stdout", stdout, &command_text);
+    diagnostics.extend(parse_diagnostics_from_output(
+        "stderr",
+        stderr,
+        &command_text,
+    ));
+    diagnostics.truncate(20);
+    diagnostics
+}
+
+fn parse_diagnostics_from_output(
+    stream: &str,
+    output: &str,
+    command: &str,
+) -> Vec<DiagnosticInput> {
+    let lines = output.lines().collect::<Vec<_>>();
+    let mut diagnostics = Vec::new();
+    let mut pending_rust = None::<PendingRustDiagnostic>;
+
+    for line in &lines {
+        if let Some((severity, code, message)) = parse_rust_diagnostic_header(line) {
+            if let Some(pending) = pending_rust.take() {
+                diagnostics.push(pending.into_input(stream, command, None, None));
+            }
+            pending_rust = Some(PendingRustDiagnostic {
+                severity,
+                code,
+                message,
+            });
+            continue;
+        }
+
+        if let Some((path, line_start)) = parse_rust_location(line) {
+            if let Some(pending) = pending_rust.take() {
+                diagnostics.push(pending.into_input(stream, command, Some(path), Some(line_start)));
+            }
+            continue;
+        }
+
+        if let Some(input) = parse_colon_diagnostic(line, stream, command) {
+            if let Some(pending) = pending_rust.take() {
+                diagnostics.push(pending.into_input(stream, command, None, None));
+            }
+            diagnostics.push(input);
+        }
+    }
+
+    if let Some(pending) = pending_rust {
+        diagnostics.push(pending.into_input(stream, command, None, None));
+    }
+
+    dedupe_diagnostics(diagnostics)
+}
+
+#[derive(Debug)]
+struct PendingRustDiagnostic {
+    severity: String,
+    code: Option<String>,
+    message: String,
+}
+
+impl PendingRustDiagnostic {
+    fn into_input(
+        self,
+        stream: &str,
+        command: &str,
+        path: Option<String>,
+        line_start: Option<i64>,
+    ) -> DiagnosticInput {
+        DiagnosticInput {
+            source: format!("command_{stream}"),
+            path,
+            line_start,
+            line_end: None,
+            severity: self.severity,
+            code: self.code,
+            message: self.message,
+            command: Some(command.to_string()),
+        }
+    }
+}
+
+fn parse_rust_diagnostic_header(line: &str) -> Option<(String, Option<String>, String)> {
+    let trimmed = line.trim();
+    let severity = if trimmed.starts_with("error") {
+        "error"
+    } else if trimmed.starts_with("warning") {
+        "warning"
+    } else {
+        return None;
+    };
+    let colon = trimmed.find(':')?;
+    let header = trimmed[..colon].trim();
+    let code = header
+        .find('[')
+        .and_then(|start| header[start + 1..].find(']').map(|end| (start, end)))
+        .map(|(start, end)| header[start + 1..start + 1 + end].to_string());
+    let message = trimmed[colon + 1..].trim();
+    (!message.is_empty()).then(|| (severity.to_string(), code, message.to_string()))
+}
+
+fn parse_rust_location(line: &str) -> Option<(String, i64)> {
+    let trimmed = line.trim();
+    let location = trimmed.strip_prefix("-->")?.trim();
+    let mut parts = location.rsplitn(3, ':');
+    let _column = parts.next()?;
+    let line_start = parts.next()?.parse::<i64>().ok()?;
+    let path = parts.next()?.trim();
+    (!path.is_empty()).then(|| (path.to_string(), line_start))
+}
+
+fn parse_colon_diagnostic(line: &str, stream: &str, command: &str) -> Option<DiagnosticInput> {
+    let trimmed = line.trim();
+    let lower = trimmed.to_lowercase();
+    let severity = if lower.contains(": error:") {
+        "error"
+    } else if lower.contains(": warning:") {
+        "warning"
+    } else {
+        return None;
+    };
+    let marker = format!(": {severity}:");
+    let marker_index = lower.find(&marker)?;
+    let message = trimmed[marker_index + marker.len()..].trim();
+    if message.is_empty() {
+        return None;
+    }
+
+    let location = &trimmed[..marker_index];
+    let mut parts = location.rsplitn(3, ':');
+    let _column = parts.next()?;
+    let line_start = parts.next()?.parse::<i64>().ok()?;
+    let path = parts.next()?.trim();
+    if path.is_empty() {
+        return None;
+    }
+
+    Some(DiagnosticInput {
+        source: format!("command_{stream}"),
+        path: Some(path.to_string()),
+        line_start: Some(line_start),
+        line_end: None,
+        severity: severity.to_string(),
+        code: None,
+        message: message.to_string(),
+        command: Some(command.to_string()),
+    })
+}
+
+fn dedupe_diagnostics(diagnostics: Vec<DiagnosticInput>) -> Vec<DiagnosticInput> {
+    let mut seen = HashSet::new();
+    diagnostics
+        .into_iter()
+        .filter(|diagnostic| {
+            seen.insert(format!(
+                "{}|{}|{}|{}|{}",
+                diagnostic.source,
+                diagnostic.path.as_deref().unwrap_or(""),
+                diagnostic
+                    .line_start
+                    .map(|line| line.to_string())
+                    .unwrap_or_default(),
+                diagnostic.severity,
+                diagnostic.message
+            ))
+        })
+        .collect()
 }
 
 async fn sync_status(format: OutputFormat) -> Result<(), String> {
@@ -606,6 +812,69 @@ fn render_memory_list_json(memories: &[Memory]) -> String {
     }
     rendered.push(']');
     rendered
+}
+
+fn render_symbols_text(query: &str, symbols: &[CodeSymbol]) -> String {
+    let mut rendered = format!(
+        "Hugr symbols\n  query: {query}\n  matches: {}\n",
+        symbols.len()
+    );
+
+    for symbol in symbols {
+        let language = symbol.language.as_deref().unwrap_or("unknown");
+        let _ = writeln!(
+            rendered,
+            "- {} {} at {} [{}]: {}",
+            symbol.kind,
+            symbol.name,
+            code_symbol_location(symbol),
+            language,
+            symbol.signature
+        );
+    }
+
+    rendered
+}
+
+fn render_symbols_json(query: &str, symbols: &[CodeSymbol]) -> String {
+    let mut rendered = format!("{{\"query\":{},\"symbols\":[", json_string(query));
+    for (index, symbol) in symbols.iter().enumerate() {
+        if index > 0 {
+            rendered.push(',');
+        }
+        let _ = write!(
+            rendered,
+            "{{\"path\":{},\"language\":{},\"name\":{},\"kind\":{},\"line_start\":{},\"line_end\":{},\"signature\":{}}}",
+            json_string(&symbol.path),
+            render_optional_json_string(symbol.language.as_deref()),
+            json_string(&symbol.name),
+            json_string(&symbol.kind),
+            symbol.line_start,
+            render_optional_i64(symbol.line_end),
+            json_string(&symbol.signature)
+        );
+    }
+    rendered.push_str("]}");
+    rendered
+}
+
+fn code_symbol_location(symbol: &CodeSymbol) -> String {
+    match symbol.line_end {
+        Some(line_end) if line_end > symbol.line_start => {
+            format!("{}:{}-{}", symbol.path, symbol.line_start, line_end)
+        }
+        _ => format!("{}:{}", symbol.path, symbol.line_start),
+    }
+}
+
+fn render_optional_json_string(value: Option<&str>) -> String {
+    value.map(json_string).unwrap_or_else(|| "null".to_string())
+}
+
+fn render_optional_i64(value: Option<i64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string())
 }
 
 fn render_session_promotion_text(result: &SessionPromotionResult) -> String {
@@ -1084,14 +1353,16 @@ fn render_sync_history_json(history: &[SyncRunHistory]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_observation_detail, output_tail, render_consolidation_json,
+        command_diagnostics, command_observation_detail, output_tail, render_consolidation_json,
         render_consolidation_text, render_forget_json, render_forget_text, render_improve_json,
         render_improve_text, render_recall_json, render_session_promotion_json,
         render_session_promotion_text, render_stale_retirement_json, render_stale_retirement_text,
-        render_sync_history_json, render_sync_history_text, render_sync_pull_json,
-        render_sync_pull_text, render_sync_push_json, render_sync_push_text,
-        render_sync_status_json, render_sync_status_text, shell_hook_text,
+        render_symbols_json, render_symbols_text, render_sync_history_json,
+        render_sync_history_text, render_sync_pull_json, render_sync_pull_text,
+        render_sync_push_json, render_sync_push_text, render_sync_status_json,
+        render_sync_status_text, shell_hook_text,
     };
+    use crate::code::CodeSymbol;
     use crate::store::{
         DuplicateMemoryGroup, ForgetResult, Memory, MemoryConsolidationResult,
         MemoryMaintenanceReport, SessionPromotionResult, StaleMemoryCandidate,
@@ -1115,6 +1386,50 @@ mod tests {
 
         let long = "x".repeat(400);
         assert_eq!(output_tail(&long).unwrap().len(), 300);
+    }
+
+    #[test]
+    fn command_diagnostics_parse_rust_and_colon_formats() {
+        let diagnostics = command_diagnostics(
+            &["cargo".to_string(), "test".to_string()],
+            "src/lib.rs:9:5: warning: unused variable: hook\n",
+            "error[E0425]: cannot find value `hook` in this scope\n  --> src/plugin_hooks.rs:12:9\n",
+        );
+
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.path.as_deref() == Some("src/plugin_hooks.rs")
+                && diagnostic.line_start == Some(12)
+                && diagnostic.severity == "error"
+                && diagnostic.code.as_deref() == Some("E0425")
+                && diagnostic.message.contains("cannot find value")
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.path.as_deref() == Some("src/lib.rs")
+                && diagnostic.line_start == Some(9)
+                && diagnostic.severity == "warning"
+                && diagnostic.message.contains("unused variable")
+        }));
+    }
+
+    #[test]
+    fn symbol_renderers_include_locations() {
+        let symbols = vec![CodeSymbol {
+            path: "src/plugin_hooks.rs".to_string(),
+            language: Some("rust".to_string()),
+            name: "PluginHooks".to_string(),
+            kind: "struct".to_string(),
+            line_start: 3,
+            line_end: Some(8),
+            signature: "pub struct PluginHooks".to_string(),
+        }];
+
+        let text = render_symbols_text("PluginHooks", &symbols);
+        let json = render_symbols_json("PluginHooks", &symbols);
+
+        assert!(text.contains("struct PluginHooks at src/plugin_hooks.rs:3-8"));
+        assert!(json.contains(r#""name":"PluginHooks""#));
+        assert!(json.contains(r#""line_end":8"#));
     }
 
     #[test]
