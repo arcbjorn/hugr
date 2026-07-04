@@ -44,6 +44,7 @@ pub enum Command {
         name: String,
         destination_path: String,
         kind: Option<String>,
+        rewrite_references: bool,
         format: OutputFormat,
     },
     ProjectStatus,
@@ -418,6 +419,7 @@ fn parse_run_command(args: &[String]) -> Result<Command, String> {
 fn parse_move_symbol_command(args: &[String]) -> Result<Command, String> {
     let mut positional = Vec::new();
     let mut kind = None;
+    let mut rewrite_references = false;
     let mut format = OutputFormat::Markdown;
     let mut index = 2;
 
@@ -425,6 +427,8 @@ fn parse_move_symbol_command(args: &[String]) -> Result<Command, String> {
         let arg = &args[index];
         if arg == "--json" {
             format = OutputFormat::Json;
+        } else if arg == "--rewrite-references" {
+            rewrite_references = true;
         } else if arg == "--kind" {
             index += 1;
             kind = Some(required_option_value(
@@ -456,6 +460,7 @@ fn parse_move_symbol_command(args: &[String]) -> Result<Command, String> {
         name: name.clone(),
         destination_path: destination_path.clone(),
         kind,
+        rewrite_references,
         format,
     })
 }
