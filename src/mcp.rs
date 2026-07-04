@@ -415,6 +415,7 @@ async fn tool_move_symbol(arguments: &Value) -> Result<Value, String> {
     let name = required_string(arguments, "name")?;
     let destination_path = required_string(arguments, "destination_path")?;
     let kind = optional_string(arguments, "kind")?;
+    let rewrite_references = optional_bool(arguments, "rewrite_references")?;
 
     let store = Store::open_current();
     if !store.supports_local_source_edits()? {
@@ -439,12 +440,24 @@ async fn tool_move_symbol(arguments: &Value) -> Result<Value, String> {
     let references = store
         .references_to_symbols(std::slice::from_ref(&target), 2000)
         .await?;
+    let reference_files = if rewrite_references {
+        read_reference_files(
+            &references,
+            &source_path,
+            &destination_path,
+            "hugr_move_symbol",
+        )?
+    } else {
+        Vec::new()
+    };
     let planned = edit::plan_move(
         &target,
         &references,
         &source_contents,
         &destination_path,
         &destination_contents,
+        reference_files,
+        rewrite_references,
     )?;
 
     for file in &planned.files {
@@ -478,6 +491,31 @@ fn read_optional_destination(path: &str, command: &str) -> Result<String, String
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
         Err(error) => Err(format!("{command} cannot read {path}: {error}")),
     }
+}
+
+fn read_reference_files(
+    references: &[crate::code::CodeReference],
+    source_path: &str,
+    destination_path: &str,
+    command: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let mut paths = references
+        .iter()
+        .map(|reference| reference.path.clone())
+        .filter(|path| path != source_path && path != destination_path)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    paths
+        .into_iter()
+        .map(|path| {
+            std::fs::read_to_string(&path)
+                .map(|contents| (path.clone(), contents))
+                .map_err(|error| format!("{command} cannot read {path}: {error}"))
+        })
+        .collect()
 }
 
 fn tools() -> Vec<Value> {
@@ -615,6 +653,15 @@ fn tool_schema(name: &str, description: &str, properties: &[(&str, &str)]) -> Va
         );
     }
 
+    if name == "hugr_move_symbol" {
+        props.insert(
+            "rewrite_references".to_string(),
+            json!({
+                "type": "boolean"
+            }),
+        );
+    }
+
     if name == "hugr_remember" {
         props.insert(
             "confidence".to_string(),
@@ -748,6 +795,15 @@ fn optional_string(arguments: &Value, key: &str) -> Result<Option<String>, Strin
         .map(str::to_string)
         .map(Some)
         .ok_or_else(|| format!("{key} must be a non-empty string"))
+}
+
+fn optional_bool(arguments: &Value, key: &str) -> Result<bool, String> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(false);
+    };
+    value
+        .as_bool()
+        .ok_or_else(|| format!("{key} must be a boolean"))
 }
 
 fn tool_result(text: String, structured: Value) -> Value {
