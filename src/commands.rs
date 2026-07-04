@@ -305,7 +305,9 @@ async fn replace_symbol(
         summary.new_line_start,
         summary.new_line_end
     );
-    store.record_session_event_if_active("edit", &detail).await?;
+    store
+        .record_session_event_if_active("edit", &detail)
+        .await?;
 
     if format == OutputFormat::Json {
         println!("{}", summary.render_json());
