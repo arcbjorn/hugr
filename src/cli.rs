@@ -432,7 +432,10 @@ fn parse_move_symbol_command(args: &[String]) -> Result<Command, String> {
                 "hugr move-symbol --kind",
             )?);
         } else if let Some(value) = arg.strip_prefix("--kind=") {
-            kind = Some(required_option_value(Some(value), "hugr move-symbol --kind")?);
+            kind = Some(required_option_value(
+                Some(value),
+                "hugr move-symbol --kind",
+            )?);
         } else if arg.starts_with("--") {
             return Err(format!("unknown option '{arg}'"));
         } else {
@@ -443,7 +446,9 @@ fn parse_move_symbol_command(args: &[String]) -> Result<Command, String> {
     }
 
     let [source_path, name, destination_path] = positional.as_slice() else {
-        return Err("hugr move-symbol requires <source-path> <symbol> <destination-path>".to_string());
+        return Err(
+            "hugr move-symbol requires <source-path> <symbol> <destination-path>".to_string(),
+        );
     };
 
     Ok(Command::MoveSymbol {
