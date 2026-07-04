@@ -93,7 +93,7 @@ Implemented:
 - `hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>` and MCP `hugr_rename_symbol` safely rename one local symbol plus indexed inbound references after refusing ambiguous targets, invalid identifiers, stale reference lines, collisions, and files that fail to parse after the refactor
 - `hugr rename-symbol` refreshes the index immediately after a successful refactor and records a session edit event when a session is active
 - `hugr move-symbol [--json] [--kind <kind>] [--rewrite-references] <source-path> <symbol> <destination-path>` and MCP `hugr_move_symbol` safely move one local symbol between files after refusing unsupported inbound references, language mismatches, destination collisions, and files that fail to parse after the move
-- `hugr move-symbol --rewrite-references` supports a conservative Rust module-path rewrite for indexed inbound references when the import/reference line contains the old qualified module path
+- `hugr move-symbol --rewrite-references` supports conservative Rust rewrites for indexed inbound references using exact module paths, simple braced `use` imports, and module-qualified call/reference lines
 - `hugr move-symbol` refreshes the index immediately after a successful move and records a session edit event when a session is active
 - `hugr context` and `hugr_context` include a first code-health risk signal for large indexed symbols using deterministic symbol line ranges
 - `hugr context` and `hugr_context` include cross-file refactor-surface risks when code graph references span multiple files
@@ -585,6 +585,7 @@ Recommended next commits:
 76. Done: `feat(edit): rename symbols with references`
 77. Done: `feat(edit): move unreferenced symbols`
 78. Done: `feat(edit): rewrite references on move`
+79. Done: `feat(edit): broaden Rust move rewrites`
 
 Each commit should leave the CLI usable.
 
@@ -601,6 +602,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Broaden reference-rewriting moves.
+Extend reference-aware moves beyond the current Rust subset.
 
-That is the right next step because context packs now persist, sync, rank evidence, include graph neighborhoods, surface deterministic risk signals, cite structured diagnostics with exact locations, expose symbol lookup, have safe local symbol replacement, flag several code-health/refactor surfaces, identify Hugr edits that invalidate persisted context, support a first reference-aware rename, can move unreferenced symbols between files, and can rewrite supported Rust module-path references on move. The remaining semantic gap is broader reference/import rewriting for more Rust import shapes and other indexed languages.
+That is the right next step because context packs now persist, sync, rank evidence, include graph neighborhoods, surface deterministic risk signals, cite structured diagnostics with exact locations, expose symbol lookup, have safe local symbol replacement, flag several code-health/refactor surfaces, identify Hugr edits that invalidate persisted context, support a first reference-aware rename, can move unreferenced symbols between files, and can rewrite several supported Rust reference/import forms on move. The remaining semantic gap is alias/nested Rust import handling plus reference-aware moves for other indexed languages.
