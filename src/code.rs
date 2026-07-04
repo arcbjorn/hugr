@@ -30,6 +30,20 @@ pub(crate) struct CodeReference {
     pub excerpt: String,
 }
 
+/// Extract symbols from in-memory source without touching disk.
+///
+/// Structural edit helpers use this both to locate an edit target and to validate
+/// that replacement source still defines the expected symbol. It reuses the same
+/// tree-sitter pipelines that populate the index, so located ranges match what
+/// `hugr symbols` and the context compiler already trust.
+pub(crate) fn symbols_in_source(
+    path: &str,
+    language: Option<&str>,
+    contents: &str,
+) -> Result<Vec<CodeSymbol>, String> {
+    extract_symbols(path, language, contents)
+}
+
 pub(crate) fn index_files(root: &Path, files: &[FileCandidate]) -> Result<Vec<CodeSymbol>, String> {
     let mut symbols = Vec::new();
     let mut seen = HashSet::new();
