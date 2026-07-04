@@ -45,6 +45,148 @@ fn remote_memory_commands_use_hosted_api_without_local_store() {
         !client_dir.join(".hugr").exists(),
         "remote API memory command should not create a local store"
     );
+    write_client_source(&client_dir);
+
+    let project_status = run_remote_hugr(hugr, &client_dir, &api_url, &["project", "status"]);
+    assert!(
+        project_status.status.success(),
+        "project status failed: {project_status:?}"
+    );
+    let project_status_text = String::from_utf8(project_status.stdout).unwrap();
+    assert!(project_status_text.contains("hugr_api_live_client"));
+
+    let index = run_remote_hugr(hugr, &client_dir, &api_url, &["index"]);
+    assert!(index.status.success(), "index failed: {index:?}");
+    let index_text = String::from_utf8(index.stdout).unwrap();
+    assert!(index_text.contains("indexed 1 files"));
+
+    let symbols = run_remote_hugr(
+        hugr,
+        &client_dir,
+        &api_url,
+        &["symbols", "--json", "LiveRemoteThing"],
+    );
+    assert!(symbols.status.success(), "symbols failed: {symbols:?}");
+    let symbols_json = String::from_utf8(symbols.stdout).unwrap();
+    assert!(symbols_json.contains("LiveRemoteThing"));
+    assert!(symbols_json.contains("src/lib.rs"));
+
+    let diagnostic_run = run_remote_hugr(
+        hugr,
+        &client_dir,
+        &api_url,
+        &[
+            "run",
+            "sh",
+            "-c",
+            "printf 'error[E0425]: cannot find value LiveRemoteThing in this scope\n  --> src/lib.rs:2:5\n' >&2; exit 1",
+        ],
+    );
+    assert!(
+        !diagnostic_run.status.success(),
+        "diagnostic command should fail: {diagnostic_run:?}"
+    );
+    let diagnostic_stderr = String::from_utf8(diagnostic_run.stderr).unwrap();
+    assert!(diagnostic_stderr.contains("error[E0425]"));
+
+    let session_start = run_remote_hugr(
+        hugr,
+        &client_dir,
+        &api_url,
+        &["session", "start", "live remote session"],
+    );
+    assert!(
+        session_start.status.success(),
+        "session start failed: {session_start:?}"
+    );
+    let session_event = run_remote_hugr(
+        hugr,
+        &client_dir,
+        &api_url,
+        &[
+            "session",
+            "event",
+            "note",
+            "LiveRemoteThing was indexed remotely",
+        ],
+    );
+    assert!(
+        session_event.status.success(),
+        "session event failed: {session_event:?}"
+    );
+    let session_end = run_remote_hugr(
+        hugr,
+        &client_dir,
+        &api_url,
+        &["session", "end", "LiveRemoteThing session complete"],
+    );
+    assert!(
+        session_end.status.success(),
+        "session end failed: {session_end:?}"
+    );
+
+    let session_promote = run_remote_hugr(
+        hugr,
+        &client_dir,
+        &api_url,
+        &["session", "promote", "--json"],
+    );
+    assert!(
+        session_promote.status.success(),
+        "session promote failed: {session_promote:?}"
+    );
+    let session_promote_json = String::from_utf8(session_promote.stdout).unwrap();
+    assert!(session_promote_json.contains("LiveRemoteThing session complete"));
+    assert!(session_promote_json.contains("session_promotion"));
+    assert!(
+        !client_dir.join(".hugr").exists(),
+        "remote API session promotion should not create a local store"
+    );
+
+    let recall_promoted = run_remote_hugr(
+        hugr,
+        &client_dir,
+        &api_url,
+        &["recall", "--json", "LiveRemoteThing session complete"],
+    );
+    assert!(
+        recall_promoted.status.success(),
+        "promoted recall failed: {recall_promoted:?}"
+    );
+    let recall_promoted_json = String::from_utf8(recall_promoted.stdout).unwrap();
+    assert!(recall_promoted_json.contains("LiveRemoteThing session complete"));
+    assert!(recall_promoted_json.contains("session_promotion"));
+
+    let context = run_remote_hugr(
+        hugr,
+        &client_dir,
+        &api_url,
+        &["context", "--json", "LiveRemoteThing"],
+    );
+    assert!(context.status.success(), "context failed: {context:?}");
+    let context_json = String::from_utf8(context.stdout).unwrap();
+    assert!(context_json.contains("LiveRemoteThing"));
+    assert!(context_json.contains(r#""diagnostics""#));
+    assert!(context_json.contains("E0425"));
+    assert!(context_json.contains("src/lib.rs"));
+    assert!(
+        context_json.contains("indexed remotely") || context_json.contains("session complete"),
+        "context should include remote session facts: {context_json}"
+    );
+
+    let impact = run_remote_hugr(
+        hugr,
+        &client_dir,
+        &api_url,
+        &["impact", "--json", "LiveRemoteThing"],
+    );
+    assert!(impact.status.success(), "impact failed: {impact:?}");
+    let impact_json = String::from_utf8(impact.stdout).unwrap();
+    assert!(impact_json.contains("LiveRemoteThing"));
+    assert!(
+        !client_dir.join(".hugr").exists(),
+        "remote API non-memory commands should not create a local store"
+    );
 
     let recall = run_remote_hugr(
         hugr,
@@ -60,7 +202,7 @@ fn remote_memory_commands_use_hosted_api_without_local_store() {
         hugr,
         &client_dir,
         &api_url,
-        &["forget", "--json", "live remote memory"],
+        &["forget", "--json", "memory contract fact"],
     );
     assert!(forget.status.success(), "forget failed: {forget:?}");
     let forget_json = String::from_utf8(forget.stdout).unwrap();
@@ -70,7 +212,7 @@ fn remote_memory_commands_use_hosted_api_without_local_store() {
         hugr,
         &client_dir,
         &api_url,
-        &["recall", "--json", "live remote memory"],
+        &["recall", "--json", "memory contract fact"],
     );
     assert!(
         recall_after_forget.status.success(),
@@ -157,4 +299,14 @@ fn temp_workspace(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("hugr_api_live_{label}_{unique}"));
     fs::create_dir_all(&path).expect("temp workspace should be created");
     path
+}
+
+fn write_client_source(client_dir: &Path) {
+    let src_dir = client_dir.join("src");
+    fs::create_dir_all(&src_dir).expect("src dir should be created");
+    fs::write(
+        src_dir.join("lib.rs"),
+        "pub struct LiveRemoteThing;\n\npub fn make_live_remote_thing() -> LiveRemoteThing {\n    LiveRemoteThing\n}\n",
+    )
+    .expect("source file should be written");
 }
