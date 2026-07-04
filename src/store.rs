@@ -1792,6 +1792,13 @@ impl Store {
         }
     }
 
+    /// Whether structural edits against the local working tree are available. Remote-only
+    /// Hugr API mode has no working tree, so source-editing commands must refuse instead
+    /// of silently doing nothing.
+    pub fn supports_local_source_edits(&self) -> Result<bool, String> {
+        Ok(!uses_remote_only_hugr_api_transport(self.storage_config()?))
+    }
+
     pub fn sync_execution_plan(&self) -> Result<SyncExecutionPlan, String> {
         self.storage_config()
             .map(StorageConfig::sync_execution_plan)
