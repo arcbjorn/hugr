@@ -88,6 +88,10 @@ Implemented:
 - `hugr run <command>` parses structured diagnostics from command output and stores file, line, severity, code, message, command, and timestamp in local or hosted Hugr API storage
 - `hugr context` and `hugr_context` include structured diagnostics with exact locations, messages, citations, and risk signals
 - `hugr symbols [--json] <query>` and MCP `hugr_symbols` provide a stable read-only symbol lookup surface over exact file/name targets or ranked symbol search
+- `hugr replace-symbol [--json] [--kind <kind>] <path> <symbol>` and MCP `hugr_replace_symbol` safely replace one local indexed symbol after refusing ambiguous targets, renames, kind changes, and replacement bodies that fail to parse
+- `hugr replace-symbol` refreshes the index immediately after a successful edit and records a session edit event when a session is active
+- `hugr context` and `hugr_context` include a first code-health risk signal for large indexed symbols using deterministic symbol line ranges
+- `hugr context` and `hugr_context` include cross-file refactor-surface risks when code graph references span multiple files
 - code-reference edges distinguish imports, calls, member calls, implementations, inheritance, instantiations, type references, and generic references
 - initial vision, storage, and technical blueprint docs
 
@@ -103,8 +107,8 @@ The near-term plan is close to complete, but the broader vision and technical bl
 - Structured memory provenance: promoted session memories preserve structured payloads in JSON, and CLI/MCP memory writes support manual source attachments plus confidence, sensitivity, validity metadata, and project scope.
 - Automatic session observation: daemon captures file-change and git/worktree events for active sessions, `hugr run <command>` captures command/test outcomes, `hugr shell-hook <bash|zsh>` can observe ordinary shell command statuses, and daemon indexing captures classified discovery summaries.
 - Session summarization and memory promotion: manual `hugr session promote` summarizes latest session facts into long-term memory, and the daemon periodically promotes ended, unpromoted sessions.
-- Risk and health signals: context packs now include deterministic risks for stale memory conflicts, changed relevant files, missing tests/symbols, graph coupling, recent failure facts, index freshness, recent diagnostic output, and structured diagnostics with source locations; complexity, dead code, risky paths, and stale-after-edit semantics beyond file mtime remain.
-- Semantic operations: read-only CLI/MCP symbol lookup exists; edit helpers and safe structural operations remain.
+- Risk and health signals: context packs now include deterministic risks for stale memory conflicts, changed relevant files, missing tests/symbols, graph coupling, cross-file refactor surfaces, recent failure facts, index freshness, recent diagnostic output, structured diagnostics with source locations, and large indexed symbols; deeper complexity, dead code, risky paths, and stale-after-edit semantics beyond file mtime remain.
+- Semantic operations: read-only CLI/MCP symbol lookup exists; the first safe structural edit helper exists for local symbol replacement with parse and identity checks; broader refactors, reference-aware rename, and multi-file edits remain.
 - Incremental freshness: watcher-driven invalidation and refresh for file discovery, symbols, graph edges, tests, and context evidence.
 
 ## Runtime Decision
@@ -361,6 +365,7 @@ Implemented first slice:
 - Likely test files are mapped from discovered project paths and surfaced in context and impact output.
 - Context packs include local branch, upstream, ahead/behind counts, and worktree changes.
 - Rust, Python, TypeScript, JavaScript/JSX, Go, Java, Kotlin, and Swift symbol extraction use tree-sitter when parsing succeeds, with line-scanner fallback.
+- `hugr replace-symbol` and `hugr_replace_symbol` use indexed symbols plus parser validation to perform the first safe local structural edit.
 
 Open questions:
 
@@ -394,6 +399,8 @@ Implemented first slices:
 - Recent command/session output with diagnostic terms is compacted into `recent_diagnostics` risk signals.
 - `hugr run` stores parsed structured diagnostics from stdout/stderr, and context packs render matching diagnostics with `diagnostic` citations plus `structured_diagnostics` risk signals.
 - `hugr symbols` and `hugr_symbols` refresh the index, then return matching symbol paths, languages, kinds, ranges, and signatures.
+- Context packs derive `large_symbol` code-health risks from indexed symbol line ranges so agents see large edit targets before changing them.
+- Context packs derive `refactor_surface` risks from code graph neighbors when incoming, outgoing, or path references span multiple files.
 
 Open questions:
 
@@ -556,6 +563,9 @@ Recommended next commits:
 67. Done: `feat(context): derive diagnostic risks`
 68. Done: `feat(context): ingest structured diagnostics`
 69. Done: `feat(symbols): add lookup surface`
+70. Done: `feat(edit): replace symbols safely`
+71. Done: `feat(context): flag large symbols`
+72. Done: `feat(context): flag refactor surfaces`
 
 Each commit should leave the CLI usable.
 
@@ -572,6 +582,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add safe structural edit helpers.
+Add deeper code-health and refactor risk signals.
 
-That is the right next step because context packs now persist, sync, rank evidence, include graph neighborhoods, surface deterministic risk signals, cite structured diagnostics with exact locations, and expose a stable read-only symbol lookup surface. The next semantic gap is safe structural operations where Hugr can reduce brittle text edits.
+That is the right next step because context packs now persist, sync, rank evidence, include graph neighborhoods, surface deterministic risk signals, cite structured diagnostics with exact locations, expose symbol lookup, and have a first safe local symbol replacement path. The remaining completion gap is higher-quality health evidence for complex, dead, risky, or highly coupled code before agents plan edits.
