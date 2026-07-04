@@ -453,6 +453,58 @@ fn rename_symbol_updates_definition_references_and_refreshes_index() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
+#[test]
+fn move_symbol_moves_unreferenced_definition_and_refreshes_index() {
+    let hugr = env!("CARGO_BIN_EXE_hugr");
+    let workspace = temp_workspace("move_symbol");
+    let src_dir = workspace.join("src");
+    fs::create_dir_all(&src_dir).expect("src dir should be created");
+    let lib = src_dir.join("lib.rs");
+    let helpers = src_dir.join("helpers.rs");
+    fs::write(
+        &lib,
+        "pub fn helper() -> u8 {\n    1\n}\n\npub fn other() {}\n",
+    )
+    .expect("lib source should be written");
+    fs::write(&helpers, "pub fn existing() {}\n").expect("helpers source should be written");
+
+    let init = run_local_hugr(hugr, &workspace, &["init"]);
+    assert!(init.status.success(), "init failed: {init:?}");
+
+    let moved = run_local_hugr(
+        hugr,
+        &workspace,
+        &[
+            "move-symbol",
+            "--json",
+            "--kind",
+            "function",
+            "src/lib.rs",
+            "helper",
+            "src/helpers.rs",
+        ],
+    );
+    assert!(moved.status.success(), "move failed: {moved:?}");
+    let moved_json = String::from_utf8(moved.stdout).unwrap();
+    assert!(moved_json.contains("\"source_path\":\"src/lib.rs\""));
+    assert!(moved_json.contains("\"destination_path\":\"src/helpers.rs\""));
+    assert!(moved_json.contains("\"name\":\"helper\""));
+
+    let edited_lib = fs::read_to_string(&lib).unwrap();
+    let edited_helpers = fs::read_to_string(&helpers).unwrap();
+    assert!(!edited_lib.contains("pub fn helper"));
+    assert!(edited_lib.contains("pub fn other() {}"));
+    assert!(edited_helpers.contains("pub fn existing() {}"));
+    assert!(edited_helpers.contains("pub fn helper() -> u8"));
+
+    let symbols = run_local_hugr(hugr, &workspace, &["symbols", "--json", "helper"]);
+    assert!(symbols.status.success(), "symbols failed: {symbols:?}");
+    let symbols_json = String::from_utf8(symbols.stdout).unwrap();
+    assert!(symbols_json.contains("\"path\":\"src/helpers.rs\""));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
 fn run_local_hugr(hugr: &str, dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(hugr)
         .args(args)
