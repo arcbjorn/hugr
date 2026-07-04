@@ -21,12 +21,15 @@ pub(crate) const HUGR_API_CONTRACT_VERSION: &str = "hugr-api-v1";
 pub(crate) const HUGR_API_ROUTES: &[&str] = &[
     "GET /v1/memories",
     "POST /v1/memories",
+    "GET /v1/storage",
+    "POST /v1/storage",
     "GET /v1/sync/status",
     "POST /v1/sync/push",
     "POST /v1/sync/pull",
     "GET /v1/sync/history",
 ];
 static SESSION_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
+static DIAGNOSTIC_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StorageMode {
@@ -49,6 +52,7 @@ enum SyncClass {
     Edges,
     Embeddings,
     ContextPacks,
+    Diagnostics,
     SessionSummaries,
     FullSource,
     RawCommandOutput,
@@ -68,6 +72,8 @@ enum SyncTableKind {
     Edges,
     CodeReferences,
     Sessions,
+    ContextPacks,
+    Diagnostics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,6 +280,52 @@ pub struct SessionFact {
     pub created_at_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphNeighbor {
+    pub kind: String,
+    pub label: String,
+    pub detail: String,
+    pub path: Option<String>,
+    pub target_path: Option<String>,
+    pub target_name: Option<String>,
+    pub line_start: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshnessSignal {
+    pub path: String,
+    pub kind: String,
+    pub detail: String,
+    pub indexed_at_ms: Option<i64>,
+    pub modified_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub id: String,
+    pub source: String,
+    pub path: Option<String>,
+    pub line_start: Option<i64>,
+    pub line_end: Option<i64>,
+    pub severity: String,
+    pub code: Option<String>,
+    pub message: String,
+    pub command: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticInput {
+    pub source: String,
+    pub path: Option<String>,
+    pub line_start: Option<i64>,
+    pub line_end: Option<i64>,
+    pub severity: String,
+    pub code: Option<String>,
+    pub message: String,
+    pub command: Option<String>,
+}
+
 struct ProjectInput {
     id: String,
     name: String,
@@ -311,6 +363,17 @@ impl Store {
         let project = current_project_input()?;
         upsert_project(&conn, project).await?;
         Ok(())
+    }
+
+    async fn connect_migrated_without_project_upsert(&self) -> Result<Connection, String> {
+        let storage_config = self.storage_config()?;
+        if !matches!(storage_config.mode, StorageMode::Remote) {
+            fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
+            fs::create_dir_all(self.root.join("sessions")).map_err(|error| error.to_string())?;
+        }
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        Ok(conn)
     }
 
     pub fn exists(&self) -> bool {
@@ -594,6 +657,11 @@ impl Store {
     }
 
     pub async fn sync_current_project(&self) -> Result<Project, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return sync_current_project_via_hugr_api(&storage_config);
+        }
+
         self.init().await?;
         self.project()
             .await?
@@ -601,6 +669,11 @@ impl Store {
     }
 
     pub async fn project(&self) -> Result<Option<Project>, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return project_via_hugr_api(&storage_config);
+        }
+
         if !self.exists() {
             return Ok(None);
         }
@@ -613,6 +686,11 @@ impl Store {
     pub async fn record_discovered_files(&self, files: &[FileCandidate]) -> Result<(), String> {
         if files.is_empty() {
             return Ok(());
+        }
+
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return record_discovered_files_via_hugr_api(&storage_config, files);
         }
 
         self.init().await?;
@@ -664,6 +742,11 @@ impl Store {
     ) -> Result<(), String> {
         if files.is_empty() {
             return Ok(());
+        }
+
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return record_code_index_via_hugr_api(&storage_config, files, symbols, references);
         }
 
         self.init().await?;
@@ -769,6 +852,11 @@ impl Store {
         target: &str,
         limit: usize,
     ) -> Result<Vec<CodeSymbol>, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return symbols_for_target_via_hugr_api(&storage_config, target, limit);
+        }
+
         if limit == 0 || !self.exists() {
             return Ok(Vec::new());
         }
@@ -819,6 +907,11 @@ impl Store {
         symbols: &[CodeSymbol],
         limit: usize,
     ) -> Result<Vec<CodeReference>, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return references_to_symbols_via_hugr_api(&storage_config, symbols, limit);
+        }
+
         if limit == 0 || symbols.is_empty() || !self.exists() {
             return Ok(Vec::new());
         }
@@ -871,6 +964,11 @@ impl Store {
         symbols: &[CodeSymbol],
         limit: usize,
     ) -> Result<Vec<CodeReference>, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return references_from_symbols_via_hugr_api(&storage_config, symbols, limit);
+        }
+
         if limit == 0 || symbols.is_empty() || !self.exists() {
             return Ok(Vec::new());
         }
@@ -919,6 +1017,11 @@ impl Store {
         path: &str,
         limit: usize,
     ) -> Result<Vec<CodeReference>, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return references_from_path_via_hugr_api(&storage_config, path, limit);
+        }
+
         if limit == 0 || !self.exists() {
             return Ok(Vec::new());
         }
@@ -962,11 +1065,174 @@ impl Store {
         Ok(references)
     }
 
+    pub async fn context_graph_neighbors(
+        &self,
+        query: &str,
+        files: &[String],
+        symbols: &[CodeSymbol],
+        limit: usize,
+    ) -> Result<Vec<GraphNeighbor>, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return context_graph_neighbors_via_hugr_api(
+                &storage_config,
+                query,
+                files,
+                symbols,
+                limit,
+            );
+        }
+
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut neighbors = Vec::new();
+        let code_reference_limit = limit.saturating_mul(3).max(12);
+
+        for reference in self
+            .references_to_symbols(symbols, code_reference_limit)
+            .await?
+        {
+            neighbors.push(graph_neighbor_from_code_reference(
+                "incoming_reference",
+                reference,
+            ));
+        }
+
+        for reference in self
+            .references_from_symbols(symbols, code_reference_limit)
+            .await?
+        {
+            neighbors.push(graph_neighbor_from_code_reference(
+                "outgoing_reference",
+                reference,
+            ));
+        }
+
+        for path in files.iter().take(8) {
+            for reference in self.references_from_path(path, limit.max(4)).await? {
+                neighbors.push(graph_neighbor_from_code_reference(
+                    "path_reference",
+                    reference,
+                ));
+            }
+        }
+
+        if self.exists() {
+            let conn = self.connect().await?;
+            migrations::migrate(&conn).await?;
+            let sources = local_source_sync_records(&conn).await?;
+            let entities = local_entity_sync_records(&conn).await?;
+            let edges = local_edge_sync_records(&conn).await?;
+            append_record_graph_neighbors(
+                query,
+                files,
+                symbols,
+                &sources,
+                &entities,
+                &edges,
+                &mut neighbors,
+                limit.saturating_mul(3).max(12),
+            );
+        }
+
+        Ok(finalize_graph_neighbors(query, neighbors, limit))
+    }
+
+    pub async fn context_freshness_signals(
+        &self,
+        files: &[String],
+        symbols: &[CodeSymbol],
+        limit: usize,
+    ) -> Result<Vec<FreshnessSignal>, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return context_freshness_signals_via_hugr_api(&storage_config, files, symbols, limit);
+        }
+
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let paths = freshness_paths(files, symbols);
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if !self.exists() {
+            return Ok(freshness_signals_from_index_timestamps(
+                paths,
+                HashMap::new(),
+                limit,
+            ));
+        }
+
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let timestamps = local_index_timestamps(&conn, &paths).await?;
+
+        Ok(freshness_signals_from_index_timestamps(
+            paths, timestamps, limit,
+        ))
+    }
+
+    pub async fn record_diagnostics(
+        &self,
+        diagnostics: &[DiagnosticInput],
+    ) -> Result<Vec<Diagnostic>, String> {
+        if diagnostics.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return record_diagnostics_via_hugr_api(&storage_config, diagnostics);
+        }
+
+        self.init().await?;
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let records = diagnostic_records_from_inputs(diagnostics)?;
+        insert_diagnostic_records(&conn, &records).await?;
+        Ok(records
+            .into_iter()
+            .map(diagnostic_from_sync_record)
+            .collect())
+    }
+
+    pub async fn recent_diagnostics(
+        &self,
+        query: &str,
+        files: &[String],
+        symbols: &[CodeSymbol],
+        limit: usize,
+    ) -> Result<Vec<Diagnostic>, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return recent_diagnostics_via_hugr_api(&storage_config, query, files, symbols, limit);
+        }
+
+        if limit == 0 || !self.exists() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        let records = local_diagnostic_sync_records(&conn).await?;
+        Ok(rank_diagnostics(records, query, files, symbols, limit))
+    }
+
     pub async fn likely_tests_for_files(
         &self,
         files: &[String],
         limit: usize,
     ) -> Result<Vec<TestCandidate>, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return likely_tests_for_files_via_hugr_api(&storage_config, files, limit);
+        }
+
         if limit == 0 || files.is_empty() || !self.exists() {
             return Ok(Vec::new());
         }
@@ -999,6 +1265,11 @@ impl Store {
         query: &str,
         limit: usize,
     ) -> Result<Vec<CodeSymbol>, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return recall_symbols_via_hugr_api(&storage_config, query, limit);
+        }
+
         if limit == 0 || !self.exists() {
             return Ok(Vec::new());
         }
@@ -1057,6 +1328,11 @@ impl Store {
     }
 
     pub async fn start_session(&self, task: &str) -> Result<Session, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return start_session_via_hugr_api(&storage_config, task);
+        }
+
         self.init().await?;
         let conn = self.connect().await?;
         let started_at_ms = now_ms()?;
@@ -1093,6 +1369,11 @@ impl Store {
         kind: &str,
         detail: &str,
     ) -> Result<SessionEvent, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return record_session_event_via_hugr_api(&storage_config, kind, detail);
+        }
+
         self.init().await?;
         let conn = self.connect().await?;
         let session_id = active_session_id(&conn).await?;
@@ -1104,6 +1385,11 @@ impl Store {
         kind: &str,
         detail: &str,
     ) -> Result<Option<SessionEvent>, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return record_session_event_if_active_via_hugr_api(&storage_config, kind, detail);
+        }
+
         if !self.exists() {
             return Ok(None);
         }
@@ -1118,6 +1404,11 @@ impl Store {
     }
 
     pub async fn end_session(&self, summary: Option<&str>) -> Result<Session, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return end_session_via_hugr_api(&storage_config, summary);
+        }
+
         self.init().await?;
         let conn = self.connect().await?;
         let session_id = active_session_id(&conn).await?;
@@ -1144,6 +1435,14 @@ impl Store {
     }
 
     pub async fn promote_latest_session(&self) -> Result<SessionPromotionResult, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return promote_latest_session_via_hugr_api(
+                &storage_config,
+                self.embedding_provider()?,
+            );
+        }
+
         if !self.exists() {
             return Err("no session available to promote".to_string());
         }
@@ -1217,6 +1516,11 @@ impl Store {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SessionFact>, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return recent_session_facts_via_hugr_api(&storage_config, query, limit);
+        }
+
         if limit == 0 || !self.exists() {
             return Ok(Vec::new());
         }
@@ -1271,6 +1575,22 @@ impl Store {
         });
         facts.truncate(limit);
         Ok(facts)
+    }
+
+    pub(crate) async fn record_context_pack(
+        &self,
+        task: &str,
+        payload_json: &str,
+    ) -> Result<String, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return record_context_pack_via_hugr_api(&storage_config, task, payload_json);
+        }
+
+        self.init().await?;
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        insert_context_pack(&conn, task, payload_json).await
     }
 
     pub async fn recall(&self, query: &str, limit: usize) -> Result<Vec<Memory>, String> {
@@ -1586,6 +1906,12 @@ impl Store {
                 Some(SyncTableKind::Sessions) => {
                     apply_api_push_session_records(&conn, &payload.records).await?
                 }
+                Some(SyncTableKind::ContextPacks) => {
+                    apply_api_push_context_pack_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::Diagnostics) => {
+                    apply_api_push_diagnostic_records(&conn, &payload.records).await?
+                }
                 None => unsupported_api_table_result(&payload.result),
             };
             applied_payloads.push(SyncApiTablePayload {
@@ -1709,6 +2035,140 @@ impl Store {
 
         let status = api_sync_status_for_payloads(&applied_payloads);
         Ok((status, applied_payloads))
+    }
+
+    pub(crate) async fn api_storage_records(
+        &self,
+    ) -> Result<
+        (
+            Vec<SyncApiTablePayload>,
+            Vec<serde_json::Value>,
+            Vec<serde_json::Value>,
+        ),
+        String,
+    > {
+        let conn = self.connect_migrated_without_project_upsert().await?;
+        let table_kinds = [
+            SyncTableKind::Projects,
+            SyncTableKind::Sources,
+            SyncTableKind::DiscoveredFiles,
+            SyncTableKind::Entities,
+            SyncTableKind::CodeSymbols,
+            SyncTableKind::Edges,
+            SyncTableKind::CodeReferences,
+            SyncTableKind::Sessions,
+            SyncTableKind::ContextPacks,
+            SyncTableKind::Diagnostics,
+        ];
+        let mut payloads = Vec::new();
+        for table in table_kinds {
+            let records = if table == SyncTableKind::Sessions {
+                session_storage_records(&conn).await?
+            } else {
+                api_sync_records_for_table(&conn, table).await?
+            };
+            payloads.push(SyncApiTablePayload {
+                result: planned_sync_table_result(
+                    table,
+                    table_row_count(&conn, table.table_name()).await?,
+                ),
+                records,
+            });
+        }
+        Ok((
+            payloads,
+            session_event_sync_records(&conn).await?,
+            session_promotion_sync_records(&conn).await?,
+        ))
+    }
+
+    pub(crate) async fn apply_api_storage_payloads(
+        &self,
+        payloads: &[SyncApiTablePayload],
+        session_events: &[serde_json::Value],
+        session_promotions: &[serde_json::Value],
+        replace_code_index_paths: &[String],
+    ) -> Result<
+        (
+            String,
+            Vec<SyncApiTablePayload>,
+            SyncTableResult,
+            SyncTableResult,
+        ),
+        String,
+    > {
+        let conn = self.connect_migrated_without_project_upsert().await?;
+        if !replace_code_index_paths.is_empty() {
+            delete_code_index_paths(&conn, replace_code_index_paths).await?;
+        }
+
+        let mut applied_payloads = Vec::new();
+        for payload in payloads {
+            let result = match SyncTableKind::from_table_name(&payload.result.table) {
+                Some(table)
+                    if api_storage_table_supports_records(table)
+                        && payload.records.is_empty()
+                        && payload.result.row_count > 0 =>
+                {
+                    missing_api_row_payload_result(&payload.result)
+                }
+                Some(SyncTableKind::Projects) => {
+                    apply_api_push_project_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::Sources) => {
+                    apply_api_push_source_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::DiscoveredFiles) => {
+                    apply_api_push_discovered_file_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::Entities) => {
+                    apply_api_push_entity_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::CodeSymbols) => {
+                    apply_api_push_code_symbol_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::Edges) => {
+                    apply_api_push_edge_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::CodeReferences) => {
+                    apply_api_push_code_reference_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::Sessions) => {
+                    apply_api_push_session_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::ContextPacks) => {
+                    apply_api_push_context_pack_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::Diagnostics) => {
+                    apply_api_push_diagnostic_records(&conn, &payload.records).await?
+                }
+                Some(_) | None => unsupported_api_table_result(&payload.result),
+            };
+            applied_payloads.push(SyncApiTablePayload {
+                result,
+                records: Vec::new(),
+            });
+        }
+        let session_events_result =
+            apply_api_storage_session_event_records(&conn, session_events).await?;
+        let session_promotions_result =
+            apply_api_storage_session_promotion_records(&conn, session_promotions).await?;
+        let mut status_payloads = applied_payloads.clone();
+        status_payloads.push(SyncApiTablePayload {
+            result: session_events_result.clone(),
+            records: Vec::new(),
+        });
+        status_payloads.push(SyncApiTablePayload {
+            result: session_promotions_result.clone(),
+            records: Vec::new(),
+        });
+        let status = api_sync_status_for_payloads(&status_payloads);
+        Ok((
+            status,
+            applied_payloads,
+            session_events_result,
+            session_promotions_result,
+        ))
     }
 
     pub async fn sync_push(&self, dry_run: bool) -> Result<SyncPushResult, String> {
@@ -2083,6 +2543,8 @@ impl SyncTableKind {
             "edges" => Some(Self::Edges),
             "code_references" => Some(Self::CodeReferences),
             "sessions" => Some(Self::Sessions),
+            "context_packs" => Some(Self::ContextPacks),
+            "diagnostics" => Some(Self::Diagnostics),
             _ => None,
         }
     }
@@ -2099,6 +2561,8 @@ impl SyncTableKind {
             Self::Edges => "edges",
             Self::CodeReferences => "code_references",
             Self::Sessions => "sessions",
+            Self::ContextPacks => "context_packs",
+            Self::Diagnostics => "diagnostics",
         }
     }
 
@@ -2111,6 +2575,8 @@ impl SyncTableKind {
             Self::Entities | Self::CodeSymbols => "entities",
             Self::Edges | Self::CodeReferences => "edges",
             Self::Sessions => "session_summaries",
+            Self::ContextPacks => "context_packs",
+            Self::Diagnostics => "diagnostics",
         }
     }
 }
@@ -2141,8 +2607,13 @@ fn sync_tables_for_config(config: &StorageConfig) -> Vec<SyncTableKind> {
             SyncClass::SessionSummaries => {
                 push_sync_table(&mut tables, &mut seen, SyncTableKind::Sessions)
             }
-            SyncClass::ContextPacks
-            | SyncClass::FullSource
+            SyncClass::ContextPacks => {
+                push_sync_table(&mut tables, &mut seen, SyncTableKind::ContextPacks)
+            }
+            SyncClass::Diagnostics => {
+                push_sync_table(&mut tables, &mut seen, SyncTableKind::Diagnostics)
+            }
+            SyncClass::FullSource
             | SyncClass::RawCommandOutput
             | SyncClass::Secrets
             | SyncClass::PrivateNotes => {}
@@ -2270,6 +2741,65 @@ fn hugr_api_remember_payloads(
     Ok((memory, payloads))
 }
 
+fn hugr_api_session_promotion_payloads(
+    embedding_provider: &SelectedEmbeddingProvider,
+    session: &Session,
+    facts: &[SessionFact],
+    project: Option<&Project>,
+) -> Result<(Memory, Vec<SyncApiTablePayload>, SessionPromotionSyncRecord), String> {
+    let now = now_ms()?;
+    let structured_payload = Some(session_promotion_payload(session, facts, project));
+    let memory = Memory {
+        id: format!("mem_{now}"),
+        created_at_ms: now,
+        kind: "fact".to_string(),
+        text: session_promotion_text(session, facts),
+        structured_payload: structured_payload.clone(),
+    };
+    let memory_record = MemorySyncRecord {
+        id: memory.id.clone(),
+        created_at_ms: memory.created_at_ms,
+        kind: memory.kind.clone(),
+        text: memory.text.clone(),
+        confidence: 1.0,
+        valid_from: None,
+        valid_to: None,
+        superseded_by: None,
+        sensitivity: "normal".to_string(),
+        structured_payload,
+    };
+    let embedding = embedding_provider.embed(&memory.text)?;
+    let embedding_record = MemoryEmbeddingSyncRecord {
+        memory_id: memory.id.clone(),
+        model: embedding.model.clone(),
+        dimensions: embedding_dimensions_i64(&embedding)?,
+        embedding: embedding.to_f32_blob(),
+    };
+    let mut payloads = Vec::new();
+    if let Some(project) = project {
+        payloads.push(api_payload_for_records(
+            SyncTableKind::Projects,
+            vec![project_sync_record_value(project)],
+        ));
+    }
+    payloads.push(api_payload_for_records(
+        SyncTableKind::Memories,
+        vec![memory_sync_record_value(&memory_record)],
+    ));
+    payloads.push(api_payload_for_records(
+        SyncTableKind::MemoryEmbeddings,
+        vec![memory_embedding_sync_record_value(&embedding_record)],
+    ));
+
+    let promotion_record = SessionPromotionSyncRecord {
+        session_id: session.id.clone(),
+        memory_id: memory.id.clone(),
+        promoted_at_ms: now,
+    };
+
+    Ok((memory, payloads, promotion_record))
+}
+
 fn project_from_input(input: ProjectInput, now: i64) -> Project {
     Project {
         id: input.id,
@@ -2330,6 +2860,1918 @@ fn memory_embedding_sync_record_value(record: &MemoryEmbeddingSyncRecord) -> ser
         "dimensions": record.dimensions,
         "embedding": &record.embedding
     })
+}
+
+fn discovered_file_sync_record_value(record: &DiscoveredFileSyncRecord) -> serde_json::Value {
+    json!({
+        "project_id": &record.project_id,
+        "path": &record.path,
+        "language": &record.language,
+        "size_bytes": &record.size_bytes,
+        "discovered_at_ms": record.discovered_at_ms,
+        "updated_at_ms": record.updated_at_ms
+    })
+}
+
+fn code_symbol_sync_record_value(record: &CodeSymbolSyncRecord) -> serde_json::Value {
+    json!({
+        "project_id": &record.project_id,
+        "path": &record.path,
+        "name": &record.name,
+        "kind": &record.kind,
+        "language": &record.language,
+        "line_start": record.line_start,
+        "line_end": &record.line_end,
+        "signature": &record.signature,
+        "indexed_at_ms": record.indexed_at_ms
+    })
+}
+
+fn code_reference_sync_record_value(record: &CodeReferenceSyncRecord) -> serde_json::Value {
+    json!({
+        "project_id": &record.project_id,
+        "path": &record.path,
+        "target_path": &record.target_path,
+        "target_name": &record.target_name,
+        "target_kind": &record.target_kind,
+        "kind": &record.kind,
+        "language": &record.language,
+        "line_start": record.line_start,
+        "excerpt": &record.excerpt,
+        "indexed_at_ms": record.indexed_at_ms
+    })
+}
+
+fn session_sync_record_value(record: &SessionSyncRecord) -> serde_json::Value {
+    json!({
+        "id": &record.id,
+        "project_id": &record.project_id,
+        "task": &record.task,
+        "branch": &record.branch,
+        "started_at_ms": record.started_at_ms,
+        "ended_at_ms": &record.ended_at_ms,
+        "final_summary": &record.final_summary
+    })
+}
+
+fn context_pack_sync_record_value(record: &ContextPackSyncRecord) -> serde_json::Value {
+    json!({
+        "id": &record.id,
+        "project_id": &record.project_id,
+        "task": &record.task,
+        "payload_json": &record.payload_json,
+        "created_at_ms": record.created_at_ms,
+        "updated_at_ms": record.updated_at_ms
+    })
+}
+
+fn diagnostic_sync_record_value(record: &DiagnosticSyncRecord) -> serde_json::Value {
+    json!({
+        "id": &record.id,
+        "project_id": &record.project_id,
+        "source": &record.source,
+        "path": &record.path,
+        "line_start": &record.line_start,
+        "line_end": &record.line_end,
+        "severity": &record.severity,
+        "code": &record.code,
+        "message": &record.message,
+        "command": &record.command,
+        "created_at_ms": record.created_at_ms
+    })
+}
+
+fn session_event_sync_record_value(record: &SessionEventSyncRecord) -> serde_json::Value {
+    json!({
+        "id": &record.id,
+        "session_id": &record.session_id,
+        "kind": &record.kind,
+        "detail": &record.detail,
+        "created_at_ms": record.created_at_ms
+    })
+}
+
+fn session_promotion_sync_record_value(record: &SessionPromotionSyncRecord) -> serde_json::Value {
+    json!({
+        "session_id": &record.session_id,
+        "memory_id": &record.memory_id,
+        "promoted_at_ms": record.promoted_at_ms
+    })
+}
+
+fn sync_current_project_via_hugr_api(config: &StorageConfig) -> Result<Project, String> {
+    let project = project_from_input(current_project_input()?, now_ms()?);
+    post_hugr_api_storage_payloads(
+        config,
+        "project status",
+        &[api_payload_for_records(
+            SyncTableKind::Projects,
+            vec![project_sync_record_value(&project)],
+        )],
+        &[],
+        &[],
+        &[],
+    )?;
+    Ok(project)
+}
+
+fn project_via_hugr_api(config: &StorageConfig) -> Result<Option<Project>, String> {
+    let snapshot = fetch_hugr_api_storage_snapshot(config)?;
+    Ok(storage_project_records(&snapshot)?
+        .into_iter()
+        .find(|project| project.id == LOCAL_PROJECT_ID))
+}
+
+fn record_context_pack_via_hugr_api(
+    config: &StorageConfig,
+    task: &str,
+    payload_json: &str,
+) -> Result<String, String> {
+    let now = now_ms()?;
+    let id = format!("ctx_{now}");
+    let project = project_from_input(current_project_input()?, now);
+    let record = ContextPackSyncRecord {
+        id: id.clone(),
+        project_id: LOCAL_PROJECT_ID.to_string(),
+        task: task.trim().to_string(),
+        payload_json: payload_json.to_string(),
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    let payloads = vec![
+        api_payload_for_records(
+            SyncTableKind::Projects,
+            vec![project_sync_record_value(&project)],
+        ),
+        api_payload_for_records(
+            SyncTableKind::ContextPacks,
+            vec![context_pack_sync_record_value(&record)],
+        ),
+    ];
+    post_hugr_api_storage_payloads(config, "record context pack", &payloads, &[], &[], &[])?;
+    Ok(id)
+}
+
+fn record_discovered_files_via_hugr_api(
+    config: &StorageConfig,
+    files: &[FileCandidate],
+) -> Result<(), String> {
+    let now = now_ms()?;
+    let project = project_from_input(current_project_input()?, now);
+    let records = files
+        .iter()
+        .map(|file| {
+            let size_bytes = file
+                .size_bytes
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            Ok(discovered_file_sync_record_value(
+                &DiscoveredFileSyncRecord {
+                    project_id: LOCAL_PROJECT_ID.to_string(),
+                    path: file.path.clone(),
+                    language: file.language.clone(),
+                    size_bytes,
+                    discovered_at_ms: now,
+                    updated_at_ms: now,
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let payloads = vec![
+        api_payload_for_records(
+            SyncTableKind::Projects,
+            vec![project_sync_record_value(&project)],
+        ),
+        api_payload_for_records(SyncTableKind::DiscoveredFiles, records),
+    ];
+    post_hugr_api_storage_payloads(config, "record discovered files", &payloads, &[], &[], &[])?;
+    Ok(())
+}
+
+fn record_code_index_via_hugr_api(
+    config: &StorageConfig,
+    files: &[FileCandidate],
+    symbols: &[CodeSymbol],
+    references: &[CodeReference],
+) -> Result<(), String> {
+    let now = now_ms()?;
+    let symbol_records = symbols
+        .iter()
+        .map(|symbol| {
+            code_symbol_sync_record_value(&CodeSymbolSyncRecord {
+                project_id: LOCAL_PROJECT_ID.to_string(),
+                path: symbol.path.clone(),
+                name: symbol.name.clone(),
+                kind: symbol.kind.clone(),
+                language: symbol.language.clone(),
+                line_start: symbol.line_start,
+                line_end: symbol.line_end,
+                signature: symbol.signature.clone(),
+                indexed_at_ms: now,
+            })
+        })
+        .collect::<Vec<_>>();
+    let reference_records = references
+        .iter()
+        .map(|reference| {
+            code_reference_sync_record_value(&CodeReferenceSyncRecord {
+                project_id: LOCAL_PROJECT_ID.to_string(),
+                path: reference.path.clone(),
+                target_path: reference.target_path.clone(),
+                target_name: reference.target_name.clone(),
+                target_kind: reference.target_kind.clone(),
+                kind: reference.kind.clone(),
+                language: reference.language.clone(),
+                line_start: reference.line_start,
+                excerpt: reference.excerpt.clone(),
+                indexed_at_ms: now,
+            })
+        })
+        .collect::<Vec<_>>();
+    let replace_paths = files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    let payloads = vec![
+        api_payload_for_records(SyncTableKind::CodeSymbols, symbol_records),
+        api_payload_for_records(SyncTableKind::CodeReferences, reference_records),
+    ];
+    post_hugr_api_storage_payloads(
+        config,
+        "record code index",
+        &payloads,
+        &[],
+        &[],
+        &replace_paths,
+    )?;
+    Ok(())
+}
+
+fn symbols_for_target_via_hugr_api(
+    config: &StorageConfig,
+    target: &str,
+    limit: usize,
+) -> Result<Vec<CodeSymbol>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let target = normalize_target(target);
+    if target.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut symbols = storage_code_symbols(&fetch_hugr_api_storage_snapshot(config)?)?
+        .into_iter()
+        .filter(|symbol| symbol.path == target || symbol.name == target)
+        .collect::<Vec<_>>();
+    symbols.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.line_start.cmp(&right.line_start))
+    });
+    if symbols.is_empty() {
+        return recall_symbols_via_hugr_api(config, &target, limit);
+    }
+    symbols.truncate(limit);
+    Ok(symbols)
+}
+
+fn references_to_symbols_via_hugr_api(
+    config: &StorageConfig,
+    symbols: &[CodeSymbol],
+    limit: usize,
+) -> Result<Vec<CodeReference>, String> {
+    if limit == 0 || symbols.is_empty() {
+        return Ok(Vec::new());
+    }
+    let targets = symbols
+        .iter()
+        .map(|symbol| (symbol.path.as_str(), symbol.name.as_str()))
+        .collect::<HashSet<_>>();
+    let mut references = storage_code_references(&fetch_hugr_api_storage_snapshot(config)?)?
+        .into_iter()
+        .filter(|reference| {
+            targets.contains(&(
+                reference.target_path.as_str(),
+                reference.target_name.as_str(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    references.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.line_start.cmp(&right.line_start))
+    });
+    references.truncate(limit);
+    Ok(references)
+}
+
+fn references_from_symbols_via_hugr_api(
+    config: &StorageConfig,
+    symbols: &[CodeSymbol],
+    limit: usize,
+) -> Result<Vec<CodeReference>, String> {
+    if limit == 0 || symbols.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut references = storage_code_references(&fetch_hugr_api_storage_snapshot(config)?)?
+        .into_iter()
+        .filter(|reference| {
+            symbols
+                .iter()
+                .any(|symbol| reference_is_in_symbol(reference, symbol))
+        })
+        .collect::<Vec<_>>();
+    references.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.line_start.cmp(&right.line_start))
+    });
+    references.truncate(limit);
+    Ok(references)
+}
+
+fn references_from_path_via_hugr_api(
+    config: &StorageConfig,
+    path: &str,
+    limit: usize,
+) -> Result<Vec<CodeReference>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let path = normalize_target(path);
+    if path.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut references = storage_code_references(&fetch_hugr_api_storage_snapshot(config)?)?
+        .into_iter()
+        .filter(|reference| reference.path == path)
+        .collect::<Vec<_>>();
+    references.sort_by(|left, right| left.line_start.cmp(&right.line_start));
+    references.truncate(limit);
+    Ok(references)
+}
+
+fn context_graph_neighbors_via_hugr_api(
+    config: &StorageConfig,
+    query: &str,
+    files: &[String],
+    symbols: &[CodeSymbol],
+    limit: usize,
+) -> Result<Vec<GraphNeighbor>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let snapshot = fetch_hugr_api_storage_snapshot(config)?;
+    let mut neighbors = Vec::new();
+    let references = storage_code_references(&snapshot)?;
+    let targets = symbols
+        .iter()
+        .map(|symbol| (symbol.path.as_str(), symbol.name.as_str()))
+        .collect::<HashSet<_>>();
+    let paths = files
+        .iter()
+        .map(|path| normalize_target(path))
+        .filter(|path| !path.is_empty())
+        .collect::<HashSet<_>>();
+
+    for reference in &references {
+        if targets.contains(&(
+            reference.target_path.as_str(),
+            reference.target_name.as_str(),
+        )) {
+            neighbors.push(graph_neighbor_from_code_reference(
+                "incoming_reference",
+                reference.clone(),
+            ));
+        }
+
+        if symbols
+            .iter()
+            .any(|symbol| reference_is_in_symbol(reference, symbol))
+        {
+            neighbors.push(graph_neighbor_from_code_reference(
+                "outgoing_reference",
+                reference.clone(),
+            ));
+        }
+
+        if paths.contains(reference.path.as_str()) {
+            neighbors.push(graph_neighbor_from_code_reference(
+                "path_reference",
+                reference.clone(),
+            ));
+        }
+    }
+
+    append_record_graph_neighbors(
+        query,
+        files,
+        symbols,
+        &storage_source_records(&snapshot)?,
+        &storage_entity_records(&snapshot)?,
+        &storage_edge_records(&snapshot)?,
+        &mut neighbors,
+        limit.saturating_mul(3).max(12),
+    );
+
+    Ok(finalize_graph_neighbors(query, neighbors, limit))
+}
+
+async fn local_source_sync_records(conn: &Connection) -> Result<Vec<SourceSyncRecord>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT id, kind, locator, created_at_ms
+            FROM sources
+            ORDER BY created_at_ms DESC, id ASC
+            LIMIT 1000
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(SourceSyncRecord {
+            id: row.get::<String>(0).map_err(|error| error.to_string())?,
+            kind: row.get::<String>(1).map_err(|error| error.to_string())?,
+            locator: row.get::<String>(2).map_err(|error| error.to_string())?,
+            created_at_ms: row.get::<i64>(3).map_err(|error| error.to_string())?,
+        });
+    }
+
+    Ok(records)
+}
+
+async fn local_entity_sync_records(conn: &Connection) -> Result<Vec<EntitySyncRecord>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT id, kind, name, locator, created_at_ms
+            FROM entities
+            ORDER BY created_at_ms DESC, id ASC
+            LIMIT 1000
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(EntitySyncRecord {
+            id: row.get::<String>(0).map_err(|error| error.to_string())?,
+            kind: row.get::<String>(1).map_err(|error| error.to_string())?,
+            name: row.get::<String>(2).map_err(|error| error.to_string())?,
+            locator: row
+                .get::<Option<String>>(3)
+                .map_err(|error| error.to_string())?,
+            created_at_ms: row.get::<i64>(4).map_err(|error| error.to_string())?,
+        });
+    }
+
+    Ok(records)
+}
+
+async fn local_edge_sync_records(conn: &Connection) -> Result<Vec<EdgeSyncRecord>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT id, from_id, to_id, kind, created_at_ms
+            FROM edges
+            ORDER BY created_at_ms DESC, id ASC
+            LIMIT 1000
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(EdgeSyncRecord {
+            id: row.get::<String>(0).map_err(|error| error.to_string())?,
+            from_id: row.get::<String>(1).map_err(|error| error.to_string())?,
+            to_id: row.get::<String>(2).map_err(|error| error.to_string())?,
+            kind: row.get::<String>(3).map_err(|error| error.to_string())?,
+            created_at_ms: row.get::<i64>(4).map_err(|error| error.to_string())?,
+        });
+    }
+
+    Ok(records)
+}
+
+fn append_record_graph_neighbors(
+    query: &str,
+    files: &[String],
+    symbols: &[CodeSymbol],
+    sources: &[SourceSyncRecord],
+    entities: &[EntitySyncRecord],
+    edges: &[EdgeSyncRecord],
+    neighbors: &mut Vec<GraphNeighbor>,
+    limit: usize,
+) {
+    if limit == 0 {
+        return;
+    }
+
+    let selector_terms = graph_selector_terms(query, files, symbols);
+    if selector_terms.is_empty() {
+        return;
+    }
+
+    let entity_labels = entities
+        .iter()
+        .map(|entity| {
+            (
+                entity.id.clone(),
+                format!("{} {}", entity.kind, entity.name),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut matched_entity_ids = HashSet::new();
+    let mut entity_matches = entities
+        .iter()
+        .filter_map(|entity| {
+            let searchable = format!(
+                "{} {} {} {}",
+                entity.id,
+                entity.kind,
+                entity.name,
+                entity.locator.as_deref().unwrap_or("")
+            );
+            let score = graph_text_match_score(&searchable, &selector_terms);
+            (score > 0).then_some((score, entity))
+        })
+        .collect::<Vec<_>>();
+    entity_matches.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.created_at_ms.cmp(&left.1.created_at_ms))
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+
+    for (_, entity) in entity_matches.into_iter().take(limit) {
+        matched_entity_ids.insert(entity.id.clone());
+        neighbors.push(graph_neighbor_from_entity(entity));
+    }
+
+    let mut source_matches = sources
+        .iter()
+        .filter_map(|source| {
+            let searchable = format!("{} {} {}", source.id, source.kind, source.locator);
+            let score = graph_text_match_score(&searchable, &selector_terms);
+            (score > 0).then_some((score, source))
+        })
+        .collect::<Vec<_>>();
+    source_matches.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.created_at_ms.cmp(&left.1.created_at_ms))
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+
+    for (_, source) in source_matches.into_iter().take(limit) {
+        neighbors.push(graph_neighbor_from_source(source));
+    }
+
+    let mut edge_matches = edges
+        .iter()
+        .filter_map(|edge| {
+            let adjacent = matched_entity_ids.contains(&edge.from_id)
+                || matched_entity_ids.contains(&edge.to_id);
+            let searchable = format!("{} {} {} {}", edge.id, edge.from_id, edge.kind, edge.to_id);
+            let score =
+                graph_text_match_score(&searchable, &selector_terms) + if adjacent { 1 } else { 0 };
+            (score > 0).then_some((score, edge))
+        })
+        .collect::<Vec<_>>();
+    edge_matches.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.created_at_ms.cmp(&left.1.created_at_ms))
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+
+    for (_, edge) in edge_matches.into_iter().take(limit) {
+        neighbors.push(graph_neighbor_from_edge(edge, &entity_labels));
+    }
+}
+
+fn graph_neighbor_from_code_reference(kind: &str, reference: CodeReference) -> GraphNeighbor {
+    let location = format!("{}:{}", reference.path, reference.line_start);
+    let target = format!("{} {}", reference.target_kind, reference.target_name);
+    let label = match kind {
+        "incoming_reference" => format!("{location} references {target}"),
+        "outgoing_reference" => format!("{location} reaches {target}"),
+        _ => format!("{location} links to {target}"),
+    };
+    let detail = if reference.excerpt.trim().is_empty() {
+        format!("{} reference to {target}", reference.kind)
+    } else {
+        format!(
+            "{} reference to {target}: {}",
+            reference.kind,
+            reference.excerpt.trim()
+        )
+    };
+
+    GraphNeighbor {
+        kind: kind.to_string(),
+        label,
+        detail,
+        path: Some(reference.path),
+        target_path: Some(reference.target_path),
+        target_name: Some(reference.target_name),
+        line_start: Some(reference.line_start),
+    }
+}
+
+fn graph_neighbor_from_source(source: &SourceSyncRecord) -> GraphNeighbor {
+    GraphNeighbor {
+        kind: "source".to_string(),
+        label: format!("{} source {}", source.kind, source.locator),
+        detail: format!("source {} recorded at {}", source.id, source.created_at_ms),
+        path: Some(source.locator.clone()),
+        target_path: None,
+        target_name: None,
+        line_start: None,
+    }
+}
+
+fn graph_neighbor_from_entity(entity: &EntitySyncRecord) -> GraphNeighbor {
+    GraphNeighbor {
+        kind: "entity".to_string(),
+        label: format!("{} {}", entity.kind, entity.name),
+        detail: match &entity.locator {
+            Some(locator) => format!("entity {} at {}", entity.id, locator),
+            None => format!("entity {}", entity.id),
+        },
+        path: entity.locator.clone(),
+        target_path: entity.locator.clone(),
+        target_name: Some(entity.name.clone()),
+        line_start: None,
+    }
+}
+
+fn graph_neighbor_from_edge(
+    edge: &EdgeSyncRecord,
+    entity_labels: &HashMap<String, String>,
+) -> GraphNeighbor {
+    let from_label = entity_labels
+        .get(&edge.from_id)
+        .cloned()
+        .unwrap_or_else(|| edge.from_id.clone());
+    let to_label = entity_labels
+        .get(&edge.to_id)
+        .cloned()
+        .unwrap_or_else(|| edge.to_id.clone());
+
+    GraphNeighbor {
+        kind: "edge".to_string(),
+        label: format!("{from_label} -{}-> {to_label}", edge.kind),
+        detail: format!("edge {} recorded at {}", edge.id, edge.created_at_ms),
+        path: None,
+        target_path: None,
+        target_name: Some(to_label),
+        line_start: None,
+    }
+}
+
+fn graph_selector_terms(query: &str, files: &[String], symbols: &[CodeSymbol]) -> Vec<String> {
+    let mut terms = query_terms(query);
+    for file in files.iter().take(12) {
+        let lower = file.to_lowercase();
+        if lower.len() > 2 {
+            terms.push(lower);
+        }
+        terms.extend(query_terms(file));
+    }
+    for symbol in symbols.iter().take(16) {
+        let lower_name = symbol.name.to_lowercase();
+        if lower_name.len() > 2 {
+            terms.push(lower_name);
+        }
+        terms.extend(query_terms(&symbol.name));
+        let lower_path = symbol.path.to_lowercase();
+        if lower_path.len() > 2 {
+            terms.push(lower_path);
+        }
+        terms.extend(query_terms(&symbol.path));
+    }
+
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+fn graph_text_match_score(value: &str, terms: &[String]) -> usize {
+    if terms.is_empty() {
+        return 0;
+    }
+
+    let lower = value.to_lowercase();
+    terms
+        .iter()
+        .filter(|term| lower.contains(term.as_str()))
+        .count()
+}
+
+fn finalize_graph_neighbors(
+    query: &str,
+    neighbors: Vec<GraphNeighbor>,
+    limit: usize,
+) -> Vec<GraphNeighbor> {
+    let terms = query_terms(query);
+    let mut seen = HashSet::new();
+    let mut deduped = neighbors
+        .into_iter()
+        .filter(|neighbor| seen.insert(graph_neighbor_key(neighbor)))
+        .collect::<Vec<_>>();
+
+    deduped.sort_by(|left, right| {
+        let left_score = graph_neighbor_sort_score(left, &terms);
+        let right_score = graph_neighbor_sort_score(right, &terms);
+        right_score
+            .cmp(&left_score)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    deduped.truncate(limit);
+    deduped
+}
+
+fn graph_neighbor_sort_score(neighbor: &GraphNeighbor, terms: &[String]) -> usize {
+    let base = match neighbor.kind.as_str() {
+        "incoming_reference" => 700,
+        "outgoing_reference" => 680,
+        "path_reference" => 640,
+        "entity" => 560,
+        "edge" => 540,
+        "source" => 520,
+        _ => 500,
+    };
+    let searchable = format!(
+        "{} {} {} {} {}",
+        neighbor.kind,
+        neighbor.label,
+        neighbor.detail,
+        neighbor.path.as_deref().unwrap_or(""),
+        neighbor.target_name.as_deref().unwrap_or("")
+    );
+    base + graph_text_match_score(&searchable, terms) * 40
+}
+
+fn graph_neighbor_key(neighbor: &GraphNeighbor) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        neighbor.path.as_deref().unwrap_or(""),
+        neighbor.target_path.as_deref().unwrap_or(""),
+        neighbor.target_name.as_deref().unwrap_or(""),
+        neighbor
+            .line_start
+            .map(|line| line.to_string())
+            .unwrap_or_default(),
+        neighbor.label
+    )
+}
+
+fn context_freshness_signals_via_hugr_api(
+    config: &StorageConfig,
+    files: &[String],
+    symbols: &[CodeSymbol],
+    limit: usize,
+) -> Result<Vec<FreshnessSignal>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let paths = freshness_paths(files, symbols);
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let snapshot = fetch_hugr_api_storage_snapshot(config)?;
+    let timestamps = storage_index_timestamps(&snapshot, &paths)?;
+
+    Ok(freshness_signals_from_index_timestamps(
+        paths, timestamps, limit,
+    ))
+}
+
+async fn local_index_timestamps(
+    conn: &Connection,
+    paths: &[String],
+) -> Result<HashMap<String, i64>, String> {
+    let path_set = paths.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut timestamps = HashMap::<String, i64>::new();
+
+    let mut rows = conn
+        .query(
+            "
+            SELECT path, updated_at_ms
+            FROM discovered_files
+            WHERE project_id = ?1
+            ",
+            params![LOCAL_PROJECT_ID],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        let path = row.get::<String>(0).map_err(|error| error.to_string())?;
+        if path_set.contains(path.as_str()) {
+            record_latest_timestamp(
+                &mut timestamps,
+                path,
+                row.get::<i64>(1).map_err(|error| error.to_string())?,
+            );
+        }
+    }
+
+    let mut rows = conn
+        .query(
+            "
+            SELECT path, indexed_at_ms
+            FROM code_symbols
+            WHERE project_id = ?1
+            ",
+            params![LOCAL_PROJECT_ID],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        let path = row.get::<String>(0).map_err(|error| error.to_string())?;
+        if path_set.contains(path.as_str()) {
+            record_latest_timestamp(
+                &mut timestamps,
+                path,
+                row.get::<i64>(1).map_err(|error| error.to_string())?,
+            );
+        }
+    }
+
+    let mut rows = conn
+        .query(
+            "
+            SELECT path, indexed_at_ms
+            FROM code_references
+            WHERE project_id = ?1
+            ",
+            params![LOCAL_PROJECT_ID],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        let path = row.get::<String>(0).map_err(|error| error.to_string())?;
+        if path_set.contains(path.as_str()) {
+            record_latest_timestamp(
+                &mut timestamps,
+                path,
+                row.get::<i64>(1).map_err(|error| error.to_string())?,
+            );
+        }
+    }
+
+    Ok(timestamps)
+}
+
+fn storage_index_timestamps(
+    snapshot: &HugrApiStorageSnapshot,
+    paths: &[String],
+) -> Result<HashMap<String, i64>, String> {
+    let path_set = paths.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut timestamps = HashMap::<String, i64>::new();
+
+    for file in storage_discovered_files(snapshot)? {
+        if path_set.contains(file.path.as_str()) {
+            record_latest_timestamp(&mut timestamps, file.path, file.updated_at_ms);
+        }
+    }
+
+    for value in storage_payload_records(snapshot, SyncTableKind::CodeSymbols) {
+        let record = code_symbol_sync_record_from_value(&value)?;
+        if path_set.contains(record.path.as_str()) {
+            record_latest_timestamp(&mut timestamps, record.path, record.indexed_at_ms);
+        }
+    }
+
+    for value in storage_payload_records(snapshot, SyncTableKind::CodeReferences) {
+        let record = code_reference_sync_record_from_value(&value)?;
+        if path_set.contains(record.path.as_str()) {
+            record_latest_timestamp(&mut timestamps, record.path, record.indexed_at_ms);
+        }
+    }
+
+    Ok(timestamps)
+}
+
+fn freshness_paths(files: &[String], symbols: &[CodeSymbol]) -> Vec<String> {
+    let mut paths = files
+        .iter()
+        .chain(symbols.iter().map(|symbol| &symbol.path))
+        .map(|path| normalize_target(path))
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn freshness_signals_from_index_timestamps(
+    paths: Vec<String>,
+    timestamps: HashMap<String, i64>,
+    limit: usize,
+) -> Vec<FreshnessSignal> {
+    let mut signals = paths
+        .into_iter()
+        .filter_map(|path| {
+            let indexed_at_ms = timestamps.get(&path).copied();
+            let modified_at_ms = file_modified_at_ms(&path);
+            match (indexed_at_ms, modified_at_ms) {
+                (Some(indexed), Some(modified)) if modified > indexed + 1_000 => {
+                    Some(FreshnessSignal {
+                        detail: format!(
+                            "{path} changed after its latest Hugr index timestamp ({modified} > {indexed})"
+                        ),
+                        path,
+                        kind: "stale_index".to_string(),
+                        indexed_at_ms: Some(indexed),
+                        modified_at_ms: Some(modified),
+                    })
+                }
+                (None, _) => Some(FreshnessSignal {
+                    detail: format!("{path} has no matching Hugr index timestamp"),
+                    path,
+                    kind: "missing_index".to_string(),
+                    indexed_at_ms: None,
+                    modified_at_ms,
+                }),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    signals.sort_by(|left, right| {
+        freshness_kind_rank(&right.kind)
+            .cmp(&freshness_kind_rank(&left.kind))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    signals.truncate(limit);
+    signals
+}
+
+fn freshness_kind_rank(kind: &str) -> usize {
+    match kind {
+        "stale_index" => 2,
+        "missing_index" => 1,
+        _ => 0,
+    }
+}
+
+fn record_latest_timestamp(timestamps: &mut HashMap<String, i64>, path: String, timestamp: i64) {
+    timestamps
+        .entry(path)
+        .and_modify(|existing| *existing = (*existing).max(timestamp))
+        .or_insert(timestamp);
+}
+
+fn file_modified_at_ms(path: &str) -> Option<i64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    let millis = modified.duration_since(UNIX_EPOCH).ok()?.as_millis();
+    i64::try_from(millis).ok()
+}
+
+fn record_diagnostics_via_hugr_api(
+    config: &StorageConfig,
+    diagnostics: &[DiagnosticInput],
+) -> Result<Vec<Diagnostic>, String> {
+    let records = diagnostic_records_from_inputs(diagnostics)?;
+    let now = now_ms()?;
+    let project = project_from_input(current_project_input()?, now);
+    let payloads = vec![
+        api_payload_for_records(
+            SyncTableKind::Projects,
+            vec![project_sync_record_value(&project)],
+        ),
+        api_payload_for_records(
+            SyncTableKind::Diagnostics,
+            records.iter().map(diagnostic_sync_record_value).collect(),
+        ),
+    ];
+    post_hugr_api_storage_payloads(config, "record diagnostics", &payloads, &[], &[], &[])?;
+    Ok(records
+        .into_iter()
+        .map(diagnostic_from_sync_record)
+        .collect())
+}
+
+fn recent_diagnostics_via_hugr_api(
+    config: &StorageConfig,
+    query: &str,
+    files: &[String],
+    symbols: &[CodeSymbol],
+    limit: usize,
+) -> Result<Vec<Diagnostic>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let records = storage_diagnostic_records(&fetch_hugr_api_storage_snapshot(config)?)?;
+    Ok(rank_diagnostics(records, query, files, symbols, limit))
+}
+
+fn diagnostic_records_from_inputs(
+    diagnostics: &[DiagnosticInput],
+) -> Result<Vec<DiagnosticSyncRecord>, String> {
+    let now = now_ms()?;
+    diagnostics
+        .iter()
+        .filter_map(|diagnostic| normalize_diagnostic_input(diagnostic))
+        .map(|diagnostic| {
+            Ok(DiagnosticSyncRecord {
+                id: diagnostic_id(now),
+                project_id: LOCAL_PROJECT_ID.to_string(),
+                source: diagnostic.source,
+                path: diagnostic.path,
+                line_start: diagnostic.line_start,
+                line_end: diagnostic.line_end,
+                severity: diagnostic.severity,
+                code: diagnostic.code,
+                message: diagnostic.message,
+                command: diagnostic.command,
+                created_at_ms: now,
+            })
+        })
+        .collect()
+}
+
+fn normalize_diagnostic_input(input: &DiagnosticInput) -> Option<DiagnosticInput> {
+    let message = input.message.trim();
+    if message.is_empty() {
+        return None;
+    }
+
+    Some(DiagnosticInput {
+        source: input
+            .source
+            .trim()
+            .to_lowercase()
+            .replace(char::is_whitespace, "_"),
+        path: input
+            .path
+            .as_deref()
+            .map(normalize_target)
+            .filter(|path| !path.is_empty()),
+        line_start: input.line_start.filter(|line| *line > 0),
+        line_end: input.line_end.filter(|line| *line > 0),
+        severity: normalize_diagnostic_severity(&input.severity),
+        code: input
+            .code
+            .as_deref()
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+            .map(str::to_string),
+        message: message.to_string(),
+        command: input
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .map(str::to_string),
+    })
+}
+
+fn normalize_diagnostic_severity(severity: &str) -> String {
+    match severity.trim().to_lowercase().as_str() {
+        "error" | "warning" | "info" | "hint" => severity.trim().to_lowercase(),
+        _ => "error".to_string(),
+    }
+}
+
+async fn insert_diagnostic_records(
+    conn: &Connection,
+    records: &[DiagnosticSyncRecord],
+) -> Result<(), String> {
+    for record in records {
+        conn.execute(
+            "
+            INSERT INTO diagnostics (
+                id, project_id, source, path, line_start, line_end, severity, code,
+                message, command, created_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(id) DO UPDATE SET
+                project_id = excluded.project_id,
+                source = excluded.source,
+                path = excluded.path,
+                line_start = excluded.line_start,
+                line_end = excluded.line_end,
+                severity = excluded.severity,
+                code = excluded.code,
+                message = excluded.message,
+                command = excluded.command,
+                created_at_ms = excluded.created_at_ms
+            ",
+            params![
+                record.id.clone(),
+                record.project_id.clone(),
+                record.source.clone(),
+                record.path.clone(),
+                record.line_start,
+                record.line_end,
+                record.severity.clone(),
+                record.code.clone(),
+                record.message.clone(),
+                record.command.clone(),
+                record.created_at_ms
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+async fn local_diagnostic_sync_records(
+    conn: &Connection,
+) -> Result<Vec<DiagnosticSyncRecord>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT id, project_id, source, path, line_start, line_end, severity,
+                   code, message, command, created_at_ms
+            FROM diagnostics
+            WHERE project_id = ?1
+            ORDER BY created_at_ms DESC, id ASC
+            LIMIT 1000
+            ",
+            params![LOCAL_PROJECT_ID],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(DiagnosticSyncRecord {
+            id: row.get::<String>(0).map_err(|error| error.to_string())?,
+            project_id: row.get::<String>(1).map_err(|error| error.to_string())?,
+            source: row.get::<String>(2).map_err(|error| error.to_string())?,
+            path: row
+                .get::<Option<String>>(3)
+                .map_err(|error| error.to_string())?,
+            line_start: row
+                .get::<Option<i64>>(4)
+                .map_err(|error| error.to_string())?,
+            line_end: row
+                .get::<Option<i64>>(5)
+                .map_err(|error| error.to_string())?,
+            severity: row.get::<String>(6).map_err(|error| error.to_string())?,
+            code: row
+                .get::<Option<String>>(7)
+                .map_err(|error| error.to_string())?,
+            message: row.get::<String>(8).map_err(|error| error.to_string())?,
+            command: row
+                .get::<Option<String>>(9)
+                .map_err(|error| error.to_string())?,
+            created_at_ms: row.get::<i64>(10).map_err(|error| error.to_string())?,
+        });
+    }
+
+    Ok(records)
+}
+
+fn storage_diagnostic_records(
+    snapshot: &HugrApiStorageSnapshot,
+) -> Result<Vec<DiagnosticSyncRecord>, String> {
+    storage_payload_records(snapshot, SyncTableKind::Diagnostics)
+        .iter()
+        .map(diagnostic_sync_record_from_value)
+        .collect()
+}
+
+fn rank_diagnostics(
+    records: Vec<DiagnosticSyncRecord>,
+    query: &str,
+    files: &[String],
+    symbols: &[CodeSymbol],
+    limit: usize,
+) -> Vec<Diagnostic> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let terms = query_terms(query);
+    let paths = files
+        .iter()
+        .map(|path| normalize_target(path))
+        .chain(symbols.iter().map(|symbol| normalize_target(&symbol.path)))
+        .filter(|path| !path.is_empty())
+        .collect::<HashSet<_>>();
+    let mut matches = records
+        .into_iter()
+        .filter_map(|record| {
+            let score = diagnostic_score(&record, &terms, &paths);
+            (score > 0).then_some((score, record))
+        })
+        .collect::<Vec<_>>();
+
+    matches.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.created_at_ms.cmp(&left.1.created_at_ms))
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+    matches.truncate(limit);
+    matches
+        .into_iter()
+        .map(|(_, record)| diagnostic_from_sync_record(record))
+        .collect()
+}
+
+fn diagnostic_score(
+    record: &DiagnosticSyncRecord,
+    terms: &[String],
+    paths: &HashSet<String>,
+) -> usize {
+    let mut relevance = 0;
+    if let Some(path) = &record.path {
+        if paths.contains(path) {
+            relevance += 120;
+        }
+    }
+
+    let searchable = format!(
+        "{} {} {} {} {}",
+        record.source,
+        record.severity,
+        record.code.as_deref().unwrap_or(""),
+        record.message,
+        record.command.as_deref().unwrap_or("")
+    )
+    .to_lowercase();
+    relevance += terms
+        .iter()
+        .filter(|term| searchable.contains(term.as_str()))
+        .count()
+        * 20;
+    if relevance == 0 {
+        return 0;
+    }
+
+    let mut score = relevance;
+    if matches!(record.severity.as_str(), "error") {
+        score += 10;
+    }
+    score
+}
+
+fn diagnostic_from_sync_record(record: DiagnosticSyncRecord) -> Diagnostic {
+    Diagnostic {
+        id: record.id,
+        source: record.source,
+        path: record.path,
+        line_start: record.line_start,
+        line_end: record.line_end,
+        severity: record.severity,
+        code: record.code,
+        message: record.message,
+        command: record.command,
+        created_at_ms: record.created_at_ms,
+    }
+}
+
+fn diagnostic_id(created_at_ms: i64) -> String {
+    let sequence = DIAGNOSTIC_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("diag_{created_at_ms}_{sequence}")
+}
+
+fn likely_tests_for_files_via_hugr_api(
+    config: &StorageConfig,
+    files: &[String],
+    limit: usize,
+) -> Result<Vec<TestCandidate>, String> {
+    if limit == 0 || files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let known_files = storage_discovered_files(&fetch_hugr_api_storage_snapshot(config)?)?
+        .into_iter()
+        .map(|record| record.path)
+        .collect::<Vec<_>>();
+    Ok(testmap::likely_tests_for_files(files, &known_files, limit))
+}
+
+fn recall_symbols_via_hugr_api(
+    config: &StorageConfig,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<CodeSymbol>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let terms = query_terms(query);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut matches = storage_code_symbols(&fetch_hugr_api_storage_snapshot(config)?)?
+        .into_iter()
+        .filter_map(|symbol| {
+            let score = code_symbol_score(&symbol, &terms, query);
+            (score > 0).then_some((score, symbol))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.path.cmp(&right.1.path))
+            .then_with(|| left.1.line_start.cmp(&right.1.line_start))
+    });
+    matches.truncate(limit);
+    Ok(matches.into_iter().map(|(_, symbol)| symbol).collect())
+}
+
+fn start_session_via_hugr_api(config: &StorageConfig, task: &str) -> Result<Session, String> {
+    let started_at_ms = now_ms()?;
+    let project = project_from_input(current_project_input()?, started_at_ms);
+    let session = Session {
+        id: format!("ses_{started_at_ms}"),
+        task: task.trim().to_string(),
+        branch: current_branch().unwrap_or(None),
+        started_at_ms,
+        ended_at_ms: None,
+        final_summary: None,
+    };
+    let record = session_record_from_session(&session);
+    let payloads = vec![
+        api_payload_for_records(
+            SyncTableKind::Projects,
+            vec![project_sync_record_value(&project)],
+        ),
+        api_payload_for_records(
+            SyncTableKind::Sessions,
+            vec![session_sync_record_value(&record)],
+        ),
+    ];
+    post_hugr_api_storage_payloads(config, "start session", &payloads, &[], &[], &[])?;
+    Ok(session)
+}
+
+fn record_session_event_via_hugr_api(
+    config: &StorageConfig,
+    kind: &str,
+    detail: &str,
+) -> Result<SessionEvent, String> {
+    record_session_event_if_active_via_hugr_api(config, kind, detail)?
+        .ok_or_else(|| "no active session; run `hugr session start <task>` first".to_string())
+}
+
+fn record_session_event_if_active_via_hugr_api(
+    config: &StorageConfig,
+    kind: &str,
+    detail: &str,
+) -> Result<Option<SessionEvent>, String> {
+    let snapshot = fetch_hugr_api_storage_snapshot(config)?;
+    let Some(session_id) = active_session_id_from_sessions(&storage_sessions(&snapshot)?) else {
+        return Ok(None);
+    };
+    let created_at_ms = now_ms()?;
+    let event = SessionEvent {
+        id: session_event_id(created_at_ms),
+        session_id,
+        kind: kind.trim().to_string(),
+        detail: detail.trim().to_string(),
+        created_at_ms,
+    };
+    let record = SessionEventSyncRecord {
+        id: event.id.clone(),
+        session_id: event.session_id.clone(),
+        kind: event.kind.clone(),
+        detail: event.detail.clone(),
+        created_at_ms: event.created_at_ms,
+    };
+    post_hugr_api_storage_payloads(
+        config,
+        "record session event",
+        &[],
+        &[session_event_sync_record_value(&record)],
+        &[],
+        &[],
+    )?;
+    Ok(Some(event))
+}
+
+fn end_session_via_hugr_api(
+    config: &StorageConfig,
+    summary: Option<&str>,
+) -> Result<Session, String> {
+    let snapshot = fetch_hugr_api_storage_snapshot(config)?;
+    let mut session = storage_sessions(&snapshot)?
+        .into_iter()
+        .filter(|session| session.ended_at_ms.is_none())
+        .max_by(|left, right| left.started_at_ms.cmp(&right.started_at_ms))
+        .ok_or_else(|| "no active session; run `hugr session start <task>` first".to_string())?;
+    session.ended_at_ms = Some(now_ms()?);
+    session.final_summary = summary
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+        .map(str::to_string);
+    let record = session_record_from_session(&session);
+    post_hugr_api_storage_payloads(
+        config,
+        "end session",
+        &[api_payload_for_records(
+            SyncTableKind::Sessions,
+            vec![session_sync_record_value(&record)],
+        )],
+        &[],
+        &[],
+        &[],
+    )?;
+    Ok(session)
+}
+
+fn promote_latest_session_via_hugr_api(
+    config: &StorageConfig,
+    embedding_provider: &SelectedEmbeddingProvider,
+) -> Result<SessionPromotionResult, String> {
+    let snapshot = fetch_hugr_api_storage_snapshot(config)?;
+    let sessions = storage_sessions(&snapshot)?;
+    let session = latest_session_from_sessions(&sessions)
+        .ok_or_else(|| "no session available to promote".to_string())?;
+    let facts = session_promotion_facts_from_records(&session, &snapshot.session_events);
+    if facts.is_empty() {
+        return Err("latest session has no events or summary to promote".to_string());
+    }
+
+    let memory_records = fetch_hugr_api_memory_records(config)?;
+    if let Some(memory) = promoted_memory_for_session_records(
+        &memory_records,
+        &snapshot.session_promotions,
+        &session.id,
+    ) {
+        return Ok(SessionPromotionResult {
+            session_id: session.id,
+            task: session.task,
+            fact_count: facts.len(),
+            memory,
+        });
+    }
+
+    let project = project_for_storage_snapshot(&snapshot)?;
+    let (memory, payloads, promotion_record) = hugr_api_session_promotion_payloads(
+        embedding_provider,
+        &session,
+        &facts,
+        project.as_ref(),
+    )?;
+    post_hugr_api_memory_payloads(config, "promote session", &payloads)?;
+    post_hugr_api_storage_payloads(
+        config,
+        "record session promotion",
+        &[],
+        &[],
+        &[session_promotion_sync_record_value(&promotion_record)],
+        &[],
+    )?;
+
+    Ok(SessionPromotionResult {
+        session_id: session.id,
+        task: session.task,
+        fact_count: facts.len(),
+        memory,
+    })
+}
+
+fn recent_session_facts_via_hugr_api(
+    config: &StorageConfig,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SessionFact>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let terms = query_terms(query);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let snapshot = fetch_hugr_api_storage_snapshot(config)?;
+    let mut facts = Vec::new();
+    for session in storage_sessions(&snapshot)? {
+        facts.push(SessionFact {
+            session_id: session.id.clone(),
+            kind: "task".to_string(),
+            detail: session.task.clone(),
+            created_at_ms: session.started_at_ms,
+        });
+        if let Some(summary) = session.final_summary {
+            facts.push(SessionFact {
+                session_id: session.id.clone(),
+                kind: "summary".to_string(),
+                detail: summary,
+                created_at_ms: session.ended_at_ms.unwrap_or(session.started_at_ms),
+            });
+        }
+    }
+    for event in &snapshot.session_events {
+        facts.push(SessionFact {
+            session_id: event.session_id.clone(),
+            kind: event.kind.clone(),
+            detail: event.detail.clone(),
+            created_at_ms: event.created_at_ms,
+        });
+    }
+    facts.retain(|fact| session_fact_score(fact, &terms) > 0);
+    facts.sort_by(|left, right| {
+        session_fact_score(right, &terms)
+            .cmp(&session_fact_score(left, &terms))
+            .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+    });
+    facts.truncate(limit);
+    Ok(facts)
+}
+
+fn session_record_from_session(session: &Session) -> SessionSyncRecord {
+    SessionSyncRecord {
+        id: session.id.clone(),
+        project_id: LOCAL_PROJECT_ID.to_string(),
+        task: session.task.clone(),
+        branch: session.branch.clone(),
+        started_at_ms: session.started_at_ms,
+        ended_at_ms: session.ended_at_ms,
+        final_summary: session.final_summary.clone(),
+    }
+}
+
+fn session_from_sync_record(record: &SessionSyncRecord) -> Session {
+    Session {
+        id: record.id.clone(),
+        task: record.task.clone(),
+        branch: record.branch.clone(),
+        started_at_ms: record.started_at_ms,
+        ended_at_ms: record.ended_at_ms,
+        final_summary: record.final_summary.clone(),
+    }
+}
+
+fn active_session_id_from_sessions(sessions: &[Session]) -> Option<String> {
+    sessions
+        .iter()
+        .filter(|session| session.ended_at_ms.is_none())
+        .max_by(|left, right| left.started_at_ms.cmp(&right.started_at_ms))
+        .map(|session| session.id.clone())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HugrApiStorageSnapshot {
+    payloads: Vec<SyncApiTablePayload>,
+    session_events: Vec<SessionEventSyncRecord>,
+    session_promotions: Vec<SessionPromotionSyncRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HugrApiStorageApplyResponse {
+    status: String,
+    tables: Vec<SyncTableResult>,
+    session_events_table: SyncTableResult,
+    session_promotions_table: SyncTableResult,
+}
+
+fn fetch_hugr_api_storage_snapshot(
+    config: &StorageConfig,
+) -> Result<HugrApiStorageSnapshot, String> {
+    let response = get_hugr_api_json(config, "/v1/storage")?;
+    parse_hugr_api_storage_snapshot_response(&response)
+}
+
+fn post_hugr_api_storage_payloads(
+    config: &StorageConfig,
+    operation: &str,
+    payloads: &[SyncApiTablePayload],
+    session_events: &[serde_json::Value],
+    session_promotions: &[serde_json::Value],
+    replace_code_index_paths: &[String],
+) -> Result<HugrApiStorageApplyResponse, String> {
+    if payloads.iter().all(|payload| payload.records.is_empty())
+        && session_events.is_empty()
+        && session_promotions.is_empty()
+        && replace_code_index_paths.is_empty()
+    {
+        return Ok(HugrApiStorageApplyResponse {
+            status: "accepted".to_string(),
+            tables: Vec::new(),
+            session_events_table: planned_storage_table_result(
+                "session_summaries",
+                "session_events",
+                0,
+                false,
+            ),
+            session_promotions_table: planned_storage_table_result(
+                "session_summaries",
+                "session_promotions",
+                0,
+                false,
+            ),
+        });
+    }
+
+    let body = hugr_api_storage_apply_request(
+        payloads,
+        session_events,
+        session_promotions,
+        replace_code_index_paths,
+    );
+    let response = post_hugr_api_json(config, "/v1/storage", &body)?;
+    let parsed = parse_hugr_api_storage_apply_response(&response)?;
+    let mut tables = parsed.tables.clone();
+    tables.push(parsed.session_events_table.clone());
+    tables.push(parsed.session_promotions_table.clone());
+    ensure_hugr_api_memory_operation_accepted(operation, &parsed.status, &tables)?;
+    Ok(parsed)
+}
+
+fn hugr_api_storage_apply_request(
+    payloads: &[SyncApiTablePayload],
+    session_events: &[serde_json::Value],
+    session_promotions: &[serde_json::Value],
+    replace_code_index_paths: &[String],
+) -> serde_json::Value {
+    json!({
+        "contract_version": HUGR_API_CONTRACT_VERSION,
+        "tables": payloads.iter().map(sync_api_table_payload_value).collect::<Vec<_>>(),
+        "session_events": session_events,
+        "session_promotions": session_promotions,
+        "replace_code_index_paths": replace_code_index_paths
+    })
+}
+
+fn parse_hugr_api_storage_snapshot_response(
+    response: &str,
+) -> Result<HugrApiStorageSnapshot, String> {
+    let value = serde_json::from_str::<serde_json::Value>(response)
+        .map_err(|error| format!("invalid Hugr API storage response: {error}"))?;
+    reject_hugr_api_error(&value)?;
+    let contract_version = json_string_field(&value, "contract_version")?;
+    if contract_version != HUGR_API_CONTRACT_VERSION {
+        return Err(format!(
+            "unsupported Hugr API contract version '{contract_version}'"
+        ));
+    }
+    Ok(HugrApiStorageSnapshot {
+        payloads: json_array_field(&value, "tables")?
+            .iter()
+            .map(parse_sync_api_table_payload)
+            .collect::<Result<Vec<_>, _>>()?,
+        session_events: json_array_field(&value, "session_events")?
+            .iter()
+            .map(session_event_sync_record_from_value)
+            .collect::<Result<Vec<_>, _>>()?,
+        session_promotions: optional_json_array_field(&value, "session_promotions")
+            .iter()
+            .map(session_promotion_sync_record_from_value)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn parse_hugr_api_storage_apply_response(
+    response: &str,
+) -> Result<HugrApiStorageApplyResponse, String> {
+    let value = serde_json::from_str::<serde_json::Value>(response)
+        .map_err(|error| format!("invalid Hugr API storage response: {error}"))?;
+    reject_hugr_api_error(&value)?;
+    let contract_version = json_string_field(&value, "contract_version")?;
+    if contract_version != HUGR_API_CONTRACT_VERSION {
+        return Err(format!(
+            "unsupported Hugr API contract version '{contract_version}'"
+        ));
+    }
+    Ok(HugrApiStorageApplyResponse {
+        status: json_string_field(&value, "status")?,
+        tables: json_array_field(&value, "tables")?
+            .iter()
+            .map(parse_sync_table_result)
+            .collect::<Result<Vec<_>, _>>()?,
+        session_events_table: parse_sync_table_result(
+            value.get("session_events_table").ok_or_else(|| {
+                "Hugr API response missing field 'session_events_table'".to_string()
+            })?,
+        )?,
+        session_promotions_table: value
+            .get("session_promotions_table")
+            .map(parse_sync_table_result)
+            .transpose()?
+            .unwrap_or_else(|| {
+                planned_storage_table_result("session_summaries", "session_promotions", 0, false)
+            }),
+    })
+}
+
+fn storage_payload_records(
+    snapshot: &HugrApiStorageSnapshot,
+    table: SyncTableKind,
+) -> Vec<serde_json::Value> {
+    snapshot
+        .payloads
+        .iter()
+        .find(|payload| payload.result.table == table.table_name())
+        .map(|payload| payload.records.clone())
+        .unwrap_or_default()
+}
+
+fn storage_project_records(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<Project>, String> {
+    storage_payload_records(snapshot, SyncTableKind::Projects)
+        .iter()
+        .map(|value| {
+            let record = project_sync_record_from_value(value)?;
+            Ok(Project {
+                id: record.id,
+                name: record.name,
+                root_path: record.root_path,
+                git_remote: record.git_remote,
+                default_branch: record.default_branch,
+                created_at_ms: record.created_at_ms,
+                updated_at_ms: record.updated_at_ms,
+            })
+        })
+        .collect()
+}
+
+fn storage_discovered_files(
+    snapshot: &HugrApiStorageSnapshot,
+) -> Result<Vec<DiscoveredFileSyncRecord>, String> {
+    storage_payload_records(snapshot, SyncTableKind::DiscoveredFiles)
+        .iter()
+        .map(discovered_file_sync_record_from_value)
+        .collect()
+}
+
+fn storage_code_symbols(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<CodeSymbol>, String> {
+    storage_payload_records(snapshot, SyncTableKind::CodeSymbols)
+        .iter()
+        .map(|value| {
+            let record = code_symbol_sync_record_from_value(value)?;
+            Ok(CodeSymbol {
+                path: record.path,
+                language: record.language,
+                name: record.name,
+                kind: record.kind,
+                line_start: record.line_start,
+                line_end: record.line_end,
+                signature: record.signature,
+            })
+        })
+        .collect()
+}
+
+fn storage_code_references(
+    snapshot: &HugrApiStorageSnapshot,
+) -> Result<Vec<CodeReference>, String> {
+    storage_payload_records(snapshot, SyncTableKind::CodeReferences)
+        .iter()
+        .map(|value| {
+            let record = code_reference_sync_record_from_value(value)?;
+            Ok(CodeReference {
+                path: record.path,
+                language: record.language,
+                target_path: record.target_path,
+                target_name: record.target_name,
+                target_kind: record.target_kind,
+                kind: record.kind,
+                line_start: record.line_start,
+                excerpt: record.excerpt,
+            })
+        })
+        .collect()
+}
+
+fn storage_source_records(
+    snapshot: &HugrApiStorageSnapshot,
+) -> Result<Vec<SourceSyncRecord>, String> {
+    storage_payload_records(snapshot, SyncTableKind::Sources)
+        .iter()
+        .map(source_sync_record_from_value)
+        .collect()
+}
+
+fn storage_entity_records(
+    snapshot: &HugrApiStorageSnapshot,
+) -> Result<Vec<EntitySyncRecord>, String> {
+    storage_payload_records(snapshot, SyncTableKind::Entities)
+        .iter()
+        .map(entity_sync_record_from_value)
+        .collect()
+}
+
+fn storage_edge_records(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<EdgeSyncRecord>, String> {
+    storage_payload_records(snapshot, SyncTableKind::Edges)
+        .iter()
+        .map(edge_sync_record_from_value)
+        .collect()
+}
+
+fn storage_sessions(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<Session>, String> {
+    storage_payload_records(snapshot, SyncTableKind::Sessions)
+        .iter()
+        .map(|value| {
+            session_sync_record_from_value(value).map(|record| session_from_sync_record(&record))
+        })
+        .collect()
+}
+
+fn latest_session_from_sessions(sessions: &[Session]) -> Option<Session> {
+    sessions
+        .iter()
+        .max_by(|left, right| {
+            left.ended_at_ms
+                .unwrap_or(left.started_at_ms)
+                .cmp(&right.ended_at_ms.unwrap_or(right.started_at_ms))
+                .then_with(|| left.started_at_ms.cmp(&right.started_at_ms))
+        })
+        .cloned()
+}
+
+fn session_promotion_facts_from_records(
+    session: &Session,
+    events: &[SessionEventSyncRecord],
+) -> Vec<SessionFact> {
+    let mut facts = events
+        .iter()
+        .filter(|event| event.session_id == session.id)
+        .map(|event| SessionFact {
+            session_id: event.session_id.clone(),
+            kind: event.kind.clone(),
+            detail: event.detail.clone(),
+            created_at_ms: event.created_at_ms,
+        })
+        .collect::<Vec<_>>();
+    facts.sort_by(|left, right| left.created_at_ms.cmp(&right.created_at_ms));
+    facts.truncate(12);
+
+    if let Some(summary) = session
+        .final_summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+    {
+        facts.push(SessionFact {
+            session_id: session.id.clone(),
+            kind: "summary".to_string(),
+            detail: summary.to_string(),
+            created_at_ms: session.ended_at_ms.unwrap_or(session.started_at_ms),
+        });
+    }
+
+    facts
+}
+
+fn project_for_storage_snapshot(
+    snapshot: &HugrApiStorageSnapshot,
+) -> Result<Option<Project>, String> {
+    let projects = storage_project_records(snapshot)?;
+    if let Some(project) = projects
+        .iter()
+        .find(|project| project.id == LOCAL_PROJECT_ID)
+        .cloned()
+    {
+        return Ok(Some(project));
+    }
+    if let Some(project) = projects
+        .iter()
+        .max_by(|left, right| left.updated_at_ms.cmp(&right.updated_at_ms))
+        .cloned()
+    {
+        return Ok(Some(project));
+    }
+
+    Ok(Some(project_from_input(
+        current_project_input()?,
+        now_ms()?,
+    )))
+}
+
+fn planned_storage_table_result(
+    class: &str,
+    table: &str,
+    row_count: usize,
+    executed: bool,
+) -> SyncTableResult {
+    SyncTableResult {
+        class: class.to_string(),
+        table: table.to_string(),
+        row_count,
+        inserted_count: 0,
+        updated_count: 0,
+        skipped_count: 0,
+        conflict_count: 0,
+        executed,
+        conflicts: Vec::new(),
+    }
 }
 
 fn hugr_api_active_memories(config: &StorageConfig) -> Result<Vec<Memory>, String> {
@@ -2573,6 +5015,44 @@ fn memory_from_sync_record(record: &MemorySyncRecord) -> Memory {
         text: record.text.clone(),
         structured_payload: record.structured_payload.clone(),
     }
+}
+
+fn promoted_memory_for_session_records(
+    records: &[MemorySyncRecord],
+    promotions: &[SessionPromotionSyncRecord],
+    session_id: &str,
+) -> Option<Memory> {
+    if let Some(memory_id) = promotions
+        .iter()
+        .filter(|promotion| promotion.session_id == session_id)
+        .max_by(|left, right| left.promoted_at_ms.cmp(&right.promoted_at_ms))
+        .map(|promotion| promotion.memory_id.as_str())
+    {
+        if let Some(record) = records.iter().find(|record| record.id == memory_id) {
+            return Some(memory_from_sync_record(record));
+        }
+    }
+
+    records
+        .iter()
+        .find(|record| memory_record_promotes_session(record, session_id))
+        .map(memory_from_sync_record)
+}
+
+fn memory_record_promotes_session(record: &MemorySyncRecord, session_id: &str) -> bool {
+    let Some(payload) = record.structured_payload.as_deref() else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    value
+        .get("source")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|source| {
+            source.get("type").and_then(serde_json::Value::as_str) == Some("session_promotion")
+                && source.get("session_id").and_then(serde_json::Value::as_str) == Some(session_id)
+        })
 }
 
 fn fetch_hugr_api_memory_records(config: &StorageConfig) -> Result<Vec<MemorySyncRecord>, String> {
@@ -2943,6 +5423,14 @@ fn json_array_field<'a>(
         .ok_or_else(|| format!("Hugr API response missing array field '{field}'"))
 }
 
+fn optional_json_array_field(value: &serde_json::Value, field: &str) -> Vec<serde_json::Value> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn json_string_field(value: &serde_json::Value, field: &str) -> Result<String, String> {
     value
         .get(field)
@@ -3082,6 +5570,24 @@ fn api_table_supports_records(table: SyncTableKind) -> bool {
             | SyncTableKind::Edges
             | SyncTableKind::CodeReferences
             | SyncTableKind::Sessions
+            | SyncTableKind::ContextPacks
+            | SyncTableKind::Diagnostics
+    )
+}
+
+fn api_storage_table_supports_records(table: SyncTableKind) -> bool {
+    matches!(
+        table,
+        SyncTableKind::Projects
+            | SyncTableKind::Sources
+            | SyncTableKind::DiscoveredFiles
+            | SyncTableKind::Entities
+            | SyncTableKind::CodeSymbols
+            | SyncTableKind::Edges
+            | SyncTableKind::CodeReferences
+            | SyncTableKind::Sessions
+            | SyncTableKind::ContextPacks
+            | SyncTableKind::Diagnostics
     )
 }
 
@@ -3100,6 +5606,8 @@ async fn api_sync_records_for_table(
         SyncTableKind::Edges => edge_sync_records(conn).await,
         SyncTableKind::CodeReferences => code_reference_sync_records(conn).await,
         SyncTableKind::Sessions => session_sync_records(conn).await,
+        SyncTableKind::ContextPacks => context_pack_sync_records(conn).await,
+        SyncTableKind::Diagnostics => diagnostic_sync_records(conn).await,
     }
 }
 
@@ -3383,6 +5891,125 @@ async fn session_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value
     Ok(records)
 }
 
+async fn session_storage_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT id, project_id, task, branch, started_at_ms, ended_at_ms, final_summary
+            FROM sessions
+            ORDER BY started_at_ms, id
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(json!({
+            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
+            "project_id": row.get::<String>(1).map_err(|error| error.to_string())?,
+            "task": row.get::<String>(2).map_err(|error| error.to_string())?,
+            "branch": row.get::<Option<String>>(3).map_err(|error| error.to_string())?,
+            "started_at_ms": row.get::<i64>(4).map_err(|error| error.to_string())?,
+            "ended_at_ms": row.get::<Option<i64>>(5).map_err(|error| error.to_string())?,
+            "final_summary": row.get::<Option<String>>(6).map_err(|error| error.to_string())?
+        }));
+    }
+
+    Ok(records)
+}
+
+async fn context_pack_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT id, project_id, task, payload_json, created_at_ms, updated_at_ms
+            FROM context_packs
+            ORDER BY project_id, updated_at_ms, id
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(json!({
+            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
+            "project_id": row.get::<String>(1).map_err(|error| error.to_string())?,
+            "task": row.get::<String>(2).map_err(|error| error.to_string())?,
+            "payload_json": row.get::<String>(3).map_err(|error| error.to_string())?,
+            "created_at_ms": row.get::<i64>(4).map_err(|error| error.to_string())?,
+            "updated_at_ms": row.get::<i64>(5).map_err(|error| error.to_string())?
+        }));
+    }
+
+    Ok(records)
+}
+
+async fn diagnostic_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    Ok(local_diagnostic_sync_records(conn)
+        .await?
+        .iter()
+        .map(diagnostic_sync_record_value)
+        .collect())
+}
+
+async fn session_event_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT id, session_id, kind, detail, created_at_ms
+            FROM session_events
+            ORDER BY created_at_ms, id
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(json!({
+            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
+            "session_id": row.get::<String>(1).map_err(|error| error.to_string())?,
+            "kind": row.get::<String>(2).map_err(|error| error.to_string())?,
+            "detail": row.get::<String>(3).map_err(|error| error.to_string())?,
+            "created_at_ms": row.get::<i64>(4).map_err(|error| error.to_string())?
+        }));
+    }
+
+    Ok(records)
+}
+
+async fn session_promotion_sync_records(
+    conn: &Connection,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT session_id, memory_id, promoted_at_ms
+            FROM session_promotions
+            ORDER BY promoted_at_ms, session_id
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(json!({
+            "session_id": row.get::<String>(0).map_err(|error| error.to_string())?,
+            "memory_id": row.get::<String>(1).map_err(|error| error.to_string())?,
+            "promoted_at_ms": row.get::<i64>(2).map_err(|error| error.to_string())?
+        }));
+    }
+
+    Ok(records)
+}
+
 #[derive(Debug, Clone)]
 struct ProjectSyncRecord {
     id: String,
@@ -3562,6 +6189,39 @@ fn edge_sync_record_from_value(value: &serde_json::Value) -> Result<EdgeSyncReco
 }
 
 #[derive(Debug, Clone)]
+struct DiagnosticSyncRecord {
+    id: String,
+    project_id: String,
+    source: String,
+    path: Option<String>,
+    line_start: Option<i64>,
+    line_end: Option<i64>,
+    severity: String,
+    code: Option<String>,
+    message: String,
+    command: Option<String>,
+    created_at_ms: i64,
+}
+
+fn diagnostic_sync_record_from_value(
+    value: &serde_json::Value,
+) -> Result<DiagnosticSyncRecord, String> {
+    Ok(DiagnosticSyncRecord {
+        id: json_string_field(value, "id")?,
+        project_id: json_string_field(value, "project_id")?,
+        source: json_string_field(value, "source")?,
+        path: json_optional_string_field(value, "path")?,
+        line_start: json_optional_i64_field(value, "line_start")?,
+        line_end: json_optional_i64_field(value, "line_end")?,
+        severity: json_string_field(value, "severity")?,
+        code: json_optional_string_field(value, "code")?,
+        message: json_string_field(value, "message")?,
+        command: json_optional_string_field(value, "command")?,
+        created_at_ms: json_i64_field(value, "created_at_ms")?,
+    })
+}
+
+#[derive(Debug, Clone)]
 struct CodeReferenceSyncRecord {
     project_id: String,
     path: String,
@@ -3612,6 +6272,67 @@ fn session_sync_record_from_value(value: &serde_json::Value) -> Result<SessionSy
         started_at_ms: json_i64_field(value, "started_at_ms")?,
         ended_at_ms: json_optional_i64_field(value, "ended_at_ms")?,
         final_summary: json_optional_string_field(value, "final_summary")?,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ContextPackSyncRecord {
+    id: String,
+    project_id: String,
+    task: String,
+    payload_json: String,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+fn context_pack_sync_record_from_value(
+    value: &serde_json::Value,
+) -> Result<ContextPackSyncRecord, String> {
+    Ok(ContextPackSyncRecord {
+        id: json_string_field(value, "id")?,
+        project_id: json_string_field(value, "project_id")?,
+        task: json_string_field(value, "task")?,
+        payload_json: json_string_field(value, "payload_json")?,
+        created_at_ms: json_i64_field(value, "created_at_ms")?,
+        updated_at_ms: json_i64_field(value, "updated_at_ms")?,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SessionEventSyncRecord {
+    id: String,
+    session_id: String,
+    kind: String,
+    detail: String,
+    created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SessionPromotionSyncRecord {
+    session_id: String,
+    memory_id: String,
+    promoted_at_ms: i64,
+}
+
+fn session_event_sync_record_from_value(
+    value: &serde_json::Value,
+) -> Result<SessionEventSyncRecord, String> {
+    Ok(SessionEventSyncRecord {
+        id: json_string_field(value, "id")?,
+        session_id: json_string_field(value, "session_id")?,
+        kind: json_string_field(value, "kind")?,
+        detail: json_string_field(value, "detail")?,
+        created_at_ms: json_i64_field(value, "created_at_ms")?,
+    })
+}
+
+fn session_promotion_sync_record_from_value(
+    value: &serde_json::Value,
+) -> Result<SessionPromotionSyncRecord, String> {
+    Ok(SessionPromotionSyncRecord {
+        session_id: json_string_field(value, "session_id")?,
+        memory_id: json_string_field(value, "memory_id")?,
+        promoted_at_ms: json_i64_field(value, "promoted_at_ms")?,
     })
 }
 
@@ -4452,6 +7173,153 @@ async fn apply_api_pull_session_records(
     finish_sync_table_result(conn, table, before_count, stats).await
 }
 
+async fn apply_api_push_context_pack_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::ContextPacks;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = context_pack_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO context_packs (
+                    id, project_id, task, payload_json, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(id) DO UPDATE SET
+                    project_id = excluded.project_id,
+                    task = excluded.task,
+                    payload_json = excluded.payload_json,
+                    updated_at_ms = excluded.updated_at_ms
+                ",
+                params![
+                    record.id,
+                    record.project_id,
+                    record.task,
+                    record.payload_json,
+                    record.created_at_ms,
+                    record.updated_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_pull_context_pack_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::ContextPacks;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = context_pack_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO context_packs (
+                    id, project_id, task, payload_json, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(id) DO UPDATE SET
+                    project_id = excluded.project_id,
+                    task = excluded.task,
+                    payload_json = excluded.payload_json,
+                    updated_at_ms = excluded.updated_at_ms
+                WHERE excluded.updated_at_ms > context_packs.updated_at_ms
+                ",
+                params![
+                    record.id,
+                    record.project_id,
+                    record.task,
+                    record.payload_json,
+                    record.created_at_ms,
+                    record.updated_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_newer_or_equal");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_push_diagnostic_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Diagnostics;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = diagnostic_sync_record_from_value(value)?;
+        insert_diagnostic_records(conn, std::slice::from_ref(&record)).await?;
+        stats.record_affected(1)?;
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_pull_diagnostic_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Diagnostics;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = diagnostic_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT OR IGNORE INTO diagnostics (
+                    id, project_id, source, path, line_start, line_end, severity, code,
+                    message, command, created_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ",
+                params![
+                    record.id,
+                    record.project_id,
+                    record.source,
+                    record.path,
+                    record.line_start,
+                    record.line_end,
+                    record.severity,
+                    record.code,
+                    record.message,
+                    record.command,
+                    record.created_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_preserved");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
 async fn apply_api_pull_payloads(
     conn: &Connection,
     payloads: &[SyncApiTablePayload],
@@ -4490,10 +7358,142 @@ async fn apply_api_pull_payloads(
             Some(SyncTableKind::Sessions) if !payload.records.is_empty() => {
                 results.push(apply_api_pull_session_records(conn, &payload.records).await?);
             }
+            Some(SyncTableKind::ContextPacks) if !payload.records.is_empty() => {
+                results.push(apply_api_pull_context_pack_records(conn, &payload.records).await?);
+            }
+            Some(SyncTableKind::Diagnostics) if !payload.records.is_empty() => {
+                results.push(apply_api_pull_diagnostic_records(conn, &payload.records).await?);
+            }
             _ => results.push(payload.result.clone()),
         }
     }
     Ok(results)
+}
+
+async fn apply_api_storage_session_event_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let before_count = table_row_count(conn, "session_events").await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = session_event_sync_record_from_value(value)?;
+        if !session_exists(conn, &record.session_id).await? {
+            stats.record_skip("missing_session");
+            continue;
+        }
+        let affected = conn
+            .execute(
+                "
+                INSERT OR IGNORE INTO session_events (
+                    id, session_id, kind, detail, created_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ",
+                params![
+                    record.id,
+                    record.session_id,
+                    record.kind,
+                    record.detail,
+                    record.created_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_preserved");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_storage_table_result(
+        conn,
+        "session_summaries",
+        "session_events",
+        before_count,
+        stats,
+    )
+    .await
+}
+
+async fn apply_api_storage_session_promotion_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let before_count = table_row_count(conn, "session_promotions").await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = session_promotion_sync_record_from_value(value)?;
+        if !session_exists(conn, &record.session_id).await? {
+            stats.record_skip("missing_session");
+            continue;
+        }
+        if !memory_exists(conn, &record.memory_id).await? {
+            stats.record_skip("missing_memory");
+            continue;
+        }
+        let affected = conn
+            .execute(
+                "
+                INSERT OR IGNORE INTO session_promotions (
+                    session_id, memory_id, promoted_at_ms
+                )
+                VALUES (?1, ?2, ?3)
+                ",
+                params![record.session_id, record.memory_id, record.promoted_at_ms],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_preserved");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_storage_table_result(
+        conn,
+        "session_summaries",
+        "session_promotions",
+        before_count,
+        stats,
+    )
+    .await
+}
+
+async fn delete_code_index_paths(conn: &Connection, paths: &[String]) -> Result<(), String> {
+    let mut normalized_paths = paths
+        .iter()
+        .map(|path| normalize_target(path))
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    normalized_paths.sort();
+    normalized_paths.dedup();
+
+    for path in normalized_paths {
+        conn.execute(
+            "
+            DELETE FROM code_symbols
+            WHERE project_id = ?1 AND path = ?2
+            ",
+            params![LOCAL_PROJECT_ID, path.clone()],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        conn.execute(
+            "
+            DELETE FROM code_references
+            WHERE project_id = ?1 AND path = ?2
+            ",
+            params![LOCAL_PROJECT_ID, path],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -4831,6 +7831,30 @@ async fn finish_sync_table_result(
     Ok(stats.into_result(table, after_count, before_count, after_count, true))
 }
 
+async fn finish_storage_table_result(
+    conn: &Connection,
+    class: &str,
+    table: &str,
+    before_count: usize,
+    stats: SyncApplyStats,
+) -> Result<SyncTableResult, String> {
+    let after_count = table_row_count(conn, table).await?;
+    let inserted_count = after_count.saturating_sub(before_count);
+    let updated_count = stats.affected_count.saturating_sub(inserted_count);
+    let conflict_count = stats.conflicts.iter().map(|conflict| conflict.count).sum();
+    Ok(SyncTableResult {
+        class: class.to_string(),
+        table: table.to_string(),
+        row_count: after_count,
+        inserted_count,
+        updated_count,
+        skipped_count: stats.skipped_count,
+        conflict_count,
+        executed: true,
+        conflicts: stats.conflicts,
+    })
+}
+
 async fn sync_run_tables(conn: &Connection, run_id: &str) -> Result<Vec<SyncTableResult>, String> {
     let mut rows = conn
         .query(
@@ -4914,6 +7938,21 @@ async fn memory_exists(conn: &Connection, memory_id: &str) -> Result<bool, Strin
         .map_err(|error| error.to_string())
 }
 
+async fn session_exists(conn: &Connection, session_id: &str) -> Result<bool, String> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM sessions WHERE id = ?1 LIMIT 1",
+            params![session_id.to_string()],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    rows.next()
+        .await
+        .map(|row| row.is_some())
+        .map_err(|error| error.to_string())
+}
+
 async fn copy_sync_table(
     local_conn: &Connection,
     remote_conn: &Connection,
@@ -4930,6 +7969,8 @@ async fn copy_sync_table(
         SyncTableKind::Edges => copy_edges(local_conn, remote_conn).await,
         SyncTableKind::CodeReferences => copy_code_references(local_conn, remote_conn).await,
         SyncTableKind::Sessions => copy_sessions(local_conn, remote_conn).await,
+        SyncTableKind::ContextPacks => copy_context_packs(local_conn, remote_conn).await,
+        SyncTableKind::Diagnostics => copy_diagnostics(local_conn, remote_conn).await,
     }
 }
 
@@ -4949,6 +7990,8 @@ async fn copy_pull_table(
         SyncTableKind::Edges => pull_edges(remote_conn, local_conn).await,
         SyncTableKind::CodeReferences => pull_code_references(remote_conn, local_conn).await,
         SyncTableKind::Sessions => pull_sessions(remote_conn, local_conn).await,
+        SyncTableKind::ContextPacks => pull_context_packs(remote_conn, local_conn).await,
+        SyncTableKind::Diagnostics => pull_diagnostics(remote_conn, local_conn).await,
     }
 }
 
@@ -5457,6 +8500,72 @@ async fn copy_sessions(
             .await
             .map_err(|error| error.to_string())?;
         stats.record_affected(affected)?;
+    }
+
+    finish_sync_table_result(remote_conn, table, before_count, stats).await
+}
+
+async fn copy_context_packs(
+    local_conn: &Connection,
+    remote_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::ContextPacks;
+    let before_count = table_row_count(remote_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+    let mut rows = local_conn
+        .query(
+            "
+            SELECT id, project_id, task, payload_json, created_at_ms, updated_at_ms
+            FROM context_packs
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        let affected = remote_conn
+            .execute(
+                "
+                INSERT INTO context_packs (
+                    id, project_id, task, payload_json, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(id) DO UPDATE SET
+                    project_id = excluded.project_id,
+                    task = excluded.task,
+                    payload_json = excluded.payload_json,
+                    updated_at_ms = excluded.updated_at_ms
+                ",
+                params![
+                    row.get::<String>(0).map_err(|error| error.to_string())?,
+                    row.get::<String>(1).map_err(|error| error.to_string())?,
+                    row.get::<String>(2).map_err(|error| error.to_string())?,
+                    row.get::<String>(3).map_err(|error| error.to_string())?,
+                    row.get::<i64>(4).map_err(|error| error.to_string())?,
+                    row.get::<i64>(5).map_err(|error| error.to_string())?,
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
+    }
+
+    finish_sync_table_result(remote_conn, table, before_count, stats).await
+}
+
+async fn copy_diagnostics(
+    local_conn: &Connection,
+    remote_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::Diagnostics;
+    let before_count = table_row_count(remote_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+    let records = local_diagnostic_sync_records(local_conn).await?;
+
+    for record in records {
+        insert_diagnostic_records(remote_conn, std::slice::from_ref(&record)).await?;
+        stats.record_affected(1)?;
     }
 
     finish_sync_table_result(remote_conn, table, before_count, stats).await
@@ -5995,6 +9104,69 @@ async fn pull_sessions(
     finish_sync_table_result(local_conn, table, before_count, stats).await
 }
 
+async fn pull_context_packs(
+    remote_conn: &Connection,
+    local_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::ContextPacks;
+    let before_count = table_row_count(local_conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+    let mut rows = remote_conn
+        .query(
+            "
+            SELECT id, project_id, task, payload_json, created_at_ms, updated_at_ms
+            FROM context_packs
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        let affected = local_conn
+            .execute(
+                "
+                INSERT INTO context_packs (
+                    id, project_id, task, payload_json, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(id) DO UPDATE SET
+                    project_id = excluded.project_id,
+                    task = excluded.task,
+                    payload_json = excluded.payload_json,
+                    updated_at_ms = excluded.updated_at_ms
+                WHERE excluded.updated_at_ms > context_packs.updated_at_ms
+                ",
+                params![
+                    row.get::<String>(0).map_err(|error| error.to_string())?,
+                    row.get::<String>(1).map_err(|error| error.to_string())?,
+                    row.get::<String>(2).map_err(|error| error.to_string())?,
+                    row.get::<String>(3).map_err(|error| error.to_string())?,
+                    row.get::<i64>(4).map_err(|error| error.to_string())?,
+                    row.get::<i64>(5).map_err(|error| error.to_string())?,
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_newer_or_equal");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_sync_table_result(local_conn, table, before_count, stats).await
+}
+
+async fn pull_diagnostics(
+    remote_conn: &Connection,
+    local_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let records = diagnostic_sync_records(remote_conn).await?;
+    let values = records;
+    apply_api_pull_diagnostic_records(local_conn, &values).await
+}
+
 impl StorageMode {
     fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -6223,6 +9395,7 @@ impl SyncClass {
             "edges" => Ok(Self::Edges),
             "embeddings" => Ok(Self::Embeddings),
             "context_packs" => Ok(Self::ContextPacks),
+            "diagnostics" => Ok(Self::Diagnostics),
             "session_summaries" => Ok(Self::SessionSummaries),
             "full_source" => Ok(Self::FullSource),
             "raw_command_output" => Ok(Self::RawCommandOutput),
@@ -6240,6 +9413,7 @@ impl SyncClass {
             Self::Edges => "edges",
             Self::Embeddings => "embeddings",
             Self::ContextPacks => "context_packs",
+            Self::Diagnostics => "diagnostics",
             Self::SessionSummaries => "session_summaries",
             Self::FullSource => "full_source",
             Self::RawCommandOutput => "raw_command_output",
@@ -6264,6 +9438,7 @@ fn default_sync_classes() -> Vec<SyncClass> {
         SyncClass::Edges,
         SyncClass::Embeddings,
         SyncClass::ContextPacks,
+        SyncClass::Diagnostics,
         SyncClass::SessionSummaries,
     ]
 }
@@ -6345,6 +9520,37 @@ async fn upsert_project(conn: &Connection, project: ProjectInput) -> Result<(), 
     .map_err(|error| error.to_string())?;
 
     Ok(())
+}
+
+async fn insert_context_pack(
+    conn: &Connection,
+    task: &str,
+    payload_json: &str,
+) -> Result<String, String> {
+    let now = now_ms()?;
+    let id = format!("ctx_{now}");
+    conn.execute(
+        "
+        INSERT INTO context_packs (
+            id, project_id, task, payload_json, created_at_ms, updated_at_ms
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+        ON CONFLICT(id) DO UPDATE SET
+            task = excluded.task,
+            payload_json = excluded.payload_json,
+            updated_at_ms = excluded.updated_at_ms
+        ",
+        params![
+            id.clone(),
+            LOCAL_PROJECT_ID,
+            task.trim().to_string(),
+            payload_json.to_string(),
+            now
+        ],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(id)
 }
 
 async fn project_from_conn(conn: &Connection) -> Result<Option<Project>, String> {
@@ -7083,13 +10289,19 @@ fn now_ms() -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HUGR_API_CONTRACT_VERSION, HUGR_API_ROUTES, LOCAL_PROJECT_ID, Memory, MemorySource,
-        MemoryWriteOptions, StorageConfig, StorageMode, Store, SyncApiTablePayload, SyncBackend,
-        SyncClass, SyncConflictSummary, SyncTableKind, SyncTableResult, apply_api_pull_payloads,
-        fts_query, hugr_api_memory_apply_request, hugr_api_remember_payloads, hugr_api_route_url,
-        hugr_api_sync_request, parse_hugr_api_history_response,
-        parse_hugr_api_memory_apply_response, parse_hugr_api_memory_records_response,
-        parse_hugr_api_sync_response, planned_sync_table_result, query_terms, recall_score,
+        DiagnosticInput, HUGR_API_CONTRACT_VERSION, HUGR_API_ROUTES, LOCAL_PROJECT_ID, Memory,
+        MemorySource, MemorySyncRecord, MemoryWriteOptions, Project, Session,
+        SessionEventSyncRecord, SessionPromotionSyncRecord, StorageConfig, StorageMode, Store,
+        SyncApiTablePayload, SyncBackend, SyncClass, SyncConflictSummary, SyncTableKind,
+        SyncTableResult, apply_api_pull_payloads, fts_query, hugr_api_memory_apply_request,
+        hugr_api_remember_payloads, hugr_api_route_url, hugr_api_session_promotion_payloads,
+        hugr_api_storage_apply_request, hugr_api_sync_request, memory_record_promotes_session,
+        parse_hugr_api_history_response, parse_hugr_api_memory_apply_response,
+        parse_hugr_api_memory_records_response, parse_hugr_api_storage_apply_response,
+        parse_hugr_api_storage_snapshot_response, parse_hugr_api_sync_response,
+        planned_storage_table_result, planned_sync_table_result,
+        promoted_memory_for_session_records, query_terms, recall_score,
+        session_promotion_facts_from_records, sync_api_table_payload_value,
         sync_table_result_value, table_row_count,
     };
     use crate::code::{CodeReference, CodeSymbol};
@@ -7171,6 +10383,7 @@ mod tests {
                 SyncClass::Edges,
                 SyncClass::Embeddings,
                 SyncClass::ContextPacks,
+                SyncClass::Diagnostics,
                 SyncClass::SessionSummaries
             ]
         );
@@ -7195,7 +10408,7 @@ mod tests {
         assert!(config.auth_token_configured);
         assert_eq!(
             config.summary(),
-            "hybrid (local active, guarded remote sync enabled, backend: direct_libsql, auth configured, sync classes: memories,sources,entities,edges,embeddings,context_packs,session_summaries)"
+            "hybrid (local active, guarded remote sync enabled, backend: direct_libsql, auth configured, sync classes: memories,sources,entities,edges,embeddings,context_packs,diagnostics,session_summaries)"
         );
 
         let plan = config.sync_execution_plan();
@@ -7227,7 +10440,7 @@ mod tests {
         let plan = config.sync_execution_plan();
         assert_eq!(
             config.summary(),
-            "remote (backend: direct_libsql, auth configured, sync classes: memories,sources,entities,edges,embeddings,context_packs,session_summaries)"
+            "remote (backend: direct_libsql, auth configured, sync classes: memories,sources,entities,edges,embeddings,context_packs,diagnostics,session_summaries)"
         );
         assert_eq!(plan.status, "remote_storage_ready");
         assert!(!plan.local_writes_enabled);
@@ -7301,7 +10514,7 @@ mod tests {
         assert_eq!(config.sync_execution_plan().backend, "hugr_api");
         assert_eq!(
             config.summary(),
-            "hybrid (local active, Hugr API sync transport configured, backend: hugr_api, auth configured, sync classes: memories,sources,entities,edges,embeddings,context_packs,session_summaries)"
+            "hybrid (local active, Hugr API sync transport configured, backend: hugr_api, auth configured, sync classes: memories,sources,entities,edges,embeddings,context_packs,diagnostics,session_summaries)"
         );
         assert_eq!(
             config.sync_execution_plan().status,
@@ -7529,6 +10742,208 @@ mod tests {
         let parsed = parse_hugr_api_memory_apply_response(&apply_response).unwrap();
         assert_eq!(parsed.status, "accepted");
         assert_eq!(parsed.tables[0].table, "memories");
+    }
+
+    #[test]
+    fn builds_and_parses_hugr_api_storage_route_payloads() {
+        let payload = SyncApiTablePayload {
+            result: planned_sync_table_result(SyncTableKind::CodeSymbols, 1),
+            records: vec![serde_json::json!({
+                "project_id": LOCAL_PROJECT_ID,
+                "path": "src/lib.rs",
+                "name": "ApiThing",
+                "kind": "struct",
+                "language": "rust",
+                "line_start": 1,
+                "line_end": null,
+                "signature": "pub struct ApiThing",
+                "indexed_at_ms": 2
+            })],
+        };
+        let session_event = serde_json::json!({
+            "id": "evt_1_0",
+            "session_id": "ses_1",
+            "kind": "note",
+            "detail": "indexed src/lib.rs",
+            "created_at_ms": 3
+        });
+        let session_promotion = serde_json::json!({
+            "session_id": "ses_1",
+            "memory_id": "mem_1",
+            "promoted_at_ms": 4
+        });
+        let request = hugr_api_storage_apply_request(
+            std::slice::from_ref(&payload),
+            std::slice::from_ref(&session_event),
+            std::slice::from_ref(&session_promotion),
+            &["src/lib.rs".to_string()],
+        );
+
+        assert_eq!(
+            request["contract_version"],
+            serde_json::json!(HUGR_API_CONTRACT_VERSION)
+        );
+        assert_eq!(
+            request["tables"][0]["table"],
+            serde_json::json!("code_symbols")
+        );
+        assert_eq!(
+            request["replace_code_index_paths"],
+            serde_json::json!(["src/lib.rs"])
+        );
+        assert_eq!(
+            request["session_events"][0]["id"],
+            serde_json::json!("evt_1_0")
+        );
+        assert_eq!(
+            request["session_promotions"][0]["memory_id"],
+            serde_json::json!("mem_1")
+        );
+
+        let snapshot_response = serde_json::json!({
+            "status": "ok",
+            "contract_version": HUGR_API_CONTRACT_VERSION,
+            "tables": [sync_api_table_payload_value(&payload)],
+            "session_events": [session_event],
+            "session_promotions": [session_promotion]
+        })
+        .to_string();
+        let snapshot = parse_hugr_api_storage_snapshot_response(&snapshot_response).unwrap();
+        assert_eq!(snapshot.payloads.len(), 1);
+        assert_eq!(snapshot.payloads[0].result.table, "code_symbols");
+        assert_eq!(snapshot.session_events[0].detail, "indexed src/lib.rs");
+        assert_eq!(snapshot.session_promotions[0].memory_id, "mem_1");
+
+        let apply_response = serde_json::json!({
+            "status": "accepted",
+            "contract_version": HUGR_API_CONTRACT_VERSION,
+            "tables": [sync_table_result_value(&payload.result)],
+            "session_events_table": sync_table_result_value(&planned_storage_table_result(
+                "session_summaries",
+                "session_events",
+                1,
+                true
+            )),
+            "session_promotions_table": sync_table_result_value(&planned_storage_table_result(
+                "session_summaries",
+                "session_promotions",
+                1,
+                true
+            ))
+        })
+        .to_string();
+        let parsed = parse_hugr_api_storage_apply_response(&apply_response).unwrap();
+        assert_eq!(parsed.status, "accepted");
+        assert_eq!(parsed.tables[0].table, "code_symbols");
+        assert_eq!(parsed.session_events_table.table, "session_events");
+        assert_eq!(parsed.session_promotions_table.table, "session_promotions");
+    }
+
+    #[test]
+    fn hosted_session_promotion_payloads_preserve_provenance() {
+        let session = Session {
+            id: "ses_1".to_string(),
+            task: "live remote session".to_string(),
+            branch: Some("main".to_string()),
+            started_at_ms: 10,
+            ended_at_ms: Some(30),
+            final_summary: Some("LiveRemoteThing session complete".to_string()),
+        };
+        let events = vec![SessionEventSyncRecord {
+            id: "evt_1_0".to_string(),
+            session_id: "ses_1".to_string(),
+            kind: "note".to_string(),
+            detail: "LiveRemoteThing was indexed remotely".to_string(),
+            created_at_ms: 20,
+        }];
+        let facts = session_promotion_facts_from_records(&session, &events);
+        let project = Project {
+            id: LOCAL_PROJECT_ID.to_string(),
+            name: "hugr_api_live_client".to_string(),
+            root_path: "/tmp/hugr_api_live_client".to_string(),
+            git_remote: None,
+            default_branch: Some("main".to_string()),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        let (memory, payloads, promotion) = hugr_api_session_promotion_payloads(
+            &SelectedEmbeddingProvider::default(),
+            &session,
+            &facts,
+            Some(&project),
+        )
+        .unwrap();
+
+        assert_eq!(facts.len(), 2);
+        assert_eq!(promotion.session_id, "ses_1");
+        assert_eq!(promotion.memory_id, memory.id);
+        assert!(memory.text.contains("live remote session"));
+        assert!(memory.text.contains("LiveRemoteThing session complete"));
+        assert!(
+            payloads
+                .iter()
+                .any(|payload| payload.result.table == "projects")
+        );
+        assert!(
+            payloads
+                .iter()
+                .any(|payload| payload.result.table == "memories")
+        );
+        assert!(
+            payloads
+                .iter()
+                .any(|payload| payload.result.table == "memory_embeddings")
+        );
+
+        let payload = serde_json::from_str::<serde_json::Value>(
+            memory.structured_payload.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["source"]["type"], "session_promotion");
+        assert_eq!(payload["source"]["session_id"], "ses_1");
+        assert_eq!(payload["project"]["id"], LOCAL_PROJECT_ID);
+        assert_eq!(payload["facts"][0]["kind"], "note");
+        assert_eq!(payload["facts"][1]["kind"], "summary");
+
+        let memory_record = MemorySyncRecord {
+            id: memory.id.clone(),
+            created_at_ms: memory.created_at_ms,
+            kind: memory.kind.clone(),
+            text: memory.text.clone(),
+            confidence: 1.0,
+            valid_from: None,
+            valid_to: None,
+            superseded_by: None,
+            sensitivity: "normal".to_string(),
+            structured_payload: memory.structured_payload.clone(),
+        };
+        let stale_promotion = SessionPromotionSyncRecord {
+            session_id: "ses_1".to_string(),
+            memory_id: "missing".to_string(),
+            promoted_at_ms: 1,
+        };
+
+        assert!(memory_record_promotes_session(&memory_record, "ses_1"));
+        assert_eq!(
+            promoted_memory_for_session_records(
+                std::slice::from_ref(&memory_record),
+                std::slice::from_ref(&promotion),
+                "ses_1",
+            )
+            .unwrap()
+            .id,
+            memory.id
+        );
+        assert_eq!(
+            promoted_memory_for_session_records(
+                std::slice::from_ref(&memory_record),
+                std::slice::from_ref(&stale_promotion),
+                "ses_1",
+            )
+            .unwrap()
+            .id,
+            memory.id
+        );
     }
 
     #[test]
@@ -7858,6 +11273,14 @@ mod tests {
             .end_session(Some("api index sync complete"))
             .await
             .unwrap();
+        local
+            .store
+            .record_context_pack(
+                "sync api indexes",
+                r#"{"task":"sync api indexes","relevant_files":[]}"#,
+            )
+            .await
+            .unwrap();
         let local_conn = local.store.connect().await.unwrap();
         let tables = vec![
             planned_sync_table_result(SyncTableKind::Memories, 1),
@@ -7866,6 +11289,7 @@ mod tests {
             planned_sync_table_result(SyncTableKind::CodeSymbols, 1),
             planned_sync_table_result(SyncTableKind::CodeReferences, 1),
             planned_sync_table_result(SyncTableKind::Sessions, 1),
+            planned_sync_table_result(SyncTableKind::ContextPacks, 1),
         ];
 
         let payloads = local
@@ -7909,6 +11333,12 @@ mod tests {
             1
         );
         assert_eq!(table_row_count(&remote_conn, "sessions").await.unwrap(), 1);
+        assert_eq!(
+            table_row_count(&remote_conn, "context_packs")
+                .await
+                .unwrap(),
+            1
+        );
         assert_eq!(session.task, "sync api indexes");
     }
 
@@ -7966,6 +11396,14 @@ mod tests {
             .end_session(Some("pull api indexes complete"))
             .await
             .unwrap();
+        remote
+            .store
+            .record_context_pack(
+                "pull api indexes",
+                r#"{"task":"pull api indexes","relevant_files":[]}"#,
+            )
+            .await
+            .unwrap();
         local.store.init().await.unwrap();
         let local_conn = local.store.connect().await.unwrap();
         let request_payloads = vec![
@@ -7991,6 +11429,10 @@ mod tests {
             },
             SyncApiTablePayload {
                 result: planned_sync_table_result(SyncTableKind::Sessions, 0),
+                records: Vec::new(),
+            },
+            SyncApiTablePayload {
+                result: planned_sync_table_result(SyncTableKind::ContextPacks, 0),
                 records: Vec::new(),
             },
         ];
@@ -8029,6 +11471,10 @@ mod tests {
             1
         );
         assert_eq!(table_row_count(&local_conn, "sessions").await.unwrap(), 1);
+        assert_eq!(
+            table_row_count(&local_conn, "context_packs").await.unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -8316,6 +11762,8 @@ mod tests {
         assert!(object_exists(&conn, "table", "sessions").await);
         assert!(object_exists(&conn, "table", "session_events").await);
         assert!(object_exists(&conn, "table", "session_promotions").await);
+        assert!(object_exists(&conn, "table", "context_packs").await);
+        assert!(object_exists(&conn, "table", "diagnostics").await);
         assert!(object_exists(&conn, "table", "code_symbols").await);
         assert!(object_exists(&conn, "table", "code_references").await);
         assert!(object_exists(&conn, "table", "sync_runs").await);
@@ -8324,6 +11772,9 @@ mod tests {
         assert!(object_exists(&conn, "index", "code_symbols_project_name_idx").await);
         assert!(object_exists(&conn, "index", "code_references_target_name_idx").await);
         assert!(object_exists(&conn, "index", "sync_runs_started_idx").await);
+        assert!(object_exists(&conn, "index", "context_packs_project_updated_idx").await);
+        assert!(object_exists(&conn, "index", "diagnostics_project_created_idx").await);
+        assert!(object_exists(&conn, "index", "diagnostics_project_path_idx").await);
         assert!(object_exists(&conn, "index", "memory_embeddings_vector_idx").await);
 
         let mut rows = conn
@@ -8348,7 +11799,9 @@ mod tests {
                 (5, "code_symbols".to_string()),
                 (6, "code_references".to_string()),
                 (7, "sync_history".to_string()),
-                (8, "session_promotions".to_string())
+                (8, "session_promotions".to_string()),
+                (9, "context_packs".to_string()),
+                (10, "diagnostics".to_string())
             ]
         );
     }
@@ -8870,6 +12323,158 @@ mod tests {
         assert!(outbound.is_empty());
         assert_eq!(file_outbound.len(), 1);
         assert_eq!(file_outbound[0].target_name, "run_after_config");
+    }
+
+    #[tokio::test]
+    async fn context_graph_neighbors_include_references_and_entities() {
+        let test = TestStore::new("context_graph_neighbors");
+        let source = FileCandidate {
+            path: "src/main.rs".to_string(),
+            score: 0,
+            language: Some("rust".to_string()),
+            size_bytes: Some(80),
+        };
+        let target = FileCandidate {
+            path: "src/plugin_hooks.rs".to_string(),
+            score: 0,
+            language: Some("rust".to_string()),
+            size_bytes: Some(120),
+        };
+        let symbol = CodeSymbol {
+            path: target.path.clone(),
+            language: target.language.clone(),
+            name: "run_after_config".to_string(),
+            kind: "function".to_string(),
+            line_start: 3,
+            line_end: Some(10),
+            signature: "pub fn run_after_config()".to_string(),
+        };
+        let reference = CodeReference {
+            path: source.path.clone(),
+            language: source.language.clone(),
+            target_path: symbol.path.clone(),
+            target_name: symbol.name.clone(),
+            target_kind: symbol.kind.clone(),
+            kind: "call".to_string(),
+            line_start: 8,
+            excerpt: "run_after_config();".to_string(),
+        };
+
+        test.store
+            .record_code_index(
+                &[source.clone(), target],
+                std::slice::from_ref(&symbol),
+                &[reference],
+            )
+            .await
+            .unwrap();
+        let conn = test.store.connect().await.unwrap();
+        insert_source_for_sync(&conn, "src_1", "file", "src/plugin_hooks.rs", 10).await;
+        insert_entity_for_sync(
+            &conn,
+            "ent_plugin",
+            "function",
+            "run_after_config",
+            Some("src/plugin_hooks.rs"),
+            11,
+        )
+        .await;
+        insert_entity_for_sync(&conn, "ent_main", "file", "main", Some("src/main.rs"), 12).await;
+        insert_edge_for_sync(&conn, "edge_1", "ent_main", "ent_plugin", "references", 13).await;
+
+        let neighbors = test
+            .store
+            .context_graph_neighbors(
+                "plugin hooks run after config",
+                &[source.path],
+                std::slice::from_ref(&symbol),
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert!(neighbors.iter().any(|neighbor| {
+            neighbor.kind == "incoming_reference"
+                && neighbor
+                    .target_name
+                    .as_deref()
+                    .is_some_and(|name| name == "run_after_config")
+        }));
+        assert!(neighbors.iter().any(|neighbor| {
+            neighbor.kind == "entity" && neighbor.label.contains("run_after_config")
+        }));
+        assert!(neighbors.iter().any(|neighbor| {
+            neighbor.kind == "edge" && neighbor.label.contains("-references->")
+        }));
+        assert!(
+            neighbors.iter().any(
+                |neighbor| neighbor.kind == "source" && neighbor.label.contains("plugin_hooks")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn context_freshness_signals_report_missing_index() {
+        let test = TestStore::new("context_freshness_missing");
+        let source_dir = test.workspace.join("src");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source_path = source_dir.join("plugin_hooks.rs");
+        fs::write(&source_path, "pub fn run_after_config() {}\n").unwrap();
+        let source_path = source_path.to_string_lossy().to_string();
+
+        let signals = test
+            .store
+            .context_freshness_signals(std::slice::from_ref(&source_path), &[], 5)
+            .await
+            .unwrap();
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].path, source_path);
+        assert_eq!(signals[0].kind, "missing_index");
+        assert!(signals[0].modified_at_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn records_and_recalls_structured_diagnostics() {
+        let test = TestStore::new("diagnostics");
+        let written = test
+            .store
+            .record_diagnostics(&[DiagnosticInput {
+                source: "command_stderr".to_string(),
+                path: Some("src/plugin_hooks.rs".to_string()),
+                line_start: Some(12),
+                line_end: None,
+                severity: "error".to_string(),
+                code: Some("E0425".to_string()),
+                message: "cannot find value hook in this scope".to_string(),
+                command: Some("cargo test".to_string()),
+            }])
+            .await
+            .unwrap();
+
+        let recalled = test
+            .store
+            .recent_diagnostics(
+                "fix plugin hooks",
+                &["src/plugin_hooks.rs".to_string()],
+                &[],
+                5,
+            )
+            .await
+            .unwrap();
+        let unrelated = test
+            .store
+            .recent_diagnostics("database migrations", &[], &[], 5)
+            .await
+            .unwrap();
+
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].severity, "error");
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].path.as_deref(), Some("src/plugin_hooks.rs"));
+        assert_eq!(recalled[0].line_start, Some(12));
+        assert_eq!(recalled[0].code.as_deref(), Some("E0425"));
+        assert!(unrelated.is_empty());
     }
 
     #[tokio::test]
