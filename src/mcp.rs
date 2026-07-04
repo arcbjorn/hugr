@@ -112,6 +112,7 @@ async fn handle_tool_call(params: Value) -> Result<Value, String> {
         "hugr_symbols" => tool_symbols(&arguments).await,
         "hugr_impact" => tool_impact(&arguments).await,
         "hugr_replace_symbol" => tool_replace_symbol(&arguments).await,
+        "hugr_rename_symbol" => tool_rename_symbol(&arguments).await,
         "hugr_forget" => tool_forget(&arguments).await,
         unknown => Err(format!("unknown tool '{unknown}'")),
     }
@@ -336,6 +337,78 @@ async fn tool_replace_symbol(arguments: &Value) -> Result<Value, String> {
     Ok(tool_result(summary.render_markdown(), structured))
 }
 
+async fn tool_rename_symbol(arguments: &Value) -> Result<Value, String> {
+    let path = required_string(arguments, "path")?;
+    let name = required_string(arguments, "name")?;
+    let new_name = required_string(arguments, "new_name")?;
+    let kind = optional_string(arguments, "kind")?;
+
+    let store = Store::open_current();
+    if !store.supports_local_source_edits()? {
+        return Err(
+            "hugr_rename_symbol edits the local working tree and is not available in remote Hugr API mode"
+                .to_string(),
+        );
+    }
+
+    indexer::index_project(5000).await?;
+
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|error| format!("hugr_rename_symbol cannot read {path}: {error}"))?;
+    let target =
+        edit::resolve_symbol_in_source(&path, &contents, &name, kind.as_deref(), "rename")?;
+    let references = store
+        .references_to_symbols(std::slice::from_ref(&target), 2000)
+        .await?;
+    let mut paths = references
+        .iter()
+        .map(|reference| reference.path.clone())
+        .chain(std::iter::once(target.path.clone()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    let mut files = Vec::new();
+    for path in paths {
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|error| format!("hugr_rename_symbol cannot read {path}: {error}"))?;
+        files.push((path, contents));
+    }
+
+    let planned = edit::plan_rename(&target, &references, files, &new_name)?;
+    for file in &planned.files {
+        std::fs::write(&file.path, &file.contents)
+            .map_err(|error| format!("hugr_rename_symbol cannot write {}: {error}", file.path))?;
+    }
+
+    indexer::index_project(5000).await?;
+
+    let summary = &planned.summary;
+    let changed_paths = summary
+        .changed_files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let detail = format!(
+        "rename-symbol {} {} -> {} at {}:{}-{}; changed files: {}",
+        summary.kind,
+        summary.old_name,
+        summary.new_name,
+        summary.target_path,
+        summary.line_start,
+        summary.line_end,
+        changed_paths
+    );
+    store
+        .record_session_event_if_active("edit", &detail)
+        .await?;
+
+    let structured = serde_json::from_str(&summary.render_json()).unwrap_or_else(|_| json!({}));
+    Ok(tool_result(summary.render_markdown(), structured))
+}
+
 fn tools() -> Vec<Value> {
     vec![
         tool_schema(
@@ -394,6 +467,15 @@ fn tools() -> Vec<Value> {
             "Safely replace one top-level symbol's source in a local file. Refuses ambiguous targets, renames, kind changes, and bodies that fail to parse.",
             &[("path", "string"), ("name", "string"), ("body", "string")],
         ),
+        tool_schema(
+            "hugr_rename_symbol",
+            "Safely rename one local symbol and its indexed inbound references. Refuses ambiguous targets, stale reference lines, invalid identifiers, and files that fail to parse after the refactor.",
+            &[
+                ("path", "string"),
+                ("name", "string"),
+                ("new_name", "string"),
+            ],
+        ),
     ]
 }
 
@@ -444,7 +526,7 @@ fn tool_schema(name: &str, description: &str, properties: &[(&str, &str)]) -> Va
         );
     }
 
-    if name == "hugr_replace_symbol" {
+    if name == "hugr_replace_symbol" || name == "hugr_rename_symbol" {
         props.insert(
             "kind".to_string(),
             json!({
@@ -729,6 +811,7 @@ mod tests {
         assert!(names.contains(&"hugr_forget"));
         assert!(names.contains(&"hugr_symbols"));
         assert!(names.contains(&"hugr_replace_symbol"));
+        assert!(names.contains(&"hugr_rename_symbol"));
     }
 
     #[test]
