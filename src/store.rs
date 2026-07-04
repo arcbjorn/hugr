@@ -1,6 +1,6 @@
 use crate::code::{CodeReference, CodeSymbol};
 use crate::discovery::FileCandidate;
-use crate::embedding::{EmbeddingProvider, SelectedEmbeddingProvider};
+use crate::embedding::{Embedding, EmbeddingProvider, SelectedEmbeddingProvider};
 use crate::migrations;
 use crate::testmap::{self, TestCandidate};
 use libsql::{Builder, Connection, Row, params};
@@ -339,6 +339,11 @@ impl Store {
         text: &str,
         options: MemoryWriteOptions,
     ) -> Result<Memory, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return self.remember_via_hugr_api(&storage_config, text, options);
+        }
+
         self.init().await?;
         let conn = self.connect().await?;
         let options = normalize_memory_write_options(options)?;
@@ -359,6 +364,11 @@ impl Store {
     }
 
     pub async fn memories(&self) -> Result<Vec<Memory>, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return hugr_api_active_memories(&storage_config);
+        }
+
         if !self.exists() {
             return Ok(Vec::new());
         }
@@ -376,6 +386,11 @@ impl Store {
         let terms = query_terms(query);
         if terms.is_empty() {
             return Err("hugr forget requires at least one searchable term".to_string());
+        }
+
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return forget_via_hugr_api(&storage_config, query, &terms, limit);
         }
 
         self.init().await?;
@@ -426,6 +441,11 @@ impl Store {
     }
 
     pub async fn memory_maintenance_report(&self) -> Result<MemoryMaintenanceReport, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return memory_maintenance_report_via_hugr_api(&storage_config);
+        }
+
         if !self.exists() {
             return Ok(MemoryMaintenanceReport {
                 active_count: 0,
@@ -479,6 +499,11 @@ impl Store {
     pub async fn consolidate_duplicate_memories(
         &self,
     ) -> Result<MemoryConsolidationResult, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return consolidate_duplicate_memories_via_hugr_api(&storage_config);
+        }
+
         self.init().await?;
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
@@ -517,6 +542,11 @@ impl Store {
     }
 
     pub async fn retire_stale_memories(&self) -> Result<StaleRetirementResult, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return retire_stale_memories_via_hugr_api(&storage_config);
+        }
+
         self.init().await?;
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
@@ -1251,6 +1281,11 @@ impl Store {
             return Ok(Vec::new());
         }
 
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return recall_via_hugr_api(&storage_config, query, &terms, limit);
+        }
+
         if !self.exists() {
             return Ok(Vec::new());
         }
@@ -1273,6 +1308,19 @@ impl Store {
         });
         matches.truncate(limit);
         Ok(matches.into_iter().map(|matched| matched.memory).collect())
+    }
+
+    fn remember_via_hugr_api(
+        &self,
+        config: &StorageConfig,
+        text: &str,
+        options: MemoryWriteOptions,
+    ) -> Result<Memory, String> {
+        let (memory, payloads) =
+            hugr_api_remember_payloads(self.embedding_provider()?, text, options)?;
+        let result = execute_hugr_api_push(config, false, &payloads)?;
+        ensure_hugr_api_memory_operation_accepted("remember", &result.status, &result.tables)?;
+        Ok(memory)
     }
 
     async fn fts_recall(
