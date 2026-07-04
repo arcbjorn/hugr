@@ -328,7 +328,9 @@ async fn tool_replace_symbol(arguments: &Value) -> Result<Value, String> {
         summary.new_line_start,
         summary.new_line_end
     );
-    store.record_session_event_if_active("edit", &detail).await?;
+    store
+        .record_session_event_if_active("edit", &detail)
+        .await?;
 
     let structured = serde_json::from_str(&summary.render_json()).unwrap_or_else(|_| json!({}));
     Ok(tool_result(summary.render_markdown(), structured))
