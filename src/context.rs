@@ -1,8 +1,11 @@
 use crate::code::CodeSymbol;
 use crate::discovery::FileCandidate;
-use crate::store::{Memory, SessionFact, StaleMemoryCandidate};
+use crate::store::{
+    Diagnostic, FreshnessSignal, GraphNeighbor, Memory, SessionFact, StaleMemoryCandidate,
+};
 use crate::testmap::TestCandidate;
 use crate::worktree::WorktreeState;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 4000;
@@ -13,9 +16,12 @@ pub struct ContextPack {
     pub budget: ContextBudget,
     pub relevant_files: Vec<ContextFile>,
     pub important_symbols: Vec<ContextSymbol>,
+    pub graph_neighbors: Vec<ContextGraphNeighbor>,
     pub affected_tests: Vec<ContextTest>,
     pub relevant_memories: Vec<ContextMemory>,
     pub stale_memory_risks: Vec<ContextStaleMemoryRisk>,
+    pub diagnostics: Vec<ContextDiagnostic>,
+    pub risk_signals: Vec<ContextRiskSignal>,
     pub recent_sessions: Vec<ContextSessionFact>,
     pub branch_state: Option<ContextBranchState>,
     pub suggested_path: Vec<String>,
@@ -58,6 +64,20 @@ pub struct ContextSymbol {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextGraphNeighbor {
+    pub kind: String,
+    pub label: String,
+    pub detail: String,
+    pub path: Option<String>,
+    pub target_path: Option<String>,
+    pub target_name: Option<String>,
+    pub line_start: Option<i64>,
+    pub citation_id: String,
+    pub evidence_score: usize,
+    pub evidence_reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextTest {
     pub path: String,
     pub reason: String,
@@ -85,6 +105,33 @@ pub struct ContextStaleMemoryRisk {
     pub shared_terms: Vec<String>,
     pub newer_memory: ContextMemory,
     pub older_memory: ContextMemory,
+    pub citation_id: String,
+    pub evidence_score: usize,
+    pub evidence_reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextDiagnostic {
+    pub id: String,
+    pub source: String,
+    pub path: Option<String>,
+    pub line_start: Option<i64>,
+    pub line_end: Option<i64>,
+    pub severity: String,
+    pub code: Option<String>,
+    pub message: String,
+    pub command: Option<String>,
+    pub created_at_ms: i64,
+    pub citation_id: String,
+    pub evidence_score: usize,
+    pub evidence_reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextRiskSignal {
+    pub severity: String,
+    pub kind: String,
+    pub summary: String,
     pub citation_id: String,
     pub evidence_score: usize,
     pub evidence_reason: String,
@@ -204,6 +251,7 @@ impl ContextPack {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_file_candidates_sessions_symbols_tests_branch_and_stale_risks(
         task: &str,
         file_candidates: Vec<FileCandidate>,
@@ -213,6 +261,34 @@ impl ContextPack {
         tests: Vec<TestCandidate>,
         branch_state: Option<WorktreeState>,
         stale_candidates: Vec<StaleMemoryCandidate>,
+    ) -> Self {
+        Self::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
+            task,
+            file_candidates,
+            memories,
+            sessions,
+            symbols,
+            tests,
+            branch_state,
+            stale_candidates,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
+        task: &str,
+        file_candidates: Vec<FileCandidate>,
+        memories: Vec<Memory>,
+        sessions: Vec<SessionFact>,
+        symbols: Vec<CodeSymbol>,
+        tests: Vec<TestCandidate>,
+        branch_state: Option<WorktreeState>,
+        stale_candidates: Vec<StaleMemoryCandidate>,
+        graph_neighbors: Vec<GraphNeighbor>,
+        freshness_signals: Vec<FreshnessSignal>,
+        diagnostics: Vec<Diagnostic>,
     ) -> Self {
         let terms = context_query_terms(task);
         let relevant_files = file_candidates
@@ -243,6 +319,24 @@ impl ContextPack {
                     line_start: symbol.line_start,
                     line_end: symbol.line_end,
                     signature: symbol.signature,
+                    evidence_score,
+                    evidence_reason,
+                }
+            })
+            .collect::<Vec<_>>();
+        let graph_neighbors = graph_neighbors
+            .into_iter()
+            .map(|neighbor| {
+                let (evidence_score, evidence_reason) = graph_evidence(&neighbor, &terms);
+                ContextGraphNeighbor {
+                    citation_id: graph_neighbor_citation_id(&neighbor),
+                    kind: neighbor.kind,
+                    label: neighbor.label,
+                    detail: neighbor.detail,
+                    path: neighbor.path,
+                    target_path: neighbor.target_path,
+                    target_name: neighbor.target_name,
+                    line_start: neighbor.line_start,
                     evidence_score,
                     evidence_reason,
                 }
@@ -310,6 +404,27 @@ impl ContextPack {
                 }
             })
             .collect::<Vec<_>>();
+        let diagnostics = diagnostics
+            .into_iter()
+            .map(|diagnostic| {
+                let (evidence_score, evidence_reason) = diagnostic_evidence(&diagnostic, &terms);
+                ContextDiagnostic {
+                    citation_id: format!("diagnostic:{}", diagnostic.id),
+                    id: diagnostic.id,
+                    source: diagnostic.source,
+                    path: diagnostic.path,
+                    line_start: diagnostic.line_start,
+                    line_end: diagnostic.line_end,
+                    severity: diagnostic.severity,
+                    code: diagnostic.code,
+                    message: diagnostic.message,
+                    command: diagnostic.command,
+                    created_at_ms: diagnostic.created_at_ms,
+                    evidence_score,
+                    evidence_reason,
+                }
+            })
+            .collect::<Vec<_>>();
         let branch_state = branch_state
             .filter(|state| state.inside_worktree)
             .map(|state| ContextBranchState {
@@ -329,6 +444,17 @@ impl ContextPack {
                     })
                     .collect(),
             });
+        let risk_signals = build_risk_signals(
+            &relevant_files,
+            &important_symbols,
+            &graph_neighbors,
+            &affected_tests,
+            &stale_memory_risks,
+            &diagnostics,
+            &freshness_signals,
+            &recent_sessions,
+            branch_state.as_ref(),
+        );
         let mut pack = Self {
             task: task.to_string(),
             budget: ContextBudget {
@@ -338,9 +464,12 @@ impl ContextPack {
             },
             relevant_files,
             important_symbols,
+            graph_neighbors,
             affected_tests,
             relevant_memories,
             stale_memory_risks,
+            diagnostics,
+            risk_signals,
             recent_sessions,
             branch_state,
             suggested_path: vec![
@@ -417,6 +546,27 @@ impl ContextPack {
         }
         rendered.push('\n');
 
+        rendered.push_str("## Graph Neighborhood\n");
+        if self.graph_neighbors.is_empty() {
+            rendered.push_str("No graph neighbors found yet.\n");
+        } else {
+            for neighbor in &self.graph_neighbors {
+                let _ = writeln!(
+                    rendered,
+                    "- {}: {} [{}] (score {}: {})",
+                    neighbor.kind,
+                    neighbor.label,
+                    neighbor.citation_id,
+                    neighbor.evidence_score,
+                    neighbor.evidence_reason
+                );
+                if !neighbor.detail.is_empty() {
+                    let _ = writeln!(rendered, "  - {}", neighbor.detail);
+                }
+            }
+        }
+        rendered.push('\n');
+
         rendered.push_str("## Affected Tests\n");
         if self.affected_tests.is_empty() {
             rendered.push_str("No likely tests mapped yet.\n");
@@ -478,6 +628,47 @@ impl ContextPack {
                     rendered,
                     "  - newer [{}]: {}",
                     risk.newer_memory.kind, risk.newer_memory.text
+                );
+            }
+        }
+        rendered.push('\n');
+
+        rendered.push_str("## Diagnostics\n");
+        if self.diagnostics.is_empty() {
+            rendered.push_str("No structured diagnostics matched this task.\n");
+        } else {
+            for diagnostic in &self.diagnostics {
+                let location = diagnostic_location(diagnostic);
+                let code = diagnostic.code.as_deref().unwrap_or("none");
+                let _ = writeln!(
+                    rendered,
+                    "- {} {} at {} [{}]: {} (score {}: {})",
+                    diagnostic.severity,
+                    code,
+                    location,
+                    diagnostic.citation_id,
+                    diagnostic.message,
+                    diagnostic.evidence_score,
+                    diagnostic.evidence_reason
+                );
+            }
+        }
+        rendered.push('\n');
+
+        rendered.push_str("## Risk Signals\n");
+        if self.risk_signals.is_empty() {
+            rendered.push_str("No deterministic risk signals detected.\n");
+        } else {
+            for risk in &self.risk_signals {
+                let _ = writeln!(
+                    rendered,
+                    "- {} {}: {} [{}] (score {}: {})",
+                    risk.severity,
+                    risk.kind,
+                    risk.summary,
+                    risk.citation_id,
+                    risk.evidence_score,
+                    risk.evidence_reason
                 );
             }
         }
@@ -612,6 +803,28 @@ impl ContextPack {
         }
         rendered.push_str("],");
 
+        rendered.push_str("\"graph_neighbors\":[");
+        for (index, neighbor) in self.graph_neighbors.iter().enumerate() {
+            if index > 0 {
+                rendered.push(',');
+            }
+            let _ = write!(
+                rendered,
+                "{{\"kind\":{},\"label\":{},\"detail\":{},\"path\":{},\"target_path\":{},\"target_name\":{},\"line_start\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
+                json_string(&neighbor.kind),
+                json_string(&neighbor.label),
+                json_string(&neighbor.detail),
+                json_option_string(neighbor.path.as_deref()),
+                json_option_string(neighbor.target_path.as_deref()),
+                json_option_string(neighbor.target_name.as_deref()),
+                json_optional_i64(neighbor.line_start),
+                json_string(&neighbor.citation_id),
+                neighbor.evidence_score,
+                json_string(&neighbor.evidence_reason)
+            );
+        }
+        rendered.push_str("],");
+
         rendered.push_str("\"affected_tests\":[");
         for (index, test) in self.affected_tests.iter().enumerate() {
             if index > 0 {
@@ -657,6 +870,49 @@ impl ContextPack {
                 shared_terms,
                 render_context_memory_json(&risk.newer_memory),
                 render_context_memory_json(&risk.older_memory),
+                json_string(&risk.citation_id),
+                risk.evidence_score,
+                json_string(&risk.evidence_reason)
+            );
+        }
+        rendered.push_str("],");
+
+        rendered.push_str("\"diagnostics\":[");
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            if index > 0 {
+                rendered.push(',');
+            }
+            let _ = write!(
+                rendered,
+                "{{\"id\":{},\"source\":{},\"path\":{},\"line_start\":{},\"line_end\":{},\"severity\":{},\"code\":{},\"message\":{},\"command\":{},\"created_at_ms\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
+                json_string(&diagnostic.id),
+                json_string(&diagnostic.source),
+                json_option_string(diagnostic.path.as_deref()),
+                json_optional_i64(diagnostic.line_start),
+                json_optional_i64(diagnostic.line_end),
+                json_string(&diagnostic.severity),
+                json_option_string(diagnostic.code.as_deref()),
+                json_string(&diagnostic.message),
+                json_option_string(diagnostic.command.as_deref()),
+                diagnostic.created_at_ms,
+                json_string(&diagnostic.citation_id),
+                diagnostic.evidence_score,
+                json_string(&diagnostic.evidence_reason)
+            );
+        }
+        rendered.push_str("],");
+
+        rendered.push_str("\"risk_signals\":[");
+        for (index, risk) in self.risk_signals.iter().enumerate() {
+            if index > 0 {
+                rendered.push(',');
+            }
+            let _ = write!(
+                rendered,
+                "{{\"severity\":{},\"kind\":{},\"summary\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
+                json_string(&risk.severity),
+                json_string(&risk.kind),
+                json_string(&risk.summary),
                 json_string(&risk.citation_id),
                 risk.evidence_score,
                 json_string(&risk.evidence_reason)
@@ -774,6 +1030,13 @@ impl ContextPack {
                 .then_with(|| left.line_start.cmp(&right.line_start))
                 .then_with(|| left.name.cmp(&right.name))
         });
+        self.graph_neighbors.sort_by(|left, right| {
+            right
+                .evidence_score
+                .cmp(&left.evidence_score)
+                .then_with(|| left.kind.cmp(&right.kind))
+                .then_with(|| left.label.cmp(&right.label))
+        });
         self.affected_tests.sort_by(|left, right| {
             right
                 .evidence_score
@@ -794,6 +1057,20 @@ impl ContextPack {
                 .then_with(|| left.signal.cmp(&right.signal))
                 .then_with(|| left.older_memory.id.cmp(&right.older_memory.id))
                 .then_with(|| left.newer_memory.id.cmp(&right.newer_memory.id))
+        });
+        self.diagnostics.sort_by(|left, right| {
+            right
+                .evidence_score
+                .cmp(&left.evidence_score)
+                .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        self.risk_signals.sort_by(|left, right| {
+            right
+                .evidence_score
+                .cmp(&left.evidence_score)
+                .then_with(|| left.severity.cmp(&right.severity))
+                .then_with(|| left.kind.cmp(&right.kind))
         });
         self.recent_sessions.sort_by(|left, right| {
             right
@@ -820,6 +1097,24 @@ fn context_memory_from(
         evidence_score,
         evidence_reason,
     }
+}
+
+fn graph_neighbor_citation_id(neighbor: &GraphNeighbor) -> String {
+    let anchor = neighbor
+        .path
+        .as_deref()
+        .or(neighbor.target_path.as_deref())
+        .unwrap_or(neighbor.label.as_str());
+    let line = neighbor
+        .line_start
+        .map(|line| format!(":{line}"))
+        .unwrap_or_default();
+    let target = neighbor
+        .target_name
+        .as_deref()
+        .unwrap_or(neighbor.kind.as_str());
+
+    format!("graph:{}:{}{}:{}", neighbor.kind, anchor, line, target)
 }
 
 fn render_context_memory_json(memory: &ContextMemory) -> String {
@@ -912,6 +1207,376 @@ fn session_evidence(
     (score, format!("session fact recall rank {}", index + 1))
 }
 
+fn graph_evidence(neighbor: &GraphNeighbor, terms: &[String]) -> (usize, String) {
+    let searchable = format!(
+        "{} {} {} {} {} {}",
+        neighbor.kind,
+        neighbor.label,
+        neighbor.detail,
+        neighbor.path.as_deref().unwrap_or(""),
+        neighbor.target_path.as_deref().unwrap_or(""),
+        neighbor.target_name.as_deref().unwrap_or("")
+    );
+    let base = match neighbor.kind.as_str() {
+        "incoming_reference" => 650,
+        "outgoing_reference" => 630,
+        "path_reference" => 590,
+        "entity" => 520,
+        "edge" => 500,
+        "source" => 480,
+        _ => 450,
+    };
+    let match_score = text_match_score(&searchable, terms);
+    let reason = if match_score > 0 {
+        format!("{} matched task terms", neighbor.kind)
+    } else {
+        format!("{} connected through selected context", neighbor.kind)
+    };
+
+    (base + match_score, reason)
+}
+
+fn diagnostic_evidence(diagnostic: &Diagnostic, terms: &[String]) -> (usize, String) {
+    let searchable = format!(
+        "{} {} {} {} {}",
+        diagnostic.source,
+        diagnostic.severity,
+        diagnostic.code.as_deref().unwrap_or(""),
+        diagnostic.path.as_deref().unwrap_or(""),
+        diagnostic.message
+    );
+    let severity_bonus = match diagnostic.severity.as_str() {
+        "error" => 120,
+        "warning" => 60,
+        _ => 20,
+    };
+    let location_bonus = diagnostic.path.as_ref().map(|_| 40).unwrap_or(0);
+    let score = 760 + severity_bonus + location_bonus + text_match_score(&searchable, terms);
+    let reason = if diagnostic.path.is_some() {
+        "structured diagnostic with source location".to_string()
+    } else {
+        "structured diagnostic matched task evidence".to_string()
+    };
+    (score, reason)
+}
+
+fn build_risk_signals(
+    files: &[ContextFile],
+    symbols: &[ContextSymbol],
+    graph_neighbors: &[ContextGraphNeighbor],
+    tests: &[ContextTest],
+    stale_memory_risks: &[ContextStaleMemoryRisk],
+    diagnostics: &[ContextDiagnostic],
+    freshness_signals: &[FreshnessSignal],
+    sessions: &[ContextSessionFact],
+    branch_state: Option<&ContextBranchState>,
+) -> Vec<ContextRiskSignal> {
+    let mut signals = Vec::new();
+
+    if !stale_memory_risks.is_empty() {
+        signals.push(context_risk_signal(
+            "high",
+            "stale_memory_conflict",
+            format!(
+                "{} unresolved stale-memory risk(s) are relevant to this task",
+                stale_memory_risks.len()
+            ),
+            900 + stale_memory_risks.len() * 25,
+            "stale-memory evidence remains unresolved",
+        ));
+    }
+
+    if let Some(branch) = branch_state {
+        let changed_paths = branch
+            .changed_files
+            .iter()
+            .flat_map(|file| [Some(file.path.as_str()), file.original_path.as_deref()])
+            .flatten()
+            .collect::<HashSet<_>>();
+        let relevant_paths = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .chain(symbols.iter().map(|symbol| symbol.path.as_str()))
+            .collect::<HashSet<_>>();
+        let mut changed_relevant = relevant_paths
+            .into_iter()
+            .filter(|path| changed_paths.contains(path))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        changed_relevant.sort();
+
+        if !changed_relevant.is_empty() {
+            signals.push(context_risk_signal(
+                "medium",
+                "changed_relevant_files",
+                format!(
+                    "relevant files already have worktree changes: {}",
+                    summarize_values(&changed_relevant, 4)
+                ),
+                740 + changed_relevant.len() * 20,
+                "worktree changes overlap selected context",
+            ));
+        }
+    }
+
+    let source_files = files
+        .iter()
+        .filter(|file| context_file_likely_source(&file.path))
+        .collect::<Vec<_>>();
+
+    if !source_files.is_empty() && tests.is_empty() {
+        signals.push(context_risk_signal(
+            "medium",
+            "missing_test_mapping",
+            format!(
+                "no likely tests were mapped for source file candidates: {}",
+                summarize_values(
+                    &source_files
+                        .iter()
+                        .map(|file| file.path.clone())
+                        .collect::<Vec<_>>(),
+                    4,
+                )
+            ),
+            660 + source_files.len() * 10,
+            "source files were selected but no affected tests were found",
+        ));
+    }
+
+    if !source_files.is_empty() && symbols.is_empty() {
+        signals.push(context_risk_signal(
+            "low",
+            "missing_symbol_index",
+            "source file candidates have no matching indexed symbols".to_string(),
+            460 + source_files.len() * 10,
+            "symbol recall did not find task-relevant symbols",
+        ));
+    }
+
+    if let Some((node, count)) = most_connected_graph_node(graph_neighbors) {
+        if count >= 4 {
+            signals.push(context_risk_signal(
+                "medium",
+                "high_graph_coupling",
+                format!("{node} has {count} nearby graph reference(s) in this context"),
+                680 + count * 15,
+                "graph neighborhood has concentrated references",
+            ));
+        }
+    }
+
+    let stale_index_paths = freshness_signals
+        .iter()
+        .filter(|signal| signal.kind == "stale_index")
+        .map(|signal| signal.path.clone())
+        .collect::<Vec<_>>();
+    if !stale_index_paths.is_empty() {
+        signals.push(context_risk_signal(
+            "medium",
+            "stale_index",
+            format!(
+                "Hugr index timestamps may be stale for relevant files: {}",
+                summarize_values(&stale_index_paths, 4)
+            ),
+            720 + stale_index_paths.len() * 20,
+            "file modification time is newer than latest indexed evidence",
+        ));
+    }
+
+    let missing_index_paths = freshness_signals
+        .iter()
+        .filter(|signal| signal.kind == "missing_index")
+        .map(|signal| signal.path.clone())
+        .collect::<Vec<_>>();
+    if !missing_index_paths.is_empty() {
+        signals.push(context_risk_signal(
+            "low",
+            "missing_index",
+            format!(
+                "relevant files have no Hugr index timestamp: {}",
+                summarize_values(&missing_index_paths, 4)
+            ),
+            500 + missing_index_paths.len() * 15,
+            "no discovered-file, symbol, or reference timestamp was found",
+        ));
+    }
+
+    if !diagnostics.is_empty() {
+        let highest_severity = if diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == "error")
+        {
+            "high"
+        } else {
+            "medium"
+        };
+        let diagnostic_summaries = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                format!(
+                    "{} at {}: {}",
+                    diagnostic.severity,
+                    diagnostic_location(diagnostic),
+                    diagnostic.message
+                )
+            })
+            .collect::<Vec<_>>();
+        signals.push(context_risk_signal(
+            highest_severity,
+            "structured_diagnostics",
+            format!(
+                "structured diagnostics are relevant: {}",
+                summarize_values(&diagnostic_summaries, 2)
+            ),
+            840 + diagnostics.len() * 30,
+            "durable diagnostic records match selected context",
+        ));
+    }
+
+    let diagnostics = sessions
+        .iter()
+        .filter_map(session_fact_diagnostic_snippet)
+        .collect::<Vec<_>>();
+    if !diagnostics.is_empty() {
+        signals.push(context_risk_signal(
+            "high",
+            "recent_diagnostics",
+            format!(
+                "recent session output includes diagnostic evidence: {}",
+                summarize_values(&diagnostics, 2)
+            ),
+            780 + diagnostics.len() * 25,
+            "recent command or session output contains diagnostic terms",
+        ));
+    }
+
+    let failure_facts = sessions
+        .iter()
+        .filter(|fact| session_fact_mentions_failure(fact))
+        .count();
+    if failure_facts > 0 {
+        signals.push(context_risk_signal(
+            "medium",
+            "recent_failure_history",
+            format!("{failure_facts} recent session fact(s) mention failures or errors"),
+            700 + failure_facts * 20,
+            "recent session evidence contains failure terms",
+        ));
+    }
+
+    signals.sort_by(|left, right| {
+        right
+            .evidence_score
+            .cmp(&left.evidence_score)
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    signals
+}
+
+fn context_risk_signal(
+    severity: &str,
+    kind: &str,
+    summary: String,
+    evidence_score: usize,
+    evidence_reason: &str,
+) -> ContextRiskSignal {
+    ContextRiskSignal {
+        severity: severity.to_string(),
+        kind: kind.to_string(),
+        summary,
+        citation_id: format!("risk:{kind}"),
+        evidence_score,
+        evidence_reason: evidence_reason.to_string(),
+    }
+}
+
+fn context_file_likely_source(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    if lower.starts_with("tests/") || lower.contains("/tests/") || lower.contains("__tests__") {
+        return false;
+    }
+
+    [
+        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".kt", ".kts", ".swift", ".c",
+        ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php",
+    ]
+    .iter()
+    .any(|extension| lower.ends_with(extension))
+}
+
+fn most_connected_graph_node(graph_neighbors: &[ContextGraphNeighbor]) -> Option<(String, usize)> {
+    let mut counts = HashMap::<String, usize>::new();
+    for neighbor in graph_neighbors.iter().filter(|neighbor| {
+        matches!(
+            neighbor.kind.as_str(),
+            "incoming_reference" | "outgoing_reference" | "path_reference"
+        )
+    }) {
+        if let Some(target_path) = &neighbor.target_path {
+            *counts.entry(target_path.clone()).or_insert(0) += 1;
+        }
+        if let Some(path) = &neighbor.path {
+            *counts.entry(path.clone()).or_insert(0) += 1;
+        }
+    }
+
+    counts
+        .into_iter()
+        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
+}
+
+fn session_fact_mentions_failure(fact: &ContextSessionFact) -> bool {
+    let lower = format!("{} {}", fact.kind, fact.detail).to_lowercase();
+    ["fail", "error", "panic", "timeout", "regression"]
+        .iter()
+        .any(|term| lower.contains(term))
+}
+
+fn session_fact_diagnostic_snippet(fact: &ContextSessionFact) -> Option<String> {
+    let lower = format!("{} {}", fact.kind, fact.detail).to_lowercase();
+    let diagnostic_terms = [
+        "error:",
+        "error[",
+        "warning:",
+        "panicked at",
+        "failed to compile",
+        "cannot find",
+        "mismatched types",
+        "unresolved import",
+        "thread '",
+    ];
+    if !diagnostic_terms.iter().any(|term| lower.contains(term)) {
+        return None;
+    }
+
+    Some(compact_snippet(&fact.detail, 140))
+}
+
+fn compact_snippet(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+
+    let mut rendered = compact.chars().take(max_chars).collect::<String>();
+    rendered.push_str("...");
+    rendered
+}
+
+fn summarize_values(values: &[String], max_items: usize) -> String {
+    let mut rendered = values
+        .iter()
+        .take(max_items)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = values.len().saturating_sub(max_items);
+    if remaining > 0 {
+        let _ = write!(rendered, " (+{remaining} more)");
+    }
+    rendered
+}
+
 fn context_query_terms(query: &str) -> Vec<String> {
     query
         .split(|char: char| !char.is_alphanumeric() && char != '_' && char != '-')
@@ -959,6 +1624,11 @@ fn build_citations(pack: &ContextPack) -> Vec<Citation> {
             symbol.kind, symbol.name, symbol.path, symbol.line_start
         ),
     }));
+    citations.extend(pack.graph_neighbors.iter().map(|neighbor| Citation {
+        id: neighbor.citation_id.clone(),
+        source_type: "graph".to_string(),
+        label: neighbor.label.clone(),
+    }));
     citations.extend(pack.affected_tests.iter().map(|test| Citation {
         id: test.citation_id.clone(),
         source_type: "test".to_string(),
@@ -976,6 +1646,21 @@ fn build_citations(pack: &ContextPack) -> Vec<Citation> {
             "{}: older {} conflicts with newer {}",
             risk.signal, risk.older_memory.id, risk.newer_memory.id
         ),
+    }));
+    citations.extend(pack.diagnostics.iter().map(|diagnostic| Citation {
+        id: diagnostic.citation_id.clone(),
+        source_type: "diagnostic".to_string(),
+        label: format!(
+            "{} at {}: {}",
+            diagnostic.severity,
+            diagnostic_location(diagnostic),
+            diagnostic.message
+        ),
+    }));
+    citations.extend(pack.risk_signals.iter().map(|risk| Citation {
+        id: risk.citation_id.clone(),
+        source_type: "risk".to_string(),
+        label: risk.summary.clone(),
     }));
     citations.extend(pack.recent_sessions.iter().map(|fact| Citation {
         id: fact.citation_id.clone(),
@@ -1007,17 +1692,26 @@ fn remove_lowest_priority_context_item(
     if let Some(test) = pack.affected_tests.last() {
         consider_weakest_evidence(&mut weakest, "affected_tests", test.evidence_score, 1);
     }
+    if let Some(neighbor) = pack.graph_neighbors.last() {
+        consider_weakest_evidence(&mut weakest, "graph_neighbors", neighbor.evidence_score, 2);
+    }
     if let Some(file) = pack.relevant_files.last() {
-        consider_weakest_evidence(&mut weakest, "relevant_files", file.evidence_score, 2);
+        consider_weakest_evidence(&mut weakest, "relevant_files", file.evidence_score, 3);
     }
     if let Some(symbol) = pack.important_symbols.last() {
-        consider_weakest_evidence(&mut weakest, "important_symbols", symbol.evidence_score, 3);
+        consider_weakest_evidence(&mut weakest, "important_symbols", symbol.evidence_score, 4);
     }
     if let Some(risk) = pack.stale_memory_risks.last() {
-        consider_weakest_evidence(&mut weakest, "stale_memory_risks", risk.evidence_score, 4);
+        consider_weakest_evidence(&mut weakest, "stale_memory_risks", risk.evidence_score, 5);
+    }
+    if let Some(diagnostic) = pack.diagnostics.last() {
+        consider_weakest_evidence(&mut weakest, "diagnostics", diagnostic.evidence_score, 6);
+    }
+    if let Some(risk) = pack.risk_signals.last() {
+        consider_weakest_evidence(&mut weakest, "risk_signals", risk.evidence_score, 7);
     }
     if let Some(memory) = pack.relevant_memories.last() {
-        consider_weakest_evidence(&mut weakest, "relevant_memories", memory.evidence_score, 5);
+        consider_weakest_evidence(&mut weakest, "relevant_memories", memory.evidence_score, 8);
     }
 
     match weakest.map(|(_, _, section)| section) {
@@ -1029,6 +1723,11 @@ fn remove_lowest_priority_context_item(
         Some("affected_tests") => {
             pack.affected_tests.pop();
             record_truncation(truncated_sections, "affected_tests");
+            true
+        }
+        Some("graph_neighbors") => {
+            pack.graph_neighbors.pop();
+            record_truncation(truncated_sections, "graph_neighbors");
             true
         }
         Some("relevant_files") => {
@@ -1044,6 +1743,16 @@ fn remove_lowest_priority_context_item(
         Some("stale_memory_risks") => {
             pack.stale_memory_risks.pop();
             record_truncation(truncated_sections, "stale_memory_risks");
+            true
+        }
+        Some("diagnostics") => {
+            pack.diagnostics.pop();
+            record_truncation(truncated_sections, "diagnostics");
+            true
+        }
+        Some("risk_signals") => {
+            pack.risk_signals.pop();
+            record_truncation(truncated_sections, "risk_signals");
             true
         }
         Some("relevant_memories") => {
@@ -1099,6 +1808,11 @@ fn estimate_context_pack_tokens(
         .map(estimate_symbol_tokens)
         .sum::<usize>();
     total += pack
+        .graph_neighbors
+        .iter()
+        .map(estimate_graph_neighbor_tokens)
+        .sum::<usize>();
+    total += pack
         .affected_tests
         .iter()
         .map(estimate_test_tokens)
@@ -1112,6 +1826,16 @@ fn estimate_context_pack_tokens(
         .stale_memory_risks
         .iter()
         .map(estimate_stale_risk_tokens)
+        .sum::<usize>();
+    total += pack
+        .diagnostics
+        .iter()
+        .map(estimate_diagnostic_tokens)
+        .sum::<usize>();
+    total += pack
+        .risk_signals
+        .iter()
+        .map(estimate_risk_signal_tokens)
         .sum::<usize>();
     total += pack
         .recent_sessions
@@ -1158,6 +1882,29 @@ fn estimate_symbol_tokens(symbol: &ContextSymbol) -> usize {
         + estimate_tokens(&symbol.evidence_reason)
 }
 
+fn estimate_graph_neighbor_tokens(neighbor: &ContextGraphNeighbor) -> usize {
+    9 + estimate_tokens(&neighbor.kind)
+        + estimate_tokens(&neighbor.label)
+        + estimate_tokens(&neighbor.detail)
+        + neighbor
+            .path
+            .as_ref()
+            .map(|path| estimate_tokens(path))
+            .unwrap_or(0)
+        + neighbor
+            .target_path
+            .as_ref()
+            .map(|path| estimate_tokens(path))
+            .unwrap_or(0)
+        + neighbor
+            .target_name
+            .as_ref()
+            .map(|name| estimate_tokens(name))
+            .unwrap_or(0)
+        + estimate_tokens(&neighbor.citation_id)
+        + estimate_tokens(&neighbor.evidence_reason)
+}
+
 fn estimate_test_tokens(test: &ContextTest) -> usize {
     4 + estimate_tokens(&test.path)
         + estimate_tokens(&test.reason)
@@ -1183,6 +1930,38 @@ fn estimate_stale_risk_tokens(risk: &ContextStaleMemoryRisk) -> usize {
             .sum::<usize>()
         + estimate_memory_tokens(&risk.newer_memory)
         + estimate_memory_tokens(&risk.older_memory)
+        + estimate_tokens(&risk.citation_id)
+        + estimate_tokens(&risk.evidence_reason)
+}
+
+fn estimate_diagnostic_tokens(diagnostic: &ContextDiagnostic) -> usize {
+    10 + estimate_tokens(&diagnostic.id)
+        + estimate_tokens(&diagnostic.source)
+        + diagnostic
+            .path
+            .as_ref()
+            .map(|path| estimate_tokens(path))
+            .unwrap_or(0)
+        + estimate_tokens(&diagnostic.severity)
+        + diagnostic
+            .code
+            .as_ref()
+            .map(|code| estimate_tokens(code))
+            .unwrap_or(0)
+        + estimate_tokens(&diagnostic.message)
+        + diagnostic
+            .command
+            .as_ref()
+            .map(|command| estimate_tokens(command))
+            .unwrap_or(0)
+        + estimate_tokens(&diagnostic.citation_id)
+        + estimate_tokens(&diagnostic.evidence_reason)
+}
+
+fn estimate_risk_signal_tokens(risk: &ContextRiskSignal) -> usize {
+    7 + estimate_tokens(&risk.severity)
+        + estimate_tokens(&risk.kind)
+        + estimate_tokens(&risk.summary)
         + estimate_tokens(&risk.citation_id)
         + estimate_tokens(&risk.evidence_reason)
 }
@@ -1278,6 +2057,19 @@ fn symbol_location(symbol: &ContextSymbol) -> String {
     }
 }
 
+fn diagnostic_location(diagnostic: &ContextDiagnostic) -> String {
+    match (
+        diagnostic.path.as_deref(),
+        diagnostic.line_start,
+        diagnostic.line_end,
+    ) {
+        (Some(path), Some(start), Some(end)) if end > start => format!("{path}:{start}-{end}"),
+        (Some(path), Some(start), _) => format!("{path}:{start}"),
+        (Some(path), None, _) => path.to_string(),
+        (None, _, _) => "unknown".to_string(),
+    }
+}
+
 fn change_label(file: &ContextChangedFile) -> String {
     match (&file.staged_status, &file.unstaged_status) {
         (Some(staged), Some(unstaged)) if staged == unstaged => staged.clone(),
@@ -1293,7 +2085,9 @@ mod tests {
     use super::{ContextPack, json_string};
     use crate::code::CodeSymbol;
     use crate::discovery::FileCandidate;
-    use crate::store::{Memory, StaleMemoryCandidate};
+    use crate::store::{
+        Diagnostic, FreshnessSignal, GraphNeighbor, Memory, SessionFact, StaleMemoryCandidate,
+    };
     use crate::testmap::TestCandidate;
     use crate::worktree::{ChangedFile, WorktreeState};
 
@@ -1364,6 +2158,143 @@ mod tests {
         assert!(json.contains("\"line_end\":8"));
         assert!(markdown.contains("- tests/plugin_hooks.rs"));
         assert!(json.contains("\"affected_tests\""));
+    }
+
+    #[test]
+    fn markdown_and_json_include_graph_neighbors() {
+        let pack =
+            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
+                "add plugin hooks",
+                vec![FileCandidate {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    score: 5,
+                    language: Some("rust".to_string()),
+                    size_bytes: Some(100),
+                }],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                Vec::new(),
+                vec![GraphNeighbor {
+                    kind: "incoming_reference".to_string(),
+                    label: "src/main.rs:8 references function run_after_config".to_string(),
+                    detail: "call reference to function run_after_config: run_after_config();"
+                        .to_string(),
+                    path: Some("src/main.rs".to_string()),
+                    target_path: Some("src/plugin_hooks.rs".to_string()),
+                    target_name: Some("run_after_config".to_string()),
+                    line_start: Some(8),
+                }],
+                Vec::new(),
+                Vec::new(),
+            );
+
+        let markdown = pack.render_markdown();
+        let json = pack.render_json();
+        let parsed = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+
+        assert!(markdown.contains("## Graph Neighborhood"));
+        assert!(markdown.contains("incoming_reference: src/main.rs:8 references"));
+        assert_eq!(
+            parsed["graph_neighbors"][0]["target_name"],
+            "run_after_config"
+        );
+        assert_eq!(parsed["citations"][1]["source_type"], "graph");
+    }
+
+    #[test]
+    fn freshness_signals_render_as_risk_signals() {
+        let pack =
+            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
+                "add plugin hooks",
+                vec![FileCandidate {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    score: 5,
+                    language: Some("rust".to_string()),
+                    size_bytes: Some(100),
+                }],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+                vec![FreshnessSignal {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    kind: "stale_index".to_string(),
+                    detail: "src/plugin_hooks.rs changed after its latest Hugr index timestamp"
+                        .to_string(),
+                    indexed_at_ms: Some(10),
+                    modified_at_ms: Some(20),
+                }],
+                Vec::new(),
+            );
+
+        let json = pack.render_json();
+        let parsed = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+        let risk_kinds = parsed["risk_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|risk| risk["kind"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(pack.render_markdown().contains("risk:stale_index [risk]"));
+        assert!(risk_kinds.contains(&"stale_index"));
+    }
+
+    #[test]
+    fn structured_diagnostics_render_with_citations_and_risks() {
+        let pack =
+            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
+                "fix plugin hooks",
+                vec![FileCandidate {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    score: 5,
+                    language: Some("rust".to_string()),
+                    size_bytes: Some(100),
+                }],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Diagnostic {
+                    id: "diag_1".to_string(),
+                    source: "command_stderr".to_string(),
+                    path: Some("src/plugin_hooks.rs".to_string()),
+                    line_start: Some(12),
+                    line_end: None,
+                    severity: "error".to_string(),
+                    code: Some("E0425".to_string()),
+                    message: "cannot find value hook in this scope".to_string(),
+                    command: Some("cargo test".to_string()),
+                    created_at_ms: 42,
+                }],
+            );
+
+        let markdown = pack.render_markdown();
+        let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
+        let risk_kinds = parsed["risk_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|risk| risk["kind"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(markdown.contains("## Diagnostics"));
+        assert!(markdown.contains("error E0425 at src/plugin_hooks.rs:12"));
+        assert_eq!(parsed["diagnostics"][0]["path"], "src/plugin_hooks.rs");
+        assert_eq!(parsed["diagnostics"][0]["line_start"], 12);
+        assert_eq!(parsed["diagnostics"][0]["citation_id"], "diagnostic:diag_1");
+        assert!(risk_kinds.contains(&"structured_diagnostics"));
+        assert!(markdown.contains("diagnostic:diag_1 [diagnostic]"));
     }
 
     #[test]
@@ -1446,6 +2377,56 @@ mod tests {
         assert!(json.contains("\"branch_state\""));
         assert!(json.contains("\"ahead\":2"));
         assert!(json.contains("\"unstaged_status\":\"modified\""));
+    }
+
+    #[test]
+    fn markdown_and_json_include_risk_signals() {
+        let pack = ContextPack::with_sessions_symbols_tests_and_branch(
+            "add plugin hooks",
+            vec!["src/plugin_hooks.rs".to_string()],
+            Vec::new(),
+            vec![SessionFact {
+                session_id: "ses_1".to_string(),
+                kind: "test".to_string(),
+                detail: "cargo test failed; stderr_tail: error[E0425]: cannot find value hook"
+                    .to_string(),
+                created_at_ms: 30,
+            }],
+            Vec::new(),
+            Vec::new(),
+            Some(WorktreeState {
+                inside_worktree: true,
+                root_path: Some("/repo".to_string()),
+                branch: Some("feature".to_string()),
+                upstream: Some("origin/feature".to_string()),
+                ahead: 0,
+                behind: 0,
+                changed_files: vec![ChangedFile {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    original_path: None,
+                    staged_status: None,
+                    unstaged_status: Some("modified".to_string()),
+                }],
+            }),
+        );
+
+        let markdown = pack.render_markdown();
+        let json = pack.render_json();
+        let parsed = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+        let risk_kinds = parsed["risk_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|risk| risk["kind"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(markdown.contains("## Risk Signals"));
+        assert!(risk_kinds.contains(&"changed_relevant_files"));
+        assert!(risk_kinds.contains(&"missing_test_mapping"));
+        assert!(risk_kinds.contains(&"missing_symbol_index"));
+        assert!(risk_kinds.contains(&"recent_diagnostics"));
+        assert!(risk_kinds.contains(&"recent_failure_history"));
+        assert!(markdown.contains("risk:changed_relevant_files [risk]"));
     }
 
     #[test]
