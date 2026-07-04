@@ -1,3 +1,4 @@
+use crate::code::CodeSymbol;
 use crate::context::ContextPack;
 use crate::discovery;
 use crate::impact;
@@ -107,6 +108,7 @@ async fn handle_tool_call(params: Value) -> Result<Value, String> {
         "hugr_session_event" => tool_session_event(&arguments).await,
         "hugr_session_end" => tool_session_end(&arguments).await,
         "hugr_index" => tool_index(&arguments).await,
+        "hugr_symbols" => tool_symbols(&arguments).await,
         "hugr_impact" => tool_impact(&arguments).await,
         "hugr_forget" => tool_forget(&arguments).await,
         unknown => Err(format!("unknown tool '{unknown}'")),
@@ -140,17 +142,28 @@ async fn tool_context(arguments: &Value) -> Result<Value, String> {
         .map(|candidate| candidate.path.clone())
         .collect::<Vec<_>>();
     let affected_tests = store.likely_tests_for_files(&files, 5).await?;
+    let graph_neighbors = store
+        .context_graph_neighbors(&task, &files, &symbols, 12)
+        .await?;
+    let freshness_signals = store
+        .context_freshness_signals(&files, &symbols, 12)
+        .await?;
+    let diagnostics = store.recent_diagnostics(&task, &files, &symbols, 8).await?;
     let branch_state = worktree::inspect(Path::new("."));
-    let pack = ContextPack::with_file_candidates_sessions_symbols_tests_branch_and_stale_risks(
-        &task,
-        file_candidates,
-        memories,
-        sessions,
-        symbols,
-        affected_tests,
-        Some(branch_state),
-        stale_candidates,
-    );
+    let pack =
+        ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
+            &task,
+            file_candidates,
+            memories,
+            sessions,
+            symbols,
+            affected_tests,
+            Some(branch_state),
+            stale_candidates,
+            graph_neighbors,
+            freshness_signals,
+            diagnostics,
+        );
     let structured = context_pack_json(&pack);
 
     Ok(tool_result(pack.render_markdown(), structured))
@@ -253,6 +266,21 @@ async fn tool_index(arguments: &Value) -> Result<Value, String> {
     ))
 }
 
+async fn tool_symbols(arguments: &Value) -> Result<Value, String> {
+    let query = required_string(arguments, "query")?;
+    let limit = optional_bounded_usize(arguments, "limit", 25, 100)?;
+    indexer::index_project(5000).await?;
+    let symbols = Store::open_current()
+        .symbols_for_target(&query, limit)
+        .await?;
+    let structured = json!({
+        "query": query,
+        "symbols": symbols.iter().map(symbol_json).collect::<Vec<_>>()
+    });
+
+    Ok(tool_result(structured.to_string(), structured))
+}
+
 async fn tool_impact(arguments: &Value) -> Result<Value, String> {
     let target = required_string(arguments, "target")?;
     let limit = optional_bounded_usize(arguments, "limit", 50, 500)?;
@@ -308,6 +336,11 @@ fn tools() -> Vec<Value> {
         ),
         tool_schema("hugr_index", "Index project files and symbols.", &[]),
         tool_schema(
+            "hugr_symbols",
+            "Lookup indexed code symbols by file path, exact name, or query.",
+            &[("query", "string")],
+        ),
+        tool_schema(
             "hugr_impact",
             "Trace direct indexed references for a file or symbol.",
             &[("target", "string")],
@@ -340,13 +373,13 @@ fn tool_schema(name: &str, description: &str, properties: &[(&str, &str)]) -> Va
         );
     }
 
-    if name == "hugr_impact" {
+    if name == "hugr_impact" || name == "hugr_symbols" {
         props.insert(
             "limit".to_string(),
             json!({
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 500
+                "maximum": if name == "hugr_impact" { 500 } else { 100 }
             }),
         );
     }
@@ -538,6 +571,18 @@ fn memory_json(memory: &Memory) -> Value {
     })
 }
 
+fn symbol_json(symbol: &CodeSymbol) -> Value {
+    json!({
+        "path": &symbol.path,
+        "language": &symbol.language,
+        "name": &symbol.name,
+        "kind": &symbol.kind,
+        "line_start": symbol.line_start,
+        "line_end": symbol.line_end,
+        "signature": &symbol.signature
+    })
+}
+
 fn memory_payload_json(payload: Option<&str>) -> Value {
     match payload {
         Some(payload) => serde_json::from_str(payload).unwrap_or_else(|_| json!(payload)),
@@ -591,7 +636,8 @@ fn context_pack_json(pack: &ContextPack) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_line, index_classification_json, memory_json, tools};
+    use super::{handle_line, index_classification_json, memory_json, symbol_json, tools};
+    use crate::code::CodeSymbol;
     use crate::indexer::IndexClassification;
     use crate::store::Memory;
     use serde_json::Value;
@@ -623,6 +669,7 @@ mod tests {
         assert!(names.contains(&"hugr_session_event"));
         assert!(names.contains(&"hugr_session_end"));
         assert!(names.contains(&"hugr_forget"));
+        assert!(names.contains(&"hugr_symbols"));
     }
 
     #[test]
@@ -686,6 +733,24 @@ mod tests {
             "session_promotion"
         );
         assert_eq!(value["structured_payload"]["source"]["session_id"], "ses_1");
+    }
+
+    #[test]
+    fn symbol_json_includes_location_fields() {
+        let value = symbol_json(&CodeSymbol {
+            path: "src/plugin_hooks.rs".to_string(),
+            language: Some("rust".to_string()),
+            name: "PluginHooks".to_string(),
+            kind: "struct".to_string(),
+            line_start: 3,
+            line_end: Some(8),
+            signature: "pub struct PluginHooks".to_string(),
+        });
+
+        assert_eq!(value["path"], "src/plugin_hooks.rs");
+        assert_eq!(value["name"], "PluginHooks");
+        assert_eq!(value["line_start"], 3);
+        assert_eq!(value["line_end"], 8);
     }
 
     #[test]
