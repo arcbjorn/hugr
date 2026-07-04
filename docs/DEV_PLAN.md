@@ -50,10 +50,11 @@ Implemented:
 - `hugr index` for explicit project indexing
 - best-effort code symbol extraction stored in `code_symbols`
 - best-effort direct reference/call/import extraction stored in `code_references`
-- tree-sitter-backed Rust, Python, TypeScript, JavaScript/JSX, Go, Java, and Swift symbol extraction with line ranges
+- tree-sitter-backed Rust, Python, TypeScript, JavaScript/JSX, Go, Java, Kotlin, and Swift symbol extraction with line ranges
 - important symbol citations in context packs
 - `hugr impact <file-or-symbol>` for direct indexed impact reports
 - local branch, upstream, ahead/behind, and worktree changes in context packs
+- durable `context_packs` storage and sync behavior for compiled context-pack JSON payloads
 - environment-driven cloud/hybrid/remote storage config with redacted status output
 - safe default and explicit opt-in cloud/hybrid sync class policy
 - `hugr sync status` execution-plan output for cloud/hybrid/remote sync decisions
@@ -62,10 +63,13 @@ Implemented:
 - Hugr API sync client transport for explicit push, pull, and history requests against the `/v1/sync/*` contract
 - `hugr daemon` exposes authenticated Hugr API sync routes for status, push, pull, and history, and records accepted API sync runs
 - `hugr daemon` exposes authenticated `GET /v1/memories` and `POST /v1/memories` storage routes for hosted memory reads and writes without recording sync runs
+- `hugr daemon` exposes authenticated `GET /v1/storage` and `POST /v1/storage` storage routes for hosted project, index, code graph, session, session-event, and session-promotion rows without recording sync runs
 - Hugr API sync push and pull transfer and reconcile memory row payloads with the same overwrite/preserve behavior used by direct sync
 - Hugr API sync push and pull transfer and reconcile all currently syncable safe row payload classes: project metadata, memories, embeddings, source references, discovered files, entities, code symbols, graph edges, code references, and finalized sessions
 - remote-mode Hugr API memory operations for `remember`, `recall`, memory counts, `forget`, and `improve` memory maintenance use hosted memory rows instead of a local libSQL connection
-- ignored live integration coverage for remote-mode Hugr API memory commands spawning a daemon and client against localhost
+- remote-mode Hugr API project status, indexing, context assembly, impact analysis, session start/event/end/promotion, `hugr run`, and shell-observation event writes use hosted storage rows instead of a local libSQL connection
+- ignored live integration coverage for remote-mode Hugr API memory, project, index, context, impact, session lifecycle, and session promotion commands spawning a daemon and client against localhost
+- GitHub Actions CI runs `cargo fmt --check`, `cargo test`, and the ignored live Hugr API client/server contract smoke explicitly
 - guarded `hugr sync push` dry-run and explicit execution path for safe sync classes
 - guarded `hugr sync pull` dry-run and explicit execution path for safe sync classes
 - `hugr sync history` with per-table sync counters and conflict summaries
@@ -76,29 +80,31 @@ Implemented:
 - `hugr improve --execute --stale [--json]` retires older stale candidates and points them at newer evidence
 - `hugr context` and `hugr_context` surface relevant unresolved stale-memory risks with citations
 - `hugr context` and `hugr_context` include deterministic token budget metadata and trim lower-priority context items before rendering
-- `hugr context` and `hugr_context` include deterministic evidence scores and reasons for files, symbols, tests, memories, stale-memory risks, and session facts
+- `hugr context` and `hugr_context` include deterministic evidence scores and reasons for files, symbols, graph neighbors, tests, memories, stale-memory risks, and session facts
+- `hugr context` and `hugr_context` include graph neighborhoods from code references plus source/entity/edge rows in local and hosted Hugr API storage modes
+- `hugr context` and `hugr_context` include deterministic risk signals for stale memory conflicts, changed relevant files, missing test mappings, missing symbol coverage, graph coupling, and recent failure session facts
+- `hugr context` and `hugr_context` include index-freshness risk evidence for relevant files whose Hugr index timestamps are missing or older than local file modification time
+- `hugr context` and `hugr_context` derive recent diagnostic risk evidence from captured command/session output terms such as compiler errors, warnings, panics, and unresolved imports
+- `hugr run <command>` parses structured diagnostics from command output and stores file, line, severity, code, message, command, and timestamp in local or hosted Hugr API storage
+- `hugr context` and `hugr_context` include structured diagnostics with exact locations, messages, citations, and risk signals
+- `hugr symbols [--json] <query>` and MCP `hugr_symbols` provide a stable read-only symbol lookup surface over exact file/name targets or ranked symbol search
 - code-reference edges distinguish imports, calls, member calls, implementations, inheritance, instantiations, type references, and generic references
 - initial vision, storage, and technical blueprint docs
 
-Not implemented yet:
-
-- tree-sitter-backed Kotlin parsing; the current published `tree-sitter-kotlin` crate resolves to `tree-sitter <0.23` and conflicts with Hugr's `tree-sitter 0.26` parser stack
-- ordinary API-backed storage operations for non-memory remote-mode commands such as project status, indexing, context assembly, and sessions
-- default CI wiring for live client/server Hugr API contract tests beyond the ignored localhost smoke
+Near-term parser and hosted API checklist is complete. Remaining broader product gaps are tracked below.
 
 ## Completion Gap Review
 
 The near-term plan is close to complete, but the broader vision and technical blueprint still require several product systems before Hugr is complete:
 
 - Daemon/runtime service: `hugr daemon` local HTTP transport, file watching, debounced background indexing, and periodic memory-maintenance audits exist.
-- Remote/cloud execution: direct remote libSQL/Turso storage mode exists; `hugr sync status` exposes the Hugr API contract metadata; explicit API sync push, pull, and history requests can use a configured hosted endpoint; `hugr daemon` exposes authenticated `/v1/sync/*` routes that accept and reconcile all currently syncable safe row payload classes, then persist accepted runs; remote-mode Hugr API memory commands use authenticated `/v1/memories` storage routes; and an ignored live localhost integration test covers remote memory command behavior. Default CI wiring for live API tests and ordinary API-backed storage for non-memory commands are still missing.
-- Context pack persistence: durable `context_packs` storage and real sync behavior for the `context_packs` sync class.
-- Context graph expansion: use code/source/entity graph neighborhoods during `hugr context`, not only direct file/symbol/memory retrieval.
+- Remote/cloud execution: direct remote libSQL/Turso storage mode exists; `hugr sync status` exposes the Hugr API contract metadata; explicit API sync push, pull, and history requests can use a configured hosted endpoint; `hugr daemon` exposes authenticated `/v1/sync/*` routes that accept and reconcile all currently syncable safe row payload classes, then persist accepted runs; remote-mode Hugr API memory commands use authenticated `/v1/memories` storage routes; remote-mode project/index/context/impact/session lifecycle/session-promotion workflows use authenticated `/v1/storage` rows; an ignored live localhost integration test covers those hosted client/server paths; and GitHub Actions runs that live smoke explicitly.
+- Context graph expansion: `hugr context` and `hugr_context` use code-reference plus source/entity/edge graph neighborhoods in local and hosted Hugr API storage modes.
 - Structured memory provenance: promoted session memories preserve structured payloads in JSON, and CLI/MCP memory writes support manual source attachments plus confidence, sensitivity, validity metadata, and project scope.
 - Automatic session observation: daemon captures file-change and git/worktree events for active sessions, `hugr run <command>` captures command/test outcomes, `hugr shell-hook <bash|zsh>` can observe ordinary shell command statuses, and daemon indexing captures classified discovery summaries.
 - Session summarization and memory promotion: manual `hugr session promote` summarizes latest session facts into long-term memory, and the daemon periodically promotes ended, unpromoted sessions.
-- Risk and health signals: complexity, coupling, dead code, diagnostics, risky paths, stale-after-edit detection, and richer risk sections in context packs.
-- Semantic operations: symbol lookup/edit helpers, diagnostics integration, and safe structural operations where they reduce brittle text edits.
+- Risk and health signals: context packs now include deterministic risks for stale memory conflicts, changed relevant files, missing tests/symbols, graph coupling, recent failure facts, index freshness, recent diagnostic output, and structured diagnostics with source locations; complexity, dead code, risky paths, and stale-after-edit semantics beyond file mtime remain.
+- Semantic operations: read-only CLI/MCP symbol lookup exists; edit helpers and safe structural operations remain.
 - Incremental freshness: watcher-driven invalidation and refresh for file discovery, symbols, graph edges, tests, and context evidence.
 
 ## Runtime Decision
@@ -354,7 +360,7 @@ Implemented first slice:
 - Impact reports include inbound references and outbound references from matched symbol or file scope.
 - Likely test files are mapped from discovered project paths and surfaced in context and impact output.
 - Context packs include local branch, upstream, ahead/behind counts, and worktree changes.
-- Rust, Python, TypeScript, JavaScript/JSX, Go, Java, and Swift symbol extraction use tree-sitter when parsing succeeds, with line-scanner fallback.
+- Rust, Python, TypeScript, JavaScript/JSX, Go, Java, Kotlin, and Swift symbol extraction use tree-sitter when parsing succeeds, with line-scanner fallback.
 
 Open questions:
 
@@ -371,15 +377,23 @@ Tasks:
 - Add token budgeting.
 - Add evidence ranking.
 - Add stale-fact filtering.
+- Add deterministic risk signals.
 - Add citations for every section.
 - Add Markdown and JSON renderers.
 
 Implemented first slices:
 
-- `hugr context` and `hugr_context` rank files, symbols, tests, memories, session facts, and stale-memory risks with deterministic evidence scores before token budgeting.
+- `hugr context` and `hugr_context` rank files, symbols, graph neighbors, tests, memories, session facts, and stale-memory risks with deterministic evidence scores before token budgeting.
 - `hugr context` and `hugr_context` include deterministic token budget metadata and remove lower-priority items when a pack exceeds the default budget.
 - `hugr context` and `hugr_context` include unresolved stale-memory risks relevant to recalled task memories.
 - Stale-memory risks render in Markdown and JSON with newer/older memory evidence, shared terms, deterministic signal, and `stale_memory` citations.
+- `hugr context` persists each compiled pack as an opaque JSON payload in `context_packs` with project/task/timestamps for later audit and sync.
+- Graph neighborhoods render in Markdown and JSON with `graph` citations, drawing from code references plus source/entity/edge rows in local and hosted API storage.
+- Risk signals render in Markdown and JSON with `risk` citations, covering stale-memory conflicts, changed relevant files, missing test mappings, missing symbol coverage, graph coupling, and recent failure session facts.
+- Index freshness checks compare relevant files against local or hosted Hugr index timestamps and surface missing/stale index evidence as risk signals.
+- Recent command/session output with diagnostic terms is compacted into `recent_diagnostics` risk signals.
+- `hugr run` stores parsed structured diagnostics from stdout/stderr, and context packs render matching diagnostics with `diagnostic` citations plus `structured_diagnostics` risk signals.
+- `hugr symbols` and `hugr_symbols` refresh the index, then return matching symbol paths, languages, kinds, ranges, and signatures.
 
 Open questions:
 
@@ -412,21 +426,23 @@ Implemented first slice:
 - `HUGR_REMOTE_DATABASE_URL` and `HUGR_REMOTE_AUTH_TOKEN` are recognized, with common libSQL/Turso aliases.
 - `HUGR_API_URL` and `HUGR_API_TOKEN` are recognized for the Hugr API backend contract.
 - CLI status, project status, doctor, and MCP project status expose redacted storage configuration.
-- Remote mode opens direct remote libSQL/Turso storage when explicitly configured; Hugr API remote mode routes memory commands through hosted memory storage and still fails non-memory local database commands with a hosted-storage-operations error instead of silently writing locally.
+- Remote mode opens direct remote libSQL/Turso storage when explicitly configured; Hugr API remote mode routes memory commands through hosted memory storage and project/index/context/impact/session lifecycle/session-promotion commands through hosted general storage, while unsupported local database commands still fail with a hosted-storage-operations error instead of silently writing locally.
 - Hybrid mode keeps local storage active while guarded direct remote sync remains opt-in.
 - `HUGR_SYNC_CLASSES` represents safe default sync classes and explicit opt-ins for full source, raw command output, secrets, and private notes.
 - `HUGR_SYNC_BACKEND=direct_libsql|hugr_api` records the execution strategy decision, defaulting to direct libSQL/Turso.
 - `hugr sync status [--json]` renders the current sync execution plan, with guarded remote reads and writes available for explicitly configured hybrid or remote direct libSQL/Turso storage.
 - For `HUGR_SYNC_BACKEND=hugr_api`, `hugr sync status [--json]` exposes the configured endpoint, `hugr-api-v1` contract version, and the planned `/v1/memories` plus `/v1/sync/*` route surface.
 - For explicit API sync execution, Hugr posts contract JSON to `POST /v1/sync/push` and `POST /v1/sync/pull`, fetches `GET /v1/sync/history`, and parses hosted table counters plus memory row payloads into the existing sync result types.
-- `hugr daemon` serves authenticated `GET /v1/memories`, `POST /v1/memories`, `GET /v1/sync/status`, `POST /v1/sync/push`, `POST /v1/sync/pull`, and `GET /v1/sync/history` routes using `HUGR_API_TOKEN` or `HUGR_REMOTE_AUTH_TOKEN` as the bearer token.
-- Hosted API push and pull validate the contract version, transfer project/memory/embedding/source/discovered-file/entity/code-symbol/edge/code-reference/finalized-session row payloads, apply supported rows server-side on push, return supported rows on pull, and persist accepted runs into sync history.
+- `hugr daemon` serves authenticated `GET /v1/memories`, `POST /v1/memories`, `GET /v1/storage`, `POST /v1/storage`, `GET /v1/sync/status`, `POST /v1/sync/push`, `POST /v1/sync/pull`, and `GET /v1/sync/history` routes using `HUGR_API_TOKEN` or `HUGR_REMOTE_AUTH_TOKEN` as the bearer token.
+- Hosted API push and pull validate the contract version, transfer project/memory/embedding/source/discovered-file/entity/code-symbol/edge/code-reference/finalized-session/context-pack row payloads, apply supported rows server-side on push, return supported rows on pull, and persist accepted runs into sync history.
 - Hosted memory storage validates the contract version, applies project/memory/embedding payloads through the same row reconciliation path without recording sync runs, and returns memory rows for remote-mode recall, memory counts, forget, and improve operations.
-- `tests/hugr_api_live.rs` provides an ignored live daemon/client contract test for remote-mode memory commands and verifies hosted memory storage does not create client-local `.hugr` state or sync-history rows.
+- Hosted general storage validates the contract version, applies project/source/discovered-file/entity/code-symbol/edge/code-reference/session/context-pack rows plus private session-event and session-promotion rows without recording sync runs, and supports remote-mode project status, indexing, context assembly, impact analysis, session lifecycle, session promotion, command observation, and shell observation.
+- `tests/hugr_api_live.rs` provides an ignored live daemon/client contract test for remote-mode memory, project, index, context, impact, session lifecycle, and session promotion commands and verifies hosted storage does not create client-local `.hugr` state or sync-history rows.
+- `.github/workflows/ci.yml` runs formatting, the full Rust test suite, and the ignored live Hugr API contract smoke on push and pull request.
 - `hugr sync push [--dry-run|--execute] [--json]` counts configured sync-class tables locally by default, writes to direct libSQL/Turso when `--execute` and hybrid remote config are explicit, or posts to the Hugr API backend when selected.
 - `hugr sync pull [--dry-run|--execute] [--json]` counts configured sync-class tables locally by default, reads from direct libSQL/Turso when `--execute` and hybrid remote config are explicit, or posts to the Hugr API backend when selected.
-- Sync push currently covers project metadata, memories, embeddings, source references, entity/code-symbol indexes, graph/code-reference edges, and finalized session summaries. It does not sync raw session events, shell output, secrets, private notes, or full source without future explicit data sources.
-- Sync pull reconciles the same safe table set with conservative merge rules: local memories are not clobbered, project and code-index rows update only when the remote record is newer, dependent embeddings are skipped until their memory exists, and finalized sessions only replace open or older local summaries.
+- Sync push currently covers project metadata, memories, embeddings, source references, entity/code-symbol indexes, graph/code-reference edges, finalized session summaries, and context packs. It does not sync raw session events, shell output, secrets, private notes, or full source without future explicit data sources.
+- Sync pull reconciles the same safe table set with conservative merge rules: local memories are not clobbered, project, code-index, and context-pack rows update only when the remote record is newer, dependent embeddings are skipped until their memory exists, and finalized sessions only replace open or older local summaries.
 - Sync push and pull report per-table inserted, updated, skipped, and conflict counts.
 - Executed sync runs are recorded in `sync_runs`, `sync_table_runs`, and `sync_table_conflicts`.
 - `hugr sync history [--json]` renders the last recorded sync runs with table counters and grouped conflict reasons.
@@ -529,6 +545,17 @@ Recommended next commits:
 56. Done: `feat(sync): reconcile API index rows`
 57. Done: `feat(api): add remote memory storage`
 58. Done: `test(api): cover live remote memory`
+59. Done: `feat(api): add remote project storage`
+60. Done: `feat(api): add remote session promotion`
+61. Done: `ci(api): run live contract smoke`
+62. Done: `feat(parser): use tree-sitter kotlin`
+63. Done: `feat(context): persist context packs`
+64. Done: `feat(context): add graph neighborhoods`
+65. Done: `feat(context): add risk signals`
+66. Done: `feat(context): add index freshness risks`
+67. Done: `feat(context): derive diagnostic risks`
+68. Done: `feat(context): ingest structured diagnostics`
+69. Done: `feat(symbols): add lookup surface`
 
 Each commit should leave the CLI usable.
 
@@ -545,6 +572,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add API-backed storage for non-memory remote-mode commands.
+Add safe structural edit helpers.
 
-That is the right next step because all currently syncable safe row payload classes and remote-mode memory commands now move through authenticated Hugr API routes, with an ignored live daemon/client test covering the memory path. The remaining remote/cloud gap is that project status, indexing, context assembly, and session workflows still depend on local database access in Hugr API remote mode.
+That is the right next step because context packs now persist, sync, rank evidence, include graph neighborhoods, surface deterministic risk signals, cite structured diagnostics with exact locations, and expose a stable read-only symbol lookup surface. The next semantic gap is safe structural operations where Hugr can reduce brittle text edits.
