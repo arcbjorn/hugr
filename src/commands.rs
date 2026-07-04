@@ -37,6 +37,20 @@ pub async fn execute(command: Command) -> Result<(), String> {
             body,
             format,
         } => replace_symbol(&path, &name, kind.as_deref(), &body, format).await,
+        Command::RenameSymbol {
+            path,
+            name,
+            new_name,
+            kind,
+            format,
+        } => rename_symbol(&path, &name, &new_name, kind.as_deref(), format).await,
+        Command::MoveSymbol {
+            source_path,
+            name,
+            destination_path,
+            kind,
+            format,
+        } => move_symbol(&source_path, &name, &destination_path, kind.as_deref(), format).await,
         Command::ProjectStatus => project_status().await,
         Command::SessionStart { task } => session_start(&task).await,
         Command::SessionEvent { kind, detail } => session_event(&kind, &detail).await,
@@ -316,6 +330,153 @@ async fn replace_symbol(
     }
 
     Ok(())
+}
+
+async fn rename_symbol(
+    path: &str,
+    name: &str,
+    new_name: &str,
+    kind: Option<&str>,
+    format: OutputFormat,
+) -> Result<(), String> {
+    let store = Store::open_current();
+    if !store.supports_local_source_edits()? {
+        return Err(
+            "hugr rename-symbol edits the local working tree and is not available in remote Hugr API mode"
+                .to_string(),
+        );
+    }
+
+    indexer::index_project(5000).await?;
+
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| format!("hugr rename-symbol cannot read {path}: {error}"))?;
+    let target = edit::resolve_symbol_in_source(path, &contents, name, kind, "rename")?;
+    let references = store
+        .references_to_symbols(std::slice::from_ref(&target), 2000)
+        .await?;
+    let mut paths = references
+        .iter()
+        .map(|reference| reference.path.clone())
+        .chain(std::iter::once(target.path.clone()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    let mut files = Vec::new();
+    for path in paths {
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|error| format!("hugr rename-symbol cannot read {path}: {error}"))?;
+        files.push((path, contents));
+    }
+
+    let planned = edit::plan_rename(&target, &references, files, new_name)?;
+    for file in &planned.files {
+        std::fs::write(&file.path, &file.contents)
+            .map_err(|error| format!("hugr rename-symbol cannot write {}: {error}", file.path))?;
+    }
+
+    indexer::index_project(5000).await?;
+
+    let summary = &planned.summary;
+    let changed_paths = summary
+        .changed_files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let detail = format!(
+        "rename-symbol {} {} -> {} at {}:{}-{}; changed files: {}",
+        summary.kind,
+        summary.old_name,
+        summary.new_name,
+        summary.target_path,
+        summary.line_start,
+        summary.line_end,
+        changed_paths
+    );
+    store
+        .record_session_event_if_active("edit", &detail)
+        .await?;
+
+    if format == OutputFormat::Json {
+        println!("{}", summary.render_json());
+    } else {
+        print!("{}", summary.render_markdown());
+    }
+
+    Ok(())
+}
+
+async fn move_symbol(
+    source_path: &str,
+    name: &str,
+    destination_path: &str,
+    kind: Option<&str>,
+    format: OutputFormat,
+) -> Result<(), String> {
+    let store = Store::open_current();
+    if !store.supports_local_source_edits()? {
+        return Err(
+            "hugr move-symbol edits the local working tree and is not available in remote Hugr API mode"
+                .to_string(),
+        );
+    }
+
+    indexer::index_project(5000).await?;
+
+    let source_contents = std::fs::read_to_string(source_path)
+        .map_err(|error| format!("hugr move-symbol cannot read {source_path}: {error}"))?;
+    let destination_contents = read_optional_destination(destination_path, "hugr move-symbol")?;
+    let target = edit::resolve_symbol_in_source(source_path, &source_contents, name, kind, "move")?;
+    let references = store
+        .references_to_symbols(std::slice::from_ref(&target), 2000)
+        .await?;
+    let planned = edit::plan_move(
+        &target,
+        &references,
+        &source_contents,
+        destination_path,
+        &destination_contents,
+    )?;
+
+    for file in &planned.files {
+        std::fs::write(&file.path, &file.contents)
+            .map_err(|error| format!("hugr move-symbol cannot write {}: {error}", file.path))?;
+    }
+
+    indexer::index_project(5000).await?;
+
+    let summary = &planned.summary;
+    let detail = format!(
+        "move-symbol {} {} from {}:{}-{} to {}",
+        summary.kind,
+        summary.name,
+        summary.source_path,
+        summary.old_line_start,
+        summary.old_line_end,
+        summary.destination_path
+    );
+    store
+        .record_session_event_if_active("edit", &detail)
+        .await?;
+
+    if format == OutputFormat::Json {
+        println!("{}", summary.render_json());
+    } else {
+        print!("{}", summary.render_markdown());
+    }
+
+    Ok(())
+}
+
+fn read_optional_destination(path: &str, command: &str) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(format!("{command} cannot read {path}: {error}")),
+    }
 }
 
 async fn project_status() -> Result<(), String> {
