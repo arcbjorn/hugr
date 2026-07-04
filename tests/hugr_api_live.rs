@@ -522,7 +522,7 @@ fn move_symbol_rewrites_supported_references_and_refreshes_index() {
     fs::write(&destination, "pub fn existing() {}\n").expect("destination should be written");
     fs::write(
         &main,
-        "use crate::plugin_hooks::helper;\n\nfn main() {\n    let _ = helper();\n}\n",
+        "use crate::plugin_hooks::{helper, other};\n\nfn main() {\n    let _ = helper();\n}\n",
     )
     .expect("main source should be written");
 
@@ -552,7 +552,8 @@ fn move_symbol_rewrites_supported_references_and_refreshes_index() {
     let edited_main = fs::read_to_string(&main).unwrap();
     assert!(!edited_source.contains("pub fn helper"));
     assert!(edited_destination.contains("pub fn helper() -> u8"));
-    assert!(edited_main.contains("use crate::helpers::helper;"));
+    assert!(edited_main.contains("use crate::plugin_hooks::{other};"));
+    assert!(edited_main.contains("use crate::helpers::{helper};"));
     assert!(edited_main.contains("helper();"));
     assert!(!edited_main.contains("crate::plugin_hooks::helper"));
 
