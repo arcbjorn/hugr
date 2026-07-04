@@ -11,6 +11,7 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "i
 tree-sitter = "0.26.10"
 tree-sitter-go = "0.25.0"
 tree-sitter-java = "0.23.5"
+tree-sitter-kotlin-ng = "1.1.0"
 tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
 tree-sitter-swift = "0.7.3"
