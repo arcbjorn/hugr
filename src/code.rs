@@ -44,6 +44,45 @@ pub(crate) fn symbols_in_source(
     extract_symbols(path, language, contents)
 }
 
+/// Report whether the tree-sitter grammar for `language` accepts `contents` without
+/// error. Languages without a wired grammar return `Ok(true)` so lenient line-scanner
+/// languages are not blocked. Structural edit validation uses this so a syntactically
+/// broken replacement body is refused rather than silently accepted by the fallback
+/// symbol scanner.
+pub(crate) fn parses_cleanly(
+    path: &str,
+    language: Option<&str>,
+    contents: &str,
+) -> Result<bool, String> {
+    let Some(grammar) = grammar_for(path, language) else {
+        return Ok(true);
+    };
+    let mut parser = Parser::new();
+    parser
+        .set_language(&grammar)
+        .map_err(|error| error.to_string())?;
+    let Some(tree) = parser.parse(contents, None) else {
+        return Ok(false);
+    };
+    Ok(!tree.root_node().has_error())
+}
+
+fn grammar_for(path: &str, language: Option<&str>) -> Option<tree_sitter::Language> {
+    let grammar = match language? {
+        "rust" => tree_sitter_rust::LANGUAGE.into(),
+        "python" => tree_sitter_python::LANGUAGE.into(),
+        "typescript" if path.ends_with(".tsx") => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        "javascript" => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        "go" => tree_sitter_go::LANGUAGE.into(),
+        "java" => tree_sitter_java::LANGUAGE.into(),
+        "kotlin" => tree_sitter_kotlin_ng::LANGUAGE.into(),
+        "swift" => tree_sitter_swift::LANGUAGE.into(),
+        _ => return None,
+    };
+    Some(grammar)
+}
+
 pub(crate) fn index_files(root: &Path, files: &[FileCandidate]) -> Result<Vec<CodeSymbol>, String> {
     let mut symbols = Vec::new();
     let mut seen = HashSet::new();
