@@ -359,7 +359,8 @@ impl SymbolReplacement {
 mod tests {
     use super::plan_replacement;
 
-    const RUST_SOURCE: &str = "pub struct Registry;\n\npub fn greet() -> u8 {\n    1\n}\n\npub fn other() {}\n";
+    const RUST_SOURCE: &str =
+        "pub struct Registry;\n\npub fn greet() -> u8 {\n    1\n}\n\npub fn other() {}\n";
 
     #[test]
     fn replaces_a_unique_function_body() {
@@ -404,9 +405,14 @@ mod tests {
 
     #[test]
     fn rejects_missing_symbol() {
-        let error =
-            plan_replacement("src/lib.rs", RUST_SOURCE, "absent", None, "pub fn absent() {}")
-                .unwrap_err();
+        let error = plan_replacement(
+            "src/lib.rs",
+            RUST_SOURCE,
+            "absent",
+            None,
+            "pub fn absent() {}",
+        )
+        .unwrap_err();
         assert!(error.contains("no symbol named 'absent'"), "{error}");
     }
 
@@ -477,8 +483,7 @@ mod tests {
 
     #[test]
     fn preserves_indentation_of_nested_symbol() {
-        let source =
-            "impl Registry {\n    pub fn value(&self) -> u8 {\n        1\n    }\n}\n";
+        let source = "impl Registry {\n    pub fn value(&self) -> u8 {\n        1\n    }\n}\n";
         let planned = plan_replacement(
             "src/lib.rs",
             source,
