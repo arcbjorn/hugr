@@ -183,6 +183,12 @@ fn extract_symbols(
             return Ok(symbols);
         }
     }
+    if matches!(language, Some("kotlin")) {
+        let symbols = extract_kotlin_symbols_with_tree_sitter(path, contents)?;
+        if !symbols.is_empty() {
+            return Ok(symbols);
+        }
+    }
     if matches!(language, Some("swift")) {
         let symbols = extract_swift_symbols_with_tree_sitter(path, contents)?;
         if !symbols.is_empty() {
@@ -716,6 +722,130 @@ fn java_symbol_from_node(
     }))
 }
 
+fn extract_kotlin_symbols_with_tree_sitter(
+    path: &str,
+    contents: &str,
+) -> Result<Vec<CodeSymbol>, String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+        .map_err(|error| error.to_string())?;
+    let Some(tree) = parser.parse(contents, None) else {
+        return Ok(Vec::new());
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return Ok(Vec::new());
+    }
+
+    let mut symbols = Vec::new();
+    collect_kotlin_symbols(path, contents, root, &mut symbols)?;
+    symbols.sort_by(|left, right| {
+        left.line_start
+            .cmp(&right.line_start)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(symbols)
+}
+
+fn collect_kotlin_symbols(
+    path: &str,
+    contents: &str,
+    node: Node<'_>,
+    symbols: &mut Vec<CodeSymbol>,
+) -> Result<(), String> {
+    if let Some(symbol) = kotlin_symbol_from_node(path, contents, node)? {
+        symbols.push(symbol);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_kotlin_symbols(path, contents, child, symbols)?;
+    }
+
+    Ok(())
+}
+
+fn kotlin_symbol_from_node(
+    path: &str,
+    contents: &str,
+    node: Node<'_>,
+) -> Result<Option<CodeSymbol>, String> {
+    let (kind, name) = match node.kind() {
+        "class_declaration" => {
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return Ok(None);
+            };
+            (
+                kotlin_class_declaration_kind(node, contents),
+                node_text(name_node, contents)?,
+            )
+        }
+        "companion_object" => {
+            let name = node
+                .child_by_field_name("name")
+                .map(|name_node| node_text(name_node, contents))
+                .transpose()?
+                .unwrap_or_else(|| "Companion".to_string());
+            ("object", name)
+        }
+        "function_declaration" => {
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return Ok(None);
+            };
+            ("function", node_text(name_node, contents)?)
+        }
+        "object_declaration" => {
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return Ok(None);
+            };
+            ("object", node_text(name_node, contents)?)
+        }
+        "secondary_constructor" => ("function", "constructor".to_string()),
+        "type_alias" => {
+            let Some(name_node) = node.child_by_field_name("type") else {
+                return Ok(None);
+            };
+            ("type", node_text(name_node, contents)?)
+        }
+        _ => return Ok(None),
+    };
+
+    Ok(Some(CodeSymbol {
+        path: path.to_string(),
+        language: Some("kotlin".to_string()),
+        name,
+        kind: kind.to_string(),
+        line_start: line_number(node.start_position().row),
+        line_end: Some(line_number(node.end_position().row)),
+        signature: line_signature(node, contents),
+    }))
+}
+
+fn kotlin_class_declaration_kind(node: Node<'_>, contents: &str) -> &'static str {
+    let signature = line_signature(node, contents);
+    let declaration = strip_leading_modifiers(&signature);
+    if keyword_remainder(declaration, "enum")
+        .and_then(|rest| keyword_remainder(rest, "class"))
+        .is_some()
+    {
+        "enum"
+    } else if keyword_remainder(declaration, "annotation")
+        .and_then(|rest| keyword_remainder(rest, "class"))
+        .is_some()
+    {
+        "annotation"
+    } else if keyword_remainder(declaration, "fun")
+        .and_then(|rest| keyword_remainder(rest, "interface"))
+        .is_some()
+        || keyword_remainder(declaration, "interface").is_some()
+    {
+        "interface"
+    } else {
+        "class"
+    }
+}
+
 fn extract_swift_symbols_with_tree_sitter(
     path: &str,
     contents: &str,
@@ -945,6 +1075,17 @@ fn extract_c_family_symbol(line: &str) -> Option<(String, String)> {
             "export",
             "async",
             "inline",
+            "data",
+            "sealed",
+            "inner",
+            "value",
+            "infix",
+            "operator",
+            "suspend",
+            "tailrec",
+            "external",
+            "lateinit",
+            "const",
             "mutating",
         ],
     );
@@ -1221,6 +1362,17 @@ fn is_declaration_modifier(token: &str) -> bool {
                 | "abstract"
                 | "open"
                 | "override"
+                | "data"
+                | "sealed"
+                | "inner"
+                | "value"
+                | "inline"
+                | "infix"
+                | "operator"
+                | "suspend"
+                | "tailrec"
+                | "external"
+                | "lateinit"
         )
 }
 
@@ -1750,6 +1902,120 @@ public class PluginRegistry implements PluginHook {
         assert_eq!(method.kind, "function");
         assert_eq!(method.line_start, 19);
         assert_eq!(method.line_end, Some(22));
+    }
+
+    #[test]
+    fn tree_sitter_kotlin_extracts_multiline_ranges() {
+        let symbols = extract_symbols(
+            "src/main/kotlin/plugin/PluginRegistry.kt",
+            Some("kotlin"),
+            r#"
+package plugin
+
+interface PluginHook {
+    fun runPluginHooks(): Boolean
+}
+
+typealias HookCallback = () -> Boolean
+
+enum class HookState {
+    ENABLED,
+    DISABLED
+}
+
+object HookDefaults {
+    fun createDefault(): PluginHook? = null
+}
+
+data class PluginRegistry(private val hooks: List<PluginHook>) {
+    constructor(): this(emptyList())
+
+    fun runPluginHooks(): Boolean {
+        return hooks.all { it.runPluginHooks() }
+    }
+
+    companion object {
+        fun empty(): PluginRegistry = PluginRegistry()
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let interface = symbols
+            .iter()
+            .find(|symbol| symbol.name == "PluginHook")
+            .unwrap();
+        let interface_method = symbols
+            .iter()
+            .find(|symbol| symbol.name == "runPluginHooks" && symbol.line_start == 5)
+            .unwrap();
+        let callback = symbols
+            .iter()
+            .find(|symbol| symbol.name == "HookCallback")
+            .unwrap();
+        let state = symbols
+            .iter()
+            .find(|symbol| symbol.name == "HookState")
+            .unwrap();
+        let defaults = symbols
+            .iter()
+            .find(|symbol| symbol.name == "HookDefaults")
+            .unwrap();
+        let default_function = symbols
+            .iter()
+            .find(|symbol| symbol.name == "createDefault")
+            .unwrap();
+        let registry = symbols
+            .iter()
+            .find(|symbol| symbol.name == "PluginRegistry" && symbol.kind == "class")
+            .unwrap();
+        let constructor = symbols
+            .iter()
+            .find(|symbol| symbol.name == "constructor")
+            .unwrap();
+        let method = symbols
+            .iter()
+            .filter(|symbol| symbol.name == "runPluginHooks")
+            .max_by_key(|symbol| symbol.line_start)
+            .unwrap();
+        let companion = symbols
+            .iter()
+            .find(|symbol| symbol.name == "Companion")
+            .unwrap();
+        let empty = symbols
+            .iter()
+            .find(|symbol| symbol.name == "empty")
+            .unwrap();
+
+        assert_eq!(interface.kind, "interface");
+        assert_eq!(interface.line_start, 4);
+        assert_eq!(interface.line_end, Some(6));
+        assert_eq!(interface_method.kind, "function");
+        assert_eq!(interface_method.line_end, Some(5));
+        assert_eq!(callback.kind, "type");
+        assert_eq!(callback.line_start, 8);
+        assert_eq!(callback.line_end, Some(8));
+        assert_eq!(state.kind, "enum");
+        assert_eq!(state.line_start, 10);
+        assert_eq!(state.line_end, Some(13));
+        assert_eq!(defaults.kind, "object");
+        assert_eq!(defaults.line_start, 15);
+        assert_eq!(defaults.line_end, Some(17));
+        assert_eq!(default_function.line_start, 16);
+        assert_eq!(registry.language.as_deref(), Some("kotlin"));
+        assert_eq!(registry.line_start, 19);
+        assert_eq!(registry.line_end, Some(29));
+        assert_eq!(constructor.kind, "function");
+        assert_eq!(constructor.line_start, 20);
+        assert_eq!(method.kind, "function");
+        assert_eq!(method.line_start, 22);
+        assert_eq!(method.line_end, Some(24));
+        assert_eq!(companion.kind, "object");
+        assert_eq!(companion.line_start, 26);
+        assert_eq!(companion.line_end, Some(28));
+        assert_eq!(empty.kind, "function");
+        assert_eq!(empty.line_start, 27);
     }
 
     #[test]
