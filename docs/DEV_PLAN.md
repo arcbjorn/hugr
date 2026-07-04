@@ -92,6 +92,8 @@ Implemented:
 - `hugr replace-symbol` refreshes the index immediately after a successful edit and records a session edit event when a session is active
 - `hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>` and MCP `hugr_rename_symbol` safely rename one local symbol plus indexed inbound references after refusing ambiguous targets, invalid identifiers, stale reference lines, collisions, and files that fail to parse after the refactor
 - `hugr rename-symbol` refreshes the index immediately after a successful refactor and records a session edit event when a session is active
+- `hugr move-symbol [--json] [--kind <kind>] <source-path> <symbol> <destination-path>` and MCP `hugr_move_symbol` safely move one unreferenced local symbol between files after refusing inbound references, language mismatches, destination collisions, and files that fail to parse after the move
+- `hugr move-symbol` refreshes the index immediately after a successful move and records a session edit event when a session is active
 - `hugr context` and `hugr_context` include a first code-health risk signal for large indexed symbols using deterministic symbol line ranges
 - `hugr context` and `hugr_context` include cross-file refactor-surface risks when code graph references span multiple files
 - `hugr context` and `hugr_context` include public/exported API surface risks using indexed symbol signatures and incoming reference evidence
@@ -372,6 +374,7 @@ Implemented first slice:
 - Rust, Python, TypeScript, JavaScript/JSX, Go, Java, Kotlin, and Swift symbol extraction use tree-sitter when parsing succeeds, with line-scanner fallback.
 - `hugr replace-symbol` and `hugr_replace_symbol` use indexed symbols plus parser validation to perform the first safe local structural edit.
 - `hugr rename-symbol` and `hugr_rename_symbol` use indexed symbols and code references to safely rename a local definition plus inbound reference lines, then re-index.
+- `hugr move-symbol` and `hugr_move_symbol` safely move an unreferenced local symbol between files with parser validation and destination collision checks.
 
 Open questions:
 
@@ -579,6 +582,7 @@ Recommended next commits:
 74. Done: `feat(context): flag unreferenced private symbols`
 75. Done: `feat(context): flag edits after context`
 76. Done: `feat(edit): rename symbols with references`
+77. Done: `feat(edit): move unreferenced symbols`
 
 Each commit should leave the CLI usable.
 
@@ -595,6 +599,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add broader multi-file structural edits.
+Add reference-rewriting multi-file moves.
 
-That is the right next step because context packs now persist, sync, rank evidence, include graph neighborhoods, surface deterministic risk signals, cite structured diagnostics with exact locations, expose symbol lookup, have safe local symbol replacement, flag several code-health/refactor surfaces, identify Hugr edits that invalidate persisted context, and now support a first reference-aware rename. The remaining semantic gap is broader safe multi-file editing beyond rename and single-symbol body replacement.
+That is the right next step because context packs now persist, sync, rank evidence, include graph neighborhoods, surface deterministic risk signals, cite structured diagnostics with exact locations, expose symbol lookup, have safe local symbol replacement, flag several code-health/refactor surfaces, identify Hugr edits that invalidate persisted context, support a first reference-aware rename, and can move unreferenced symbols between files. The remaining semantic gap is rewriting references/imports when moving referenced symbols across files.
