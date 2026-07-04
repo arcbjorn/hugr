@@ -90,6 +90,8 @@ Implemented:
 - `hugr symbols [--json] <query>` and MCP `hugr_symbols` provide a stable read-only symbol lookup surface over exact file/name targets or ranked symbol search
 - `hugr replace-symbol [--json] [--kind <kind>] <path> <symbol>` and MCP `hugr_replace_symbol` safely replace one local indexed symbol after refusing ambiguous targets, renames, kind changes, and replacement bodies that fail to parse
 - `hugr replace-symbol` refreshes the index immediately after a successful edit and records a session edit event when a session is active
+- `hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>` and MCP `hugr_rename_symbol` safely rename one local symbol plus indexed inbound references after refusing ambiguous targets, invalid identifiers, stale reference lines, collisions, and files that fail to parse after the refactor
+- `hugr rename-symbol` refreshes the index immediately after a successful refactor and records a session edit event when a session is active
 - `hugr context` and `hugr_context` include a first code-health risk signal for large indexed symbols using deterministic symbol line ranges
 - `hugr context` and `hugr_context` include cross-file refactor-surface risks when code graph references span multiple files
 - `hugr context` and `hugr_context` include public/exported API surface risks using indexed symbol signatures and incoming reference evidence
@@ -111,7 +113,7 @@ The near-term plan is close to complete, but the broader vision and technical bl
 - Automatic session observation: daemon captures file-change and git/worktree events for active sessions, `hugr run <command>` captures command/test outcomes, `hugr shell-hook <bash|zsh>` can observe ordinary shell command statuses, and daemon indexing captures classified discovery summaries.
 - Session summarization and memory promotion: manual `hugr session promote` summarizes latest session facts into long-term memory, and the daemon periodically promotes ended, unpromoted sessions.
 - Risk and health signals: context packs now include deterministic risks for stale memory conflicts, changed relevant files, missing tests/symbols, graph coupling, public/exported API surfaces, cross-file refactor surfaces, unreferenced private symbols, recent failure facts, index freshness, stale-after-edit context invalidation, recent diagnostic output, structured diagnostics with source locations, and large indexed symbols; deeper complexity and risky paths remain.
-- Semantic operations: read-only CLI/MCP symbol lookup exists; the first safe structural edit helper exists for local symbol replacement with parse and identity checks; broader refactors, reference-aware rename, and multi-file edits remain.
+- Semantic operations: read-only CLI/MCP symbol lookup exists; safe local symbol replacement exists with parse and identity checks; the first reference-aware local rename exists for definitions plus indexed inbound references; broader multi-file structural edits remain.
 - Incremental freshness: watcher-driven invalidation and refresh for file discovery, symbols, graph edges, tests, and context evidence.
 
 ## Runtime Decision
@@ -369,6 +371,7 @@ Implemented first slice:
 - Context packs include local branch, upstream, ahead/behind counts, and worktree changes.
 - Rust, Python, TypeScript, JavaScript/JSX, Go, Java, Kotlin, and Swift symbol extraction use tree-sitter when parsing succeeds, with line-scanner fallback.
 - `hugr replace-symbol` and `hugr_replace_symbol` use indexed symbols plus parser validation to perform the first safe local structural edit.
+- `hugr rename-symbol` and `hugr_rename_symbol` use indexed symbols and code references to safely rename a local definition plus inbound reference lines, then re-index.
 
 Open questions:
 
@@ -575,6 +578,7 @@ Recommended next commits:
 73. Done: `feat(context): flag public api surfaces`
 74. Done: `feat(context): flag unreferenced private symbols`
 75. Done: `feat(context): flag edits after context`
+76. Done: `feat(edit): rename symbols with references`
 
 Each commit should leave the CLI usable.
 
@@ -591,6 +595,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add reference-aware structural refactors.
+Add broader multi-file structural edits.
 
-That is the right next step because context packs now persist, sync, rank evidence, include graph neighborhoods, surface deterministic risk signals, cite structured diagnostics with exact locations, expose symbol lookup, have a first safe local symbol replacement path, flag several code-health/refactor surfaces, and now identify Hugr edits that invalidate persisted context. The remaining semantic gap is broader safe refactoring, especially reference-aware rename and multi-file edits.
+That is the right next step because context packs now persist, sync, rank evidence, include graph neighborhoods, surface deterministic risk signals, cite structured diagnostics with exact locations, expose symbol lookup, have safe local symbol replacement, flag several code-health/refactor surfaces, identify Hugr edits that invalidate persisted context, and now support a first reference-aware rename. The remaining semantic gap is broader safe multi-file editing beyond rename and single-symbol body replacement.
