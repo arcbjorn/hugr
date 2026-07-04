@@ -1537,7 +1537,7 @@ impl Store {
                 Some(SyncTableKind::Sessions) => {
                     apply_api_push_session_records(&conn, &payload.records).await?
                 }
-                Some(_) | None => unsupported_api_table_result(&payload.result),
+                None => unsupported_api_table_result(&payload.result),
             };
             applied_payloads.push(SyncApiTablePayload {
                 result,
@@ -2545,7 +2545,6 @@ async fn api_sync_records_for_table(
         SyncTableKind::Edges => edge_sync_records(conn).await,
         SyncTableKind::CodeReferences => code_reference_sync_records(conn).await,
         SyncTableKind::Sessions => session_sync_records(conn).await,
-        _ => Ok(Vec::new()),
     }
 }
 
@@ -7280,18 +7279,20 @@ mod tests {
             line_start: 9,
             excerpt: "PluginHooks".to_string(),
         };
+        let file = FileCandidate {
+            path: "src/plugin_hooks.rs".to_string(),
+            score: 1,
+            language: Some("rust".to_string()),
+            size_bytes: Some(128),
+        };
         remote
             .store
-            .record_code_index(
-                &[FileCandidate {
-                    path: "src/plugin_hooks.rs".to_string(),
-                    score: 1,
-                    language: Some("rust".to_string()),
-                    size_bytes: Some(128),
-                }],
-                &[symbol],
-                &[reference],
-            )
+            .record_discovered_files(std::slice::from_ref(&file))
+            .await
+            .unwrap();
+        remote
+            .store
+            .record_code_index(std::slice::from_ref(&file), &[symbol], &[reference])
             .await
             .unwrap();
         remote
