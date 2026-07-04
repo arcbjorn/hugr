@@ -395,6 +395,64 @@ fn replace_symbol_edits_local_source_and_refreshes_index() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
+#[test]
+fn rename_symbol_updates_definition_references_and_refreshes_index() {
+    let hugr = env!("CARGO_BIN_EXE_hugr");
+    let workspace = temp_workspace("rename_symbol");
+    let src_dir = workspace.join("src");
+    fs::create_dir_all(&src_dir).expect("src dir should be created");
+    let lib = src_dir.join("lib.rs");
+    let main = src_dir.join("main.rs");
+    fs::write(&lib, "pub fn run_after_config() -> u8 {\n    1\n}\n")
+        .expect("lib source should be written");
+    fs::write(
+        &main,
+        "use crate::lib::run_after_config;\n\nfn main() {\n    let _ = run_after_config();\n}\n",
+    )
+    .expect("main source should be written");
+
+    let init = run_local_hugr(hugr, &workspace, &["init"]);
+    assert!(init.status.success(), "init failed: {init:?}");
+
+    let rename = run_local_hugr(
+        hugr,
+        &workspace,
+        &[
+            "rename-symbol",
+            "--json",
+            "--kind",
+            "function",
+            "src/lib.rs",
+            "run_after_config",
+            "run_before_config",
+        ],
+    );
+    assert!(rename.status.success(), "rename failed: {rename:?}");
+    let rename_json = String::from_utf8(rename.stdout).unwrap();
+    assert!(rename_json.contains("\"old_name\":\"run_after_config\""));
+    assert!(rename_json.contains("\"new_name\":\"run_before_config\""));
+    assert!(rename_json.contains("\"reference_count\":2"));
+
+    let edited_lib = fs::read_to_string(&lib).unwrap();
+    let edited_main = fs::read_to_string(&main).unwrap();
+    assert!(edited_lib.contains("run_before_config"));
+    assert!(!edited_lib.contains("run_after_config"));
+    assert!(edited_main.contains("use crate::lib::run_before_config;"));
+    assert!(edited_main.contains("run_before_config();"));
+    assert!(!edited_main.contains("run_after_config"));
+
+    let symbols = run_local_hugr(
+        hugr,
+        &workspace,
+        &["symbols", "--json", "run_before_config"],
+    );
+    assert!(symbols.status.success(), "symbols failed: {symbols:?}");
+    let symbols_json = String::from_utf8(symbols.stdout).unwrap();
+    assert!(symbols_json.contains("\"name\":\"run_before_config\""));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
 fn run_local_hugr(hugr: &str, dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(hugr)
         .args(args)
