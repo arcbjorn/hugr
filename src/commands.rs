@@ -446,7 +446,12 @@ async fn move_symbol(
         .references_to_symbols(std::slice::from_ref(&target), 2000)
         .await?;
     let reference_files = if rewrite_references {
-        read_reference_files(&references, source_path, destination_path, "hugr move-symbol")?
+        read_reference_files(
+            &references,
+            source_path,
+            destination_path,
+            "hugr move-symbol",
+        )?
     } else {
         Vec::new()
     };
