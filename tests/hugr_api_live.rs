@@ -346,15 +346,27 @@ fn replace_symbol_edits_local_source_and_refreshes_index() {
     assert!(replace_json.contains("\"new_line_end\":6"));
 
     let edited = fs::read_to_string(&source).unwrap();
-    assert!(edited.contains("let value = 42;"), "body not replaced: {edited}");
-    assert!(edited.contains("pub struct Registry;"), "struct clobbered: {edited}");
-    assert!(edited.contains("pub fn other() {}"), "sibling clobbered: {edited}");
+    assert!(
+        edited.contains("let value = 42;"),
+        "body not replaced: {edited}"
+    );
+    assert!(
+        edited.contains("pub struct Registry;"),
+        "struct clobbered: {edited}"
+    );
+    assert!(
+        edited.contains("pub fn other() {}"),
+        "sibling clobbered: {edited}"
+    );
 
     // The index refresh baked into replace-symbol should surface the new line span.
     let symbols = run_local_hugr(hugr, &workspace, &["symbols", "--json", "greet"]);
     assert!(symbols.status.success(), "symbols failed: {symbols:?}");
     let symbols_json = String::from_utf8(symbols.stdout).unwrap();
-    assert!(symbols_json.contains("\"line_end\":6"), "stale index: {symbols_json}");
+    assert!(
+        symbols_json.contains("\"line_end\":6"),
+        "stale index: {symbols_json}"
+    );
 
     // A rename attempt is refused and leaves the file untouched.
     let rename = run_local_hugr(
@@ -370,9 +382,15 @@ fn replace_symbol_edits_local_source_and_refreshes_index() {
     );
     assert!(!rename.status.success(), "rename should fail: {rename:?}");
     let rename_stderr = String::from_utf8(rename.stderr).unwrap();
-    assert!(rename_stderr.contains("does not define"), "unexpected error: {rename_stderr}");
+    assert!(
+        rename_stderr.contains("does not define"),
+        "unexpected error: {rename_stderr}"
+    );
     let after_refusal = fs::read_to_string(&source).unwrap();
-    assert_eq!(after_refusal, edited, "refused edit must not modify the file");
+    assert_eq!(
+        after_refusal, edited,
+        "refused edit must not modify the file"
+    );
 
     let _ = fs::remove_dir_all(&workspace);
 }
