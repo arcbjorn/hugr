@@ -50,7 +50,16 @@ pub async fn execute(command: Command) -> Result<(), String> {
             destination_path,
             kind,
             format,
-        } => move_symbol(&source_path, &name, &destination_path, kind.as_deref(), format).await,
+        } => {
+            move_symbol(
+                &source_path,
+                &name,
+                &destination_path,
+                kind.as_deref(),
+                format,
+            )
+            .await
+        }
         Command::ProjectStatus => project_status().await,
         Command::SessionStart { task } => session_start(&task).await,
         Command::SessionEvent { kind, detail } => session_event(&kind, &detail).await,
