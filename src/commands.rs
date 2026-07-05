@@ -7,6 +7,7 @@ use crate::edit;
 use crate::eval;
 use crate::impact as impact_analysis;
 use crate::indexer;
+use crate::install;
 use crate::mcp;
 use crate::store::{
     DiagnosticInput, ForgetResult, Memory, MemoryConsolidationResult, MemoryMaintenanceReport,
@@ -104,6 +105,8 @@ pub async fn execute(command: Command) -> Result<(), String> {
             })
             .await
         }
+        Command::Install { agent, shared } => install::install(&agent, shared),
+        Command::Hook { agent, event } => install::hook(&agent, &event).await,
         Command::Doctor => doctor().await,
         Command::Help => {
             print!("{}", help_text());

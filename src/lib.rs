@@ -9,6 +9,7 @@ mod embedding;
 mod eval;
 mod impact;
 mod indexer;
+mod install;
 mod mcp;
 mod migrations;
 mod store;

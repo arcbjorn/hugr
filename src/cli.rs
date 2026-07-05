@@ -107,6 +107,14 @@ pub enum Command {
         min_hit_rate: Option<String>,
         format: OutputFormat,
     },
+    Install {
+        agent: String,
+        shared: bool,
+    },
+    Hook {
+        agent: String,
+        event: String,
+    },
     Doctor,
     Help,
 }
@@ -199,6 +207,8 @@ impl Command {
                 })
             }
             "eval" => parse_eval_command(args),
+            "install" => parse_install_command(args),
+            "hook" => parse_hook_command(args),
             "doctor" => Ok(Self::Doctor),
             "help" | "--help" | "-h" => Ok(Self::Help),
             unknown => Err(format!("unknown command '{unknown}'")),
@@ -846,8 +856,39 @@ fn parse_positive_usize(value: Option<&String>, flag: &str) -> Result<usize, Str
     Ok(parsed)
 }
 
+fn parse_install_command(args: &[String]) -> Result<Command, String> {
+    let mut agent = None;
+    let mut shared = false;
+
+    for arg in args.iter().skip(2) {
+        match arg.as_str() {
+            "--shared" => shared = true,
+            value if !value.starts_with("--") && agent.is_none() => {
+                agent = Some(value.to_string());
+            }
+            unknown => return Err(format!("unknown install option '{unknown}'")),
+        }
+    }
+
+    let agent =
+        agent.ok_or("install requires an agent: hugr install <claude-code|cursor> [--shared]")?;
+    Ok(Command::Install { agent, shared })
+}
+
+fn parse_hook_command(args: &[String]) -> Result<Command, String> {
+    let agent = args
+        .get(2)
+        .cloned()
+        .ok_or("hook requires an agent, e.g. hugr hook claude-code <event>")?;
+    let event = args
+        .get(3)
+        .cloned()
+        .ok_or("hook requires an event, e.g. hugr hook claude-code post-tool-use")?;
+    Ok(Command::Hook { agent, event })
+}
+
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index [--paths <p1,p2,...>]\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr replace-symbol [--json] [--kind <kind>] <path> <symbol> (--body <source> | --body-file <path>)\n  hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>\n  hugr move-symbol [--json] [--kind <kind>] [--rewrite-references] <source-path> <symbol> <destination-path>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr eval [--json] [--from-git <n>] [--max-files <n>] [--min-hit-rate <0.0-1.0>]\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index [--paths <p1,p2,...>]\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr replace-symbol [--json] [--kind <kind>] <path> <symbol> (--body <source> | --body-file <path>)\n  hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>\n  hugr move-symbol [--json] [--kind <kind>] [--rewrite-references] <source-path> <symbol> <destination-path>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr eval [--json] [--from-git <n>] [--max-files <n>] [--min-hit-rate <0.0-1.0>]\n  hugr install <claude-code|cursor> [--shared]\n  hugr doctor\n"
 }
 
 #[cfg(test)]
