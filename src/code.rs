@@ -132,6 +132,7 @@ pub(crate) fn extract_references(
 
     let declaration_lines = declaration_line_set(&targets);
     let (targets_by_name, irregular_targets) = index_targets_by_name(&targets);
+    let ambiguous_groups = ambiguous_name_groups(&targets);
 
     let mut references = Vec::new();
     let mut seen = HashSet::new();
@@ -153,6 +154,8 @@ pub(crate) fn extract_references(
             continue;
         };
 
+        let resolutions = ambiguous_resolutions(&file.path, &contents, &targets, &ambiguous_groups);
+
         for (index, line) in contents.lines().enumerate() {
             let line_number = i64::try_from(index + 1).map_err(|error| error.to_string())?;
             let trimmed = line.trim();
@@ -164,6 +167,11 @@ pub(crate) fn extract_references(
                 matched_target_indices(trimmed, &targets, &targets_by_name, &irregular_targets)
             {
                 let target = &targets[target_index];
+                if let Some(resolution) = resolutions.get(target.name.as_str()) {
+                    if !resolution.allows(trimmed, target_index, &target.name) {
+                        continue;
+                    }
+                }
                 if declaration_lines.contains(&(
                     file.path.as_str(),
                     target.name.as_str(),
@@ -1435,6 +1443,93 @@ fn reference_kind(line: &str, target: &CodeSymbol) -> String {
     }
 }
 
+/// How references to a symbol name defined in more than one file resolve
+/// within one referencing file. Local definitions shadow foreign ones for
+/// plain references, import evidence narrows the rest, and member calls keep
+/// every candidate because the receiver type is unknown to a text scan.
+struct AmbiguousResolution {
+    locals: Vec<usize>,
+    imported: Vec<usize>,
+}
+
+impl AmbiguousResolution {
+    fn allows(&self, line: &str, target_index: usize, name: &str) -> bool {
+        if contains_member_call(line, name) {
+            return true;
+        }
+        if !self.locals.is_empty() {
+            return self.locals.contains(&target_index);
+        }
+        if !self.imported.is_empty() {
+            return self.imported.contains(&target_index);
+        }
+        true
+    }
+}
+
+fn ambiguous_name_groups(targets: &[CodeSymbol]) -> HashMap<&str, Vec<usize>> {
+    let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, target) in targets.iter().enumerate() {
+        groups.entry(target.name.as_str()).or_default().push(index);
+    }
+    groups.retain(|_, indices| indices.len() > 1);
+    groups
+}
+
+fn ambiguous_resolutions<'targets>(
+    file_path: &str,
+    contents: &str,
+    targets: &'targets [CodeSymbol],
+    groups: &HashMap<&'targets str, Vec<usize>>,
+) -> HashMap<&'targets str, AmbiguousResolution> {
+    if groups.is_empty() {
+        return HashMap::new();
+    }
+
+    let import_lines = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| is_import_line(line))
+        .collect::<Vec<_>>();
+
+    groups
+        .iter()
+        .map(|(name, group)| {
+            let locals = group
+                .iter()
+                .copied()
+                .filter(|&index| targets[index].path == file_path)
+                .collect::<Vec<_>>();
+            let imported = group
+                .iter()
+                .copied()
+                .filter(|&index| target_import_evidence(&import_lines, &targets[index]))
+                .collect::<Vec<_>>();
+            (*name, AmbiguousResolution { locals, imported })
+        })
+        .collect()
+}
+
+/// File stems too generic to identify a module in an import line; a bare-name
+/// check is useless here because every group member shares the name, so the
+/// stem is the only discriminating evidence.
+const GENERIC_FILE_STEMS: &[&str] = &["main", "index", "types", "utils"];
+
+fn target_import_evidence(import_lines: &[&str], target: &CodeSymbol) -> bool {
+    let stem = file_stem(&target.path);
+    if stem.len() < 4 || GENERIC_FILE_STEMS.contains(&stem) {
+        return false;
+    }
+    import_lines
+        .iter()
+        .any(|line| contains_identifier(line, stem))
+}
+
+fn file_stem(path: &str) -> &str {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.split('.').next().unwrap_or(name)
+}
+
 fn declaration_line_set(targets: &[CodeSymbol]) -> HashSet<(&str, &str, &str, i64)> {
     targets
         .iter()
@@ -2488,6 +2583,150 @@ fn main() {
                 && reference.target_name == "run_after_config"
                 && reference.kind == "call"
         }));
+    }
+
+    fn ambiguous_project(name: &str) -> TempProject {
+        let project = TempProject::new(name);
+        project.write(
+            "src/defs_a.rs",
+            "pub fn provider_symbol() -> i32 {\n    1\n}\n",
+        );
+        project.write(
+            "src/defs_b.rs",
+            "pub fn provider_symbol() -> i32 {\n    2\n}\n",
+        );
+        project
+    }
+
+    fn ambiguous_files(extra: &str) -> Vec<FileCandidate> {
+        vec![
+            candidate("src/defs_a.rs"),
+            candidate("src/defs_b.rs"),
+            candidate(extra),
+        ]
+    }
+
+    fn caller_targets<'refs>(references: &'refs [CodeReference], path: &str) -> Vec<&'refs str> {
+        let mut targets = references
+            .iter()
+            .filter(|reference| {
+                reference.path == path && reference.target_name == "provider_symbol"
+            })
+            .map(|reference| reference.target_path.as_str())
+            .collect::<Vec<_>>();
+        targets.sort_unstable();
+        targets.dedup();
+        targets
+    }
+
+    #[test]
+    fn resolves_ambiguous_references_with_import_evidence() {
+        let project = ambiguous_project("ambiguous_import");
+        project.write(
+            "src/caller.rs",
+            "use crate::defs_a::provider_symbol;\n\npub fn run() -> i32 {\n    provider_symbol()\n}\n",
+        );
+        let files = ambiguous_files("src/caller.rs");
+        let symbols = index_files(project.root(), &files).unwrap();
+
+        let references = extract_references(project.root(), &files, &symbols).unwrap();
+
+        assert_eq!(
+            caller_targets(&references, "src/caller.rs"),
+            vec!["src/defs_a.rs"],
+            "import evidence should keep only the imported definition"
+        );
+    }
+
+    #[test]
+    fn resolves_typescript_ambiguity_with_relative_imports() {
+        let project = TempProject::new("ambiguous_ts");
+        project.write(
+            "src/defs_a.ts",
+            "export function provider_symbol(): number {\n  return 1;\n}\n",
+        );
+        project.write(
+            "src/defs_b.ts",
+            "export function provider_symbol(): number {\n  return 2;\n}\n",
+        );
+        project.write(
+            "src/caller.ts",
+            "import { provider_symbol } from \"./defs_a\";\n\nexport function run(): number {\n  return provider_symbol();\n}\n",
+        );
+        let files = ["src/defs_a.ts", "src/defs_b.ts", "src/caller.ts"]
+            .iter()
+            .map(|path| FileCandidate {
+                path: (*path).to_string(),
+                score: 0,
+                language: Some("typescript".to_string()),
+                size_bytes: None,
+            })
+            .collect::<Vec<_>>();
+        let symbols = index_files(project.root(), &files).unwrap();
+
+        let references = extract_references(project.root(), &files, &symbols).unwrap();
+
+        assert_eq!(
+            caller_targets(&references, "src/caller.ts"),
+            vec!["src/defs_a.ts"]
+        );
+    }
+
+    #[test]
+    fn keeps_all_ambiguous_candidates_without_import_evidence() {
+        let project = ambiguous_project("ambiguous_bare");
+        project.write(
+            "src/caller.rs",
+            "pub fn run() -> i32 {\n    provider_symbol()\n}\n",
+        );
+        let files = ambiguous_files("src/caller.rs");
+        let symbols = index_files(project.root(), &files).unwrap();
+
+        let references = extract_references(project.root(), &files, &symbols).unwrap();
+
+        assert_eq!(
+            caller_targets(&references, "src/caller.rs"),
+            vec!["src/defs_a.rs", "src/defs_b.rs"],
+            "no evidence means both candidates stay"
+        );
+    }
+
+    #[test]
+    fn local_definitions_shadow_ambiguous_candidates() {
+        let project = ambiguous_project("ambiguous_local");
+        project.write(
+            "src/caller.rs",
+            "fn provider_symbol() -> i32 {\n    3\n}\n\npub fn run() -> i32 {\n    provider_symbol()\n}\n",
+        );
+        let files = ambiguous_files("src/caller.rs");
+        let symbols = index_files(project.root(), &files).unwrap();
+
+        let references = extract_references(project.root(), &files, &symbols).unwrap();
+
+        assert_eq!(
+            caller_targets(&references, "src/caller.rs"),
+            vec!["src/caller.rs"],
+            "a local definition shadows same-named foreign definitions"
+        );
+    }
+
+    #[test]
+    fn member_calls_keep_all_ambiguous_candidates() {
+        let project = ambiguous_project("ambiguous_member");
+        project.write(
+            "src/caller.rs",
+            "pub fn run(client: &Client) -> i32 {\n    client.provider_symbol()\n}\n",
+        );
+        let files = ambiguous_files("src/caller.rs");
+        let symbols = index_files(project.root(), &files).unwrap();
+
+        let references = extract_references(project.root(), &files, &symbols).unwrap();
+
+        assert_eq!(
+            caller_targets(&references, "src/caller.rs"),
+            vec!["src/defs_a.rs", "src/defs_b.rs"],
+            "member calls cannot be resolved by text and keep every candidate"
+        );
     }
 
     #[test]
