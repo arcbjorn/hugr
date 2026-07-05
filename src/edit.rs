@@ -694,9 +694,13 @@ fn plan_java_same_package_type_reference_awareness(
         )
     })?;
     if source_package != destination_package {
-        return Err(format!(
-            "move-symbol --rewrite-references requires Java source and destination files to share package '{source_package}'"
-        ));
+        return plan_java_cross_package_reference_rewrites(
+            target,
+            &source_package,
+            &destination_package,
+            references_by_path,
+            reference_contents,
+        );
     }
 
     for (path, references) in references_by_path {
@@ -736,6 +740,171 @@ fn plan_java_same_package_type_reference_awareness(
     }
 
     Ok(PlannedReferenceRewrite::default())
+}
+
+/// Rewrites Java `import` statements when a type declaration moves to a
+/// different package: a referencing file in the source package gains
+/// `import <new_pkg>.<Type>;`, a file elsewhere that imported the old path has
+/// it rewritten, and a file already in the destination package drops the now-
+/// redundant import. Refuses wildcard imports it cannot rewrite safely.
+fn plan_java_cross_package_reference_rewrites(
+    target: &CodeSymbol,
+    source_package: &str,
+    destination_package: &str,
+    references_by_path: BTreeMap<String, Vec<CodeReference>>,
+    reference_contents: BTreeMap<String, String>,
+) -> Result<PlannedReferenceRewrite, String> {
+    let old_import = format!("{source_package}.{}", target.name);
+    let new_import = format!("{destination_package}.{}", target.name);
+
+    let mut files = Vec::new();
+    let mut changed_files = Vec::new();
+    let mut rewritten_reference_count = 0;
+
+    for (path, references) in references_by_path {
+        let Some(contents) = reference_contents.get(&path) else {
+            return Err(format!(
+                "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
+            ));
+        };
+        if !code::parses_cleanly(&path, language_for_path(&path), contents)? {
+            return Err(format!(
+                "referencing file {path} is not valid Java code; refusing to trust stale references"
+            ));
+        }
+        if java_has_wildcard_import(contents, source_package) {
+            return Err(format!(
+                "move-symbol --rewrite-references cannot safely rewrite a Java wildcard import of '{source_package}.*' in {path}"
+            ));
+        }
+
+        for reference in &references {
+            let line = line_at(contents, reference.line_start).ok_or_else(|| {
+                format!(
+                    "move-symbol reference line {} is past end of {path}",
+                    reference.line_start
+                )
+            })?;
+            let (_line, matches) = replace_identifier_in_line(line, &target.name, &target.name);
+            if matches == 0 {
+                return Err(format!(
+                    "move-symbol --rewrite-references could not verify Java reference '{}' on {path}:{}; rerun hugr index",
+                    target.name, reference.line_start
+                ));
+            }
+        }
+
+        let reference_package = java_package_name(contents).ok_or_else(|| {
+            format!("move-symbol --rewrite-references cannot determine Java package for {path}")
+        })?;
+        let (rewritten, changes) = java_rewrite_import_for_move(
+            contents,
+            &old_import,
+            &new_import,
+            reference_package == destination_package,
+        )
+        .ok_or_else(|| {
+            format!(
+                "move-symbol --rewrite-references could not update the Java import for '{}' in {path}",
+                target.name
+            )
+        })?;
+        if changes == 0 {
+            return Err(format!(
+                "move-symbol --rewrite-references made no Java import change in {path}"
+            ));
+        }
+        if !code::parses_cleanly(&path, language_for_path(&path), &rewritten)? {
+            return Err(format!(
+                "referencing file {path} would not parse after moving '{}'",
+                target.name
+            ));
+        }
+        rewritten_reference_count += references.len();
+        files.push(PlannedMoveFile {
+            path: path.clone(),
+            contents: rewritten,
+        });
+        changed_files.push(SymbolMoveFile {
+            path,
+            action: "rewrote imports".to_string(),
+        });
+    }
+
+    Ok(PlannedReferenceRewrite {
+        files,
+        changed_files,
+        rewritten_reference_count,
+    })
+}
+
+fn java_has_wildcard_import(contents: &str, package: &str) -> bool {
+    let wildcard = format!("{package}.*");
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("import ") else {
+            continue;
+        };
+        let rest = rest.trim_end_matches(';').trim();
+        let rest = rest.strip_prefix("static ").unwrap_or(rest).trim();
+        if rest == wildcard {
+            return true;
+        }
+    }
+    false
+}
+
+fn java_rewrite_import_for_move(
+    contents: &str,
+    old_import: &str,
+    new_import: &str,
+    reference_in_destination_package: bool,
+) -> Option<(String, usize)> {
+    let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
+    let existing = lines.iter().position(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("import ")
+            .map(|rest| rest.trim_end_matches(';').trim() == old_import)
+            .unwrap_or(false)
+    });
+
+    if reference_in_destination_package {
+        if let Some(index) = existing {
+            lines.remove(index);
+            return Some((join_lines(&lines, contents), 1));
+        }
+        return Some((contents.to_string(), 0));
+    }
+
+    if let Some(index) = existing {
+        lines[index] = format!("import {new_import};");
+        return Some((join_lines(&lines, contents), 1));
+    }
+
+    let insert_at = java_import_insertion_index(&lines);
+    lines.insert(insert_at, format!("import {new_import};"));
+    Some((join_lines(&lines, contents), 1))
+}
+
+fn java_import_insertion_index(lines: &[String]) -> usize {
+    let mut last_import = None;
+    let mut package_line = None;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("import ") {
+            last_import = Some(index);
+        } else if trimmed.starts_with("package ") {
+            package_line = Some(index);
+        }
+    }
+    if let Some(index) = last_import {
+        index + 1
+    } else if let Some(index) = package_line {
+        index + 1
+    } else {
+        0
+    }
 }
 
 fn java_reference_safe_kind(kind: &str) -> bool {
@@ -4053,6 +4222,116 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("only for type declarations"), "{error}");
+    }
+
+    #[test]
+    fn rewrites_foreign_package_import_on_java_cross_package_move() {
+        let source = "package plugin;\n\npublic class Helper {}\n";
+        let destination = "package other;\n\nclass Existing {}\n";
+        let caller = "package app;\n\nimport plugin.Helper;\n\nclass Caller {\n    Helper helper = new Helper();\n}\n";
+        let target =
+            resolve_symbol_in_source("src/plugin/Helper.java", source, "Helper", None, "move")
+                .unwrap();
+        let references = vec![CodeReference {
+            path: "src/app/Caller.java".to_string(),
+            language: Some("java".to_string()),
+            target_path: "src/plugin/Helper.java".to_string(),
+            target_name: "Helper".to_string(),
+            target_kind: "class".to_string(),
+            kind: "instantiation".to_string(),
+            line_start: 6,
+            excerpt: "Helper helper = new Helper();".to_string(),
+        }];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "src/other/Helper.java",
+            destination,
+            vec![("src/app/Caller.java".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+
+        let rewritten = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/app/Caller.java")
+            .unwrap();
+        assert!(rewritten.contents.contains("import other.Helper;"));
+        assert!(!rewritten.contents.contains("import plugin.Helper;"));
+    }
+
+    #[test]
+    fn inserts_import_for_source_package_referencer_on_java_cross_package_move() {
+        let source = "package plugin;\n\npublic class Helper {}\n";
+        let destination = "package other;\n\nclass Existing {}\n";
+        let caller = "package plugin;\n\nclass Caller {\n    Helper helper = new Helper();\n}\n";
+        let target =
+            resolve_symbol_in_source("src/plugin/Helper.java", source, "Helper", None, "move")
+                .unwrap();
+        let references = vec![CodeReference {
+            path: "src/plugin/Caller.java".to_string(),
+            language: Some("java".to_string()),
+            target_path: "src/plugin/Helper.java".to_string(),
+            target_name: "Helper".to_string(),
+            target_kind: "class".to_string(),
+            kind: "instantiation".to_string(),
+            line_start: 4,
+            excerpt: "Helper helper = new Helper();".to_string(),
+        }];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "src/other/Helper.java",
+            destination,
+            vec![("src/plugin/Caller.java".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+
+        let rewritten = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/plugin/Caller.java")
+            .unwrap();
+        assert!(rewritten.contents.contains("import other.Helper;"));
+    }
+
+    #[test]
+    fn rejects_wildcard_import_on_java_cross_package_move() {
+        let source = "package plugin;\n\npublic class Helper {}\n";
+        let destination = "package other;\n\nclass Existing {}\n";
+        let caller = "package app;\n\nimport plugin.*;\n\nclass Caller {\n    Helper helper = new Helper();\n}\n";
+        let target =
+            resolve_symbol_in_source("src/plugin/Helper.java", source, "Helper", None, "move")
+                .unwrap();
+        let references = vec![CodeReference {
+            path: "src/app/Caller.java".to_string(),
+            language: Some("java".to_string()),
+            target_path: "src/plugin/Helper.java".to_string(),
+            target_name: "Helper".to_string(),
+            target_kind: "class".to_string(),
+            kind: "instantiation".to_string(),
+            line_start: 6,
+            excerpt: "Helper helper = new Helper();".to_string(),
+        }];
+
+        let error = plan_move(
+            &target,
+            &references,
+            source,
+            "src/other/Helper.java",
+            destination,
+            vec![("src/app/Caller.java".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("wildcard import"), "{error}");
     }
 
     #[test]
