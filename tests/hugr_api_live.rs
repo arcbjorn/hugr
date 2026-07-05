@@ -565,6 +565,62 @@ fn move_symbol_rewrites_supported_references_and_refreshes_index() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
+#[test]
+fn move_symbol_rewrites_nested_and_aliased_rust_references() {
+    let hugr = env!("CARGO_BIN_EXE_hugr");
+    let workspace = temp_workspace("move_symbol_nested_alias");
+    let src_dir = workspace.join("src");
+    fs::create_dir_all(&src_dir).expect("src dir should be created");
+    let source = src_dir.join("plugin_hooks.rs");
+    let destination = src_dir.join("helpers.rs");
+    let main = src_dir.join("main.rs");
+    fs::write(
+        &source,
+        "pub fn helper() -> u8 {\n    1\n}\n\npub fn other() {}\n",
+    )
+    .expect("source file should be written");
+    fs::write(&destination, "pub fn existing() {}\n").expect("destination should be written");
+    fs::write(
+        &main,
+        "use crate::{config::Settings, plugin_hooks::{helper as run_helper, other}, plugin_hooks as hooks};\n\nfn main() {\n    let _ = run_helper();\n    let _ = hooks::helper();\n}\n",
+    )
+    .expect("main source should be written");
+
+    let init = run_local_hugr(hugr, &workspace, &["init"]);
+    assert!(init.status.success(), "init failed: {init:?}");
+
+    let moved = run_local_hugr(
+        hugr,
+        &workspace,
+        &[
+            "move-symbol",
+            "--json",
+            "--rewrite-references",
+            "--kind",
+            "function",
+            "src/plugin_hooks.rs",
+            "helper",
+            "src/helpers.rs",
+        ],
+    );
+    assert!(moved.status.success(), "move failed: {moved:?}");
+    let moved_json = String::from_utf8(moved.stdout).unwrap();
+    assert!(moved_json.contains("\"rewritten_reference_count\":2"));
+
+    let edited_main = fs::read_to_string(&main).unwrap();
+    assert!(
+        edited_main.contains(
+            "use crate::{config::Settings, plugin_hooks::{other}, plugin_hooks as hooks};"
+        )
+    );
+    assert!(edited_main.contains("use crate::helpers::{helper as run_helper};"));
+    assert!(edited_main.contains("run_helper();"));
+    assert!(edited_main.contains("crate::helpers::helper();"));
+    assert!(!edited_main.contains("hooks::helper"));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
 fn run_local_hugr(hugr: &str, dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(hugr)
         .args(args)
