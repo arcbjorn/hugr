@@ -1044,6 +1044,95 @@ fn index_prunes_symbols_for_deleted_files() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
+#[test]
+fn incremental_index_refreshes_only_changed_paths() {
+    let hugr = env!("CARGO_BIN_EXE_hugr");
+    let workspace = temp_workspace("incremental_index");
+    let src_dir = workspace.join("src");
+    fs::create_dir_all(&src_dir).expect("src dir should be created");
+    let defs = src_dir.join("defs.rs");
+    let caller = src_dir.join("caller.rs");
+    // defs defines `provider_symbol`; caller references it. Only defs will change.
+    fs::write(&defs, "pub fn provider_symbol() -> i32 {\n    1\n}\n").expect("defs written");
+    fs::write(
+        &caller,
+        "pub fn use_provider() -> i32 {\n    provider_symbol()\n}\n",
+    )
+    .expect("caller written");
+
+    let init = run_local_hugr(hugr, &workspace, &["init"]);
+    assert!(init.status.success(), "init failed: {init:?}");
+    let first_index = run_local_hugr(hugr, &workspace, &["index"]);
+    assert!(
+        first_index.status.success(),
+        "full index failed: {first_index:?}"
+    );
+
+    // Sanity: the inbound reference from caller to provider_symbol is indexed.
+    let impact_before = run_local_hugr(hugr, &workspace, &["impact", "--json", "provider_symbol"]);
+    assert!(impact_before.status.success());
+    let impact_before_json = String::from_utf8(impact_before.stdout).unwrap();
+    assert!(
+        impact_before_json.contains("src/caller.rs"),
+        "expected inbound reference indexed: {impact_before_json}"
+    );
+
+    // Rename the provider symbol in defs.rs only. caller.rs is untouched, so its
+    // reference to the old name becomes dangling and must be re-extracted away
+    // by the incremental refresh (caller is an inbound-reference source).
+    fs::write(&defs, "pub fn provider_symbol_v2() -> i32 {\n    2\n}\n").expect("defs rewritten");
+
+    let incremental = run_local_hugr(hugr, &workspace, &["index", "--paths", "src/defs.rs"]);
+    assert!(
+        incremental.status.success(),
+        "incremental index failed: {incremental:?}"
+    );
+    let incremental_text = String::from_utf8(incremental.stdout).unwrap();
+    assert!(
+        incremental_text.contains("reparsed 1 files"),
+        "expected single-file reparse: {incremental_text}"
+    );
+    // caller is re-scanned as an inbound source, so reference_files > 1.
+    assert!(
+        incremental_text.contains("rescanned 2 reference files"),
+        "expected inbound source rescanned: {incremental_text}"
+    );
+
+    // New symbol name is indexed.
+    let new_symbols = run_local_hugr(
+        hugr,
+        &workspace,
+        &["symbols", "--json", "provider_symbol_v2"],
+    );
+    assert!(new_symbols.status.success());
+    let new_symbols_json = String::from_utf8(new_symbols.stdout).unwrap();
+    assert!(
+        new_symbols_json.contains("src/defs.rs"),
+        "renamed symbol should be indexed: {new_symbols_json}"
+    );
+
+    // Old symbol name is gone from the symbol index.
+    let old_symbols = run_local_hugr(hugr, &workspace, &["symbols", "--json", "provider_symbol"]);
+    assert!(old_symbols.status.success());
+    let old_symbols_json = String::from_utf8(old_symbols.stdout).unwrap();
+    assert!(
+        !old_symbols_json.contains("\"name\":\"provider_symbol\""),
+        "old symbol should be pruned from index: {old_symbols_json}"
+    );
+
+    // The dangling inbound reference from caller.rs to the old name is gone,
+    // proving the inbound-reference source was correctly re-scanned.
+    let impact_after = run_local_hugr(hugr, &workspace, &["impact", "--json", "provider_symbol"]);
+    assert!(impact_after.status.success());
+    let impact_after_json = String::from_utf8(impact_after.stdout).unwrap();
+    assert!(
+        !impact_after_json.contains("src/caller.rs"),
+        "dangling inbound reference should be re-extracted away: {impact_after_json}"
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
 fn run_local_hugr(hugr: &str, dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(hugr)
         .args(args)
