@@ -12,6 +12,8 @@ const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 4000;
 const LARGE_SYMBOL_LINE_THRESHOLD: i64 = 80;
 const VERY_LARGE_SYMBOL_LINE_THRESHOLD: i64 = 200;
 const REFACTOR_SURFACE_FILE_THRESHOLD: usize = 3;
+const LONG_PARAMETER_LIST_THRESHOLD: usize = 5;
+const VERY_LONG_PARAMETER_LIST_THRESHOLD: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextPack {
@@ -1384,6 +1386,10 @@ fn build_risk_signals(
         signals.push(signal);
     }
 
+    if let Some(signal) = long_parameter_list_signal(symbols) {
+        signals.push(signal);
+    }
+
     let edit_after_context = freshness_signals
         .iter()
         .filter(|signal| signal.kind == "edit_after_context")
@@ -1784,6 +1790,100 @@ fn large_symbol_health_signal(symbols: &[ContextSymbol]) -> Option<ContextRiskSi
         690 + bounded_span + large_symbols.len() * 15,
         "indexed symbol line ranges exceed deterministic size threshold",
     ))
+}
+
+/// Flags callable symbols whose signatures declare many parameters, a
+/// deterministic complexity smell that makes call sites error-prone and often
+/// signals low cohesion. Parameter counts come from the indexed signature, so
+/// no extra parsing is needed.
+fn long_parameter_list_signal(symbols: &[ContextSymbol]) -> Option<ContextRiskSignal> {
+    let mut wide_symbols = symbols
+        .iter()
+        .filter(|symbol| symbol.kind == "function" || symbol.kind == "method")
+        .filter_map(|symbol| {
+            let count = count_signature_parameters(&symbol.signature)?;
+            (count >= LONG_PARAMETER_LIST_THRESHOLD).then_some((count, symbol))
+        })
+        .collect::<Vec<_>>();
+    if wide_symbols.is_empty() {
+        return None;
+    }
+
+    wide_symbols.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.path.cmp(&right.1.path))
+            .then_with(|| left.1.name.cmp(&right.1.name))
+    });
+
+    let highest_count = wide_symbols.first().map(|(count, _)| *count)?;
+    let summaries = wide_symbols
+        .iter()
+        .map(|(count, symbol)| {
+            format!(
+                "{} {} takes {count} parameters at {}:{}",
+                symbol.kind, symbol.name, symbol.path, symbol.line_start
+            )
+        })
+        .collect::<Vec<_>>();
+    let severity = if highest_count >= VERY_LONG_PARAMETER_LIST_THRESHOLD {
+        "medium"
+    } else {
+        "low"
+    };
+
+    Some(context_risk_signal(
+        severity,
+        "long_parameter_list",
+        format!(
+            "functions with long parameter lists are error-prone to call and edit: {}",
+            summarize_values(&summaries, 3)
+        ),
+        650 + highest_count * 10 + wide_symbols.len() * 10,
+        "indexed signature declares parameter count above deterministic threshold",
+    ))
+}
+
+/// Counts the top-level parameters in a callable signature by scanning the text
+/// between its outermost parentheses and splitting on commas at bracket depth
+/// zero, so generics like `Map<K, V>` and nested calls count as one parameter.
+/// Returns None when no parameter list is found, and 0 for an empty `()`.
+fn count_signature_parameters(signature: &str) -> Option<usize> {
+    let open = signature.find('(')?;
+    let bytes = signature.as_bytes();
+    let mut depth = 0i32;
+    let mut angle = 0i32;
+    let mut params = 0usize;
+    let mut saw_content = false;
+    let mut index = open;
+    while index < bytes.len() {
+        let ch = bytes[index] as char;
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    // Closed the outermost parameter list.
+                    break;
+                }
+            }
+            '<' => angle += 1,
+            '>' => angle = (angle - 1).max(0),
+            ',' if depth == 1 && angle == 0 => {
+                params += 1;
+            }
+            c if !c.is_whitespace() && depth == 1 => saw_content = true,
+            _ => {}
+        }
+        index += 1;
+    }
+
+    if !saw_content {
+        // Empty parameter list `()`.
+        return Some(0);
+    }
+    Some(params + 1)
 }
 
 fn context_risk_signal(
@@ -2395,7 +2495,7 @@ fn change_label(file: &ContextChangedFile) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContextPack, json_string};
+    use super::{ContextPack, count_signature_parameters, json_string};
     use crate::code::CodeSymbol;
     use crate::discovery::FileCandidate;
     use crate::store::{
@@ -2843,6 +2943,91 @@ mod tests {
         assert!(risk_kinds.contains(&"large_symbol"));
         assert!(markdown.contains("risk:large_symbol [risk]"));
         assert!(markdown.contains("function run_after_config spans 94 lines"));
+    }
+
+    #[test]
+    fn counts_signature_parameters_across_shapes() {
+        assert_eq!(count_signature_parameters("fn f()"), Some(0));
+        assert_eq!(count_signature_parameters("fn f(a: i32)"), Some(1));
+        assert_eq!(count_signature_parameters("fn f(a: i32, b: i32)"), Some(2));
+        // Generics with internal commas count as one parameter.
+        assert_eq!(
+            count_signature_parameters("fn f(map: Map<K, V>, count: usize)"),
+            Some(2)
+        );
+        // Nested call/default with commas inside parens counts as one.
+        assert_eq!(
+            count_signature_parameters("def f(a, b=make(1, 2), c)"),
+            Some(3)
+        );
+        // No parameter list at all.
+        assert_eq!(count_signature_parameters("class Foo"), None);
+    }
+
+    #[test]
+    fn long_parameter_lists_render_as_code_health_risks() {
+        let pack = ContextPack::with_sessions_symbols_tests_and_branch(
+            "refactor plugin hooks",
+            vec!["src/plugin_hooks.rs".to_string()],
+            Vec::new(),
+            Vec::new(),
+            vec![CodeSymbol {
+                path: "src/plugin_hooks.rs".to_string(),
+                language: Some("rust".to_string()),
+                name: "configure".to_string(),
+                kind: "function".to_string(),
+                line_start: 12,
+                line_end: Some(20),
+                signature: "pub fn configure(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32)"
+                    .to_string(),
+            }],
+            Vec::new(),
+            None,
+        );
+
+        let markdown = pack.render_markdown();
+        let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
+        let risk_kinds = parsed["risk_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|risk| risk["kind"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(risk_kinds.contains(&"long_parameter_list"));
+        assert!(markdown.contains("risk:long_parameter_list [risk]"));
+        assert!(markdown.contains("function configure takes 6 parameters"));
+    }
+
+    #[test]
+    fn short_parameter_lists_do_not_flag_health_risk() {
+        let pack = ContextPack::with_sessions_symbols_tests_and_branch(
+            "refactor plugin hooks",
+            vec!["src/plugin_hooks.rs".to_string()],
+            Vec::new(),
+            Vec::new(),
+            vec![CodeSymbol {
+                path: "src/plugin_hooks.rs".to_string(),
+                language: Some("rust".to_string()),
+                name: "small".to_string(),
+                kind: "function".to_string(),
+                line_start: 12,
+                line_end: Some(14),
+                signature: "pub fn small(a: i32, b: i32)".to_string(),
+            }],
+            Vec::new(),
+            None,
+        );
+
+        let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
+        let risk_kinds = parsed["risk_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|risk| risk["kind"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(!risk_kinds.contains(&"long_parameter_list"));
     }
 
     #[test]
