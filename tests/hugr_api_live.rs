@@ -865,6 +865,120 @@ fn move_symbol_allows_java_same_package_type_references_and_refreshes_index() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
+#[test]
+fn move_symbol_allows_kotlin_same_package_type_references_and_refreshes_index() {
+    let hugr = env!("CARGO_BIN_EXE_hugr");
+    let workspace = temp_workspace("move_symbol_kotlin_same_package");
+    let pkg_dir = workspace.join("src/plugin");
+    fs::create_dir_all(&pkg_dir).expect("package dir should be created");
+    let source = pkg_dir.join("Hooks.kt");
+    let destination = pkg_dir.join("Helper.kt");
+    let caller = pkg_dir.join("Caller.kt");
+    fs::write(
+        &source,
+        "package plugin\n\nclass Helper {\n    fun value(): Int = 1\n}\n\nclass Other\n",
+    )
+    .expect("source file should be written");
+    fs::write(&destination, "package plugin\n\nclass Existing\n")
+        .expect("destination should be written");
+    fs::write(
+        &caller,
+        "package plugin\n\nclass Caller {\n    val helper = Helper()\n}\n",
+    )
+    .expect("caller should be written");
+
+    let init = run_local_hugr(hugr, &workspace, &["init"]);
+    assert!(init.status.success(), "init failed: {init:?}");
+
+    let moved = run_local_hugr(
+        hugr,
+        &workspace,
+        &[
+            "move-symbol",
+            "--json",
+            "--rewrite-references",
+            "--kind",
+            "class",
+            "src/plugin/Hooks.kt",
+            "Helper",
+            "src/plugin/Helper.kt",
+        ],
+    );
+    assert!(moved.status.success(), "move failed: {moved:?}");
+    let moved_json = String::from_utf8(moved.stdout).unwrap();
+    assert!(moved_json.contains("\"rewritten_reference_count\":0"));
+
+    let edited_source = fs::read_to_string(&source).unwrap();
+    let edited_destination = fs::read_to_string(&destination).unwrap();
+    let edited_caller = fs::read_to_string(&caller).unwrap();
+    assert!(!edited_source.contains("class Helper"));
+    assert!(edited_source.contains("class Other"));
+    assert!(edited_destination.contains("class Helper"));
+    assert!(edited_caller.contains("val helper = Helper()"));
+
+    let symbols = run_local_hugr(hugr, &workspace, &["symbols", "--json", "Helper"]);
+    assert!(symbols.status.success(), "symbols failed: {symbols:?}");
+    let symbols_json = String::from_utf8(symbols.stdout).unwrap();
+    assert!(symbols_json.contains("\"path\":\"src/plugin/Helper.kt\""));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn move_symbol_allows_swift_same_module_type_references_and_refreshes_index() {
+    let hugr = env!("CARGO_BIN_EXE_hugr");
+    let workspace = temp_workspace("move_symbol_swift_same_module");
+    let module_dir = workspace.join("Sources/App");
+    fs::create_dir_all(&module_dir).expect("module dir should be created");
+    let source = module_dir.join("Hooks.swift");
+    let destination = module_dir.join("Helper.swift");
+    let caller = module_dir.join("Caller.swift");
+    fs::write(
+        &source,
+        "struct Helper {\n    let value = 1\n}\n\nstruct Other {}\n",
+    )
+    .expect("source file should be written");
+    fs::write(&destination, "struct Existing {}\n").expect("destination should be written");
+    fs::write(&caller, "struct Caller {\n    let helper = Helper()\n}\n")
+        .expect("caller should be written");
+
+    let init = run_local_hugr(hugr, &workspace, &["init"]);
+    assert!(init.status.success(), "init failed: {init:?}");
+
+    let moved = run_local_hugr(
+        hugr,
+        &workspace,
+        &[
+            "move-symbol",
+            "--json",
+            "--rewrite-references",
+            "--kind",
+            "struct",
+            "Sources/App/Hooks.swift",
+            "Helper",
+            "Sources/App/Helper.swift",
+        ],
+    );
+    assert!(moved.status.success(), "move failed: {moved:?}");
+    let moved_json = String::from_utf8(moved.stdout).unwrap();
+    assert!(moved_json.contains("\"rewritten_reference_count\":0"));
+
+    let edited_source = fs::read_to_string(&source).unwrap();
+    let edited_destination = fs::read_to_string(&destination).unwrap();
+    let edited_caller = fs::read_to_string(&caller).unwrap();
+    assert!(!edited_source.contains("struct Helper"));
+    assert!(edited_source.contains("struct Other"));
+    assert!(edited_destination.contains("struct Helper"));
+    assert!(edited_caller.contains("let helper = Helper()"));
+
+    let symbols = run_local_hugr(hugr, &workspace, &["symbols", "--json", "Helper"]);
+    assert!(symbols.status.success(), "symbols failed: {symbols:?}");
+    let symbols_json = String::from_utf8(symbols.stdout).unwrap();
+    assert!(symbols_json.contains("\"path\":\"Sources/App/Helper.swift\""));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
 fn run_local_hugr(hugr: &str, dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(hugr)
         .args(args)
