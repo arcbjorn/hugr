@@ -1,5 +1,5 @@
 use crate::discovery::FileCandidate;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
@@ -130,6 +130,9 @@ pub(crate) fn extract_references(
         return Ok(Vec::new());
     }
 
+    let declaration_lines = declaration_line_set(&targets);
+    let (targets_by_name, irregular_targets) = index_targets_by_name(&targets);
+
     let mut references = Vec::new();
     let mut seen = HashSet::new();
 
@@ -157,14 +160,19 @@ pub(crate) fn extract_references(
                 continue;
             }
 
-            for target in &targets {
-                if is_declaration_line(&targets, &file.path, line_number, target) {
+            for target_index in
+                matched_target_indices(trimmed, &targets, &targets_by_name, &irregular_targets)
+            {
+                let target = &targets[target_index];
+                if declaration_lines.contains(&(
+                    file.path.as_str(),
+                    target.name.as_str(),
+                    target.kind.as_str(),
+                    line_number,
+                )) {
                     continue;
                 }
                 if line_declares_target(trimmed, target) {
-                    continue;
-                }
-                if !contains_identifier(trimmed, &target.name) {
                     continue;
                 }
 
@@ -1427,18 +1435,63 @@ fn reference_kind(line: &str, target: &CodeSymbol) -> String {
     }
 }
 
-fn is_declaration_line(
-    symbols: &[CodeSymbol],
-    path: &str,
-    line_number: i64,
-    target: &CodeSymbol,
-) -> bool {
-    symbols.iter().any(|symbol| {
-        symbol.path == path
-            && symbol.name == target.name
-            && symbol.kind == target.kind
-            && symbol.line_start == line_number
-    })
+fn declaration_line_set(targets: &[CodeSymbol]) -> HashSet<(&str, &str, &str, i64)> {
+    targets
+        .iter()
+        .map(|symbol| {
+            (
+                symbol.path.as_str(),
+                symbol.name.as_str(),
+                symbol.kind.as_str(),
+                symbol.line_start,
+            )
+        })
+        .collect()
+}
+
+fn index_targets_by_name<'targets>(
+    targets: &'targets [CodeSymbol],
+) -> (HashMap<&'targets str, Vec<usize>>, Vec<usize>) {
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut irregular = Vec::new();
+
+    for (index, target) in targets.iter().enumerate() {
+        if target.name.chars().all(is_identifier_char) {
+            by_name.entry(target.name.as_str()).or_default().push(index);
+        } else {
+            irregular.push(index);
+        }
+    }
+
+    (by_name, irregular)
+}
+
+fn matched_target_indices(
+    line: &str,
+    targets: &[CodeSymbol],
+    targets_by_name: &HashMap<&str, Vec<usize>>,
+    irregular_targets: &[usize],
+) -> Vec<usize> {
+    let mut matched = Vec::new();
+
+    for token in line
+        .split(|char: char| !is_identifier_char(char))
+        .filter(|token| !token.is_empty())
+    {
+        if let Some(indices) = targets_by_name.get(token) {
+            matched.extend_from_slice(indices);
+        }
+    }
+
+    for &index in irregular_targets {
+        if contains_identifier(line, &targets[index].name) {
+            matched.push(index);
+        }
+    }
+
+    matched.sort_unstable();
+    matched.dedup();
+    matched
 }
 
 fn line_declares_target(line: &str, target: &CodeSymbol) -> bool {
@@ -1673,16 +1726,97 @@ fn is_identifier_char(char: char) -> bool {
     char.is_alphanumeric() || char == '_' || char == '$'
 }
 
+/// Splits an identifier into lowercase words at snake/kebab separators and
+/// camelCase boundaries so task terms can match identifier words exactly
+/// instead of relying on raw substring hits.
+pub(crate) fn identifier_word_tokens(identifier: &str) -> Vec<String> {
+    let chars = identifier.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for (index, &char) in chars.iter().enumerate() {
+        if !char.is_alphanumeric() {
+            flush_identifier_token(&mut tokens, &mut current);
+            continue;
+        }
+
+        let previous = index.checked_sub(1).and_then(|prior| chars.get(prior));
+        let next = chars.get(index + 1);
+        let starts_new_word = previous.is_some_and(|previous| {
+            previous.is_alphanumeric()
+                && char.is_uppercase()
+                && (previous.is_lowercase()
+                    || (previous.is_uppercase() && next.is_some_and(|next| next.is_lowercase())))
+        });
+        if starts_new_word {
+            flush_identifier_token(&mut tokens, &mut current);
+        }
+        current.extend(char.to_lowercase());
+    }
+
+    flush_identifier_token(&mut tokens, &mut current);
+    tokens
+}
+
+fn flush_identifier_token(tokens: &mut Vec<String>, current: &mut String) {
+    if current.len() >= 2 {
+        tokens.push(std::mem::take(current));
+    } else {
+        current.clear();
+    }
+}
+
+/// Deterministic light stemming: a lowercase task term matches a lowercase
+/// identifier word when they are equal, or when one is a prefix of the other
+/// with at most a short suffix left over (rank/ranking, test/tests). The
+/// suffix cap keeps compound terms like provider_symbol from matching the
+/// unrelated word provider.
+pub(crate) fn term_matches_identifier_word(word: &str, term: &str) -> bool {
+    if word == term {
+        return true;
+    }
+    let (short, long) = if word.len() <= term.len() {
+        (word, term)
+    } else {
+        (term, word)
+    };
+    short.len() >= 4 && long.len() - short.len() <= 3 && long.starts_with(short)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CodeReference, CodeSymbol, contains_identifier, extract_references, extract_symbols,
-        index_files,
+        identifier_word_tokens, index_files, term_matches_identifier_word,
     };
     use crate::discovery::FileCandidate;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn splits_identifiers_into_words() {
+        assert_eq!(
+            identifier_word_tokens("rank_context_sections"),
+            vec!["rank", "context", "sections"]
+        );
+        assert_eq!(
+            identifier_word_tokens("ContextPack"),
+            vec!["context", "pack"]
+        );
+        assert_eq!(identifier_word_tokens("HTTPServer"), vec!["http", "server"]);
+        assert_eq!(identifier_word_tokens("hugr-api"), vec!["hugr", "api"]);
+        assert_eq!(identifier_word_tokens("f32_blob"), vec!["f32", "blob"]);
+    }
+
+    #[test]
+    fn matches_terms_against_identifier_words() {
+        assert!(term_matches_identifier_word("rank", "ranking"));
+        assert!(term_matches_identifier_word("tests", "test"));
+        assert!(term_matches_identifier_word("context", "context"));
+        assert!(!term_matches_identifier_word("the", "then"));
+        assert!(!term_matches_identifier_word("rank", "file"));
+    }
 
     #[test]
     fn extracts_rust_symbols() {
