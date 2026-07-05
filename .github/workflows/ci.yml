@@ -26,3 +26,25 @@ jobs:
 
       - name: Run live Hugr API contract smoke
         run: cargo test --test hugr_api_live -- --ignored --nocapture
+
+  context-eval:
+    name: Context eval baseline
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout with history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Report-only for now: prints retrieval quality against recent commits
+      # so ranking regressions are visible in CI logs. A --min-hit-rate gate
+      # lands once a stable baseline is established across a few runs.
+      - name: Score context retrieval against git history
+        run: |
+          cargo run --quiet -- init
+          cargo run --quiet -- index
+          cargo run --quiet -- eval --from-git 30
