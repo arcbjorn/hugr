@@ -83,6 +83,7 @@ pub struct ContextGraphNeighbor {
     pub target_path: Option<String>,
     pub target_name: Option<String>,
     pub line_start: Option<i64>,
+    pub site_count: usize,
     pub citation_id: String,
     pub evidence_score: usize,
     pub evidence_reason: String,
@@ -348,6 +349,7 @@ impl ContextPack {
                     target_path: neighbor.target_path,
                     target_name: neighbor.target_name,
                     line_start: neighbor.line_start,
+                    site_count: neighbor.site_count,
                     evidence_score,
                     evidence_reason,
                 }
@@ -562,11 +564,17 @@ impl ContextPack {
             rendered.push_str("No graph neighbors found yet.\n");
         } else {
             for neighbor in &self.graph_neighbors {
+                let sites = if neighbor.site_count > 1 {
+                    format!(" ({} reference sites)", neighbor.site_count)
+                } else {
+                    String::new()
+                };
                 let _ = writeln!(
                     rendered,
-                    "- {}: {} [{}] (score {}: {})",
+                    "- {}: {}{} [{}] (score {}: {})",
                     neighbor.kind,
                     neighbor.label,
+                    sites,
                     neighbor.citation_id,
                     neighbor.evidence_score,
                     neighbor.evidence_reason
@@ -821,7 +829,7 @@ impl ContextPack {
             }
             let _ = write!(
                 rendered,
-                "{{\"kind\":{},\"label\":{},\"detail\":{},\"path\":{},\"target_path\":{},\"target_name\":{},\"line_start\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
+                "{{\"kind\":{},\"label\":{},\"detail\":{},\"path\":{},\"target_path\":{},\"target_name\":{},\"line_start\":{},\"site_count\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
                 json_string(&neighbor.kind),
                 json_string(&neighbor.label),
                 json_string(&neighbor.detail),
@@ -829,6 +837,7 @@ impl ContextPack {
                 json_option_string(neighbor.target_path.as_deref()),
                 json_option_string(neighbor.target_name.as_deref()),
                 json_optional_i64(neighbor.line_start),
+                neighbor.site_count,
                 json_string(&neighbor.citation_id),
                 neighbor.evidence_score,
                 json_string(&neighbor.evidence_reason)
@@ -1124,8 +1133,23 @@ fn graph_neighbor_citation_id(neighbor: &GraphNeighbor) -> String {
         .target_name
         .as_deref()
         .unwrap_or(neighbor.kind.as_str());
+    // Same-named targets defined in different files need distinct citations.
+    let target_qualifier = neighbor
+        .target_path
+        .as_deref()
+        .filter(|target_path| {
+            neighbor
+                .path
+                .as_deref()
+                .is_some_and(|path| path != *target_path)
+        })
+        .map(|target_path| format!("@{target_path}"))
+        .unwrap_or_default();
 
-    format!("graph:{}:{}{}:{}", neighbor.kind, anchor, line, target)
+    format!(
+        "graph:{}:{}{}:{}{}",
+        neighbor.kind, anchor, line, target, target_qualifier
+    )
 }
 
 fn render_context_memory_json(memory: &ContextMemory) -> String {
@@ -1179,12 +1203,35 @@ fn file_evidence(candidate: &FileCandidate, terms: &[String]) -> (usize, String)
 }
 
 fn symbol_evidence(symbol: &CodeSymbol, terms: &[String]) -> (usize, String) {
-    let searchable = format!(
-        "{} {} {} {}",
-        symbol.path, symbol.kind, symbol.name, symbol.signature
-    );
-    let score = 600 + text_match_score(&searchable, terms);
-    (score, "symbol path/name/signature matched task".to_string())
+    let name_words = crate::code::identifier_word_tokens(&symbol.name);
+    let name_score = terms
+        .iter()
+        .map(|term| {
+            if name_words.iter().any(|word| word == term) {
+                30
+            } else if name_words
+                .iter()
+                .any(|word| crate::code::term_matches_identifier_word(word, term))
+            {
+                22
+            } else {
+                0
+            }
+        })
+        .sum::<usize>();
+    let signature_score = text_match_score(&format!("{} {}", symbol.kind, symbol.signature), terms);
+    let path_score = text_match_score(&symbol.path, terms) / 2;
+    let score = 600 + name_score + signature_score + path_score;
+    let reason = if name_score > 0 {
+        "symbol name matched task terms"
+    } else if signature_score > 0 {
+        "symbol signature matched task"
+    } else if path_score > 0 {
+        "symbol file path matched task"
+    } else {
+        "symbol from selected context files"
+    };
+    (score, reason.to_string())
 }
 
 fn memory_evidence(
@@ -2295,11 +2342,12 @@ fn most_connected_graph_node(graph_neighbors: &[ContextGraphNeighbor]) -> Option
             "incoming_reference" | "outgoing_reference" | "path_reference"
         )
     }) {
+        let sites = neighbor.site_count.max(1);
         if let Some(target_path) = &neighbor.target_path {
-            *counts.entry(target_path.clone()).or_insert(0) += 1;
+            *counts.entry(target_path.clone()).or_insert(0) += sites;
         }
         if let Some(path) = &neighbor.path {
-            *counts.entry(path.clone()).or_insert(0) += 1;
+            *counts.entry(path.clone()).or_insert(0) += sites;
         }
     }
 
@@ -2865,7 +2913,9 @@ fn change_label(file: &ContextChangedFile) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContextPack, count_signature_parameters, json_string};
+    use super::{
+        ContextPack, context_query_terms, count_signature_parameters, json_string, symbol_evidence,
+    };
     use crate::code::CodeSymbol;
     use crate::discovery::{FileCandidate, source_embedding_score};
     use crate::store::{
@@ -2875,6 +2925,39 @@ mod tests {
     use crate::worktree::{ChangedFile, WorktreeState};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn symbol_evidence_distinguishes_name_matches_from_path_matches() {
+        let terms = context_query_terms("improve recall ranking quality in the context compiler");
+        let name_matched = CodeSymbol {
+            path: "src/context.rs".to_string(),
+            language: Some("rust".to_string()),
+            name: "rank_context_sections".to_string(),
+            kind: "function".to_string(),
+            line_start: 1029,
+            line_end: Some(1090),
+            signature: "fn rank_context_sections(&mut self)".to_string(),
+        };
+        let path_matched = CodeSymbol {
+            path: "src/context.rs".to_string(),
+            language: Some("rust".to_string()),
+            name: "DEFAULT_BUDGET".to_string(),
+            kind: "constant".to_string(),
+            line_start: 12,
+            line_end: None,
+            signature: "const DEFAULT_BUDGET: usize = 4000".to_string(),
+        };
+
+        let (name_score, name_reason) = symbol_evidence(&name_matched, &terms);
+        let (path_score, path_reason) = symbol_evidence(&path_matched, &terms);
+
+        assert!(
+            name_score > path_score,
+            "name match {name_score} should outrank path match {path_score}"
+        );
+        assert_eq!(name_reason, "symbol name matched task terms");
+        assert_eq!(path_reason, "symbol file path matched task");
+    }
 
     #[test]
     fn markdown_includes_citations_for_files_and_memories() {
@@ -2971,6 +3054,7 @@ mod tests {
                     target_path: Some("src/plugin_hooks.rs".to_string()),
                     target_name: Some("run_after_config".to_string()),
                     line_start: Some(8),
+                    site_count: 1,
                 }],
                 Vec::new(),
                 Vec::new(),
@@ -3010,6 +3094,7 @@ mod tests {
                         target_path: Some("src/plugin_hooks.rs".to_string()),
                         target_name: Some("run_after_config".to_string()),
                         line_start: Some(8),
+                        site_count: 1,
                     },
                     GraphNeighbor {
                         kind: "incoming_reference".to_string(),
@@ -3019,6 +3104,7 @@ mod tests {
                         target_path: Some("src/plugin_hooks.rs".to_string()),
                         target_name: Some("run_after_config".to_string()),
                         line_start: Some(14),
+                        site_count: 1,
                     },
                 ],
                 Vec::new(),
@@ -3049,6 +3135,7 @@ mod tests {
             target_path: Some("src/core.rs".to_string()),
             target_name: Some("hot_symbol".to_string()),
             line_start: Some(line),
+            site_count: 1,
         };
         let pack =
             ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
@@ -3102,6 +3189,7 @@ mod tests {
             target_path: Some("src/core.rs".to_string()),
             target_name: Some("warm_symbol".to_string()),
             line_start: Some(line),
+            site_count: 1,
         };
         let pack =
             ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
@@ -3177,6 +3265,7 @@ mod tests {
                         target_path: Some("src/plugin_hooks.rs".to_string()),
                         target_name: Some("run_after_config".to_string()),
                         line_start: Some(8),
+                        site_count: 1,
                     },
                     GraphNeighbor {
                         kind: "incoming_reference".to_string(),
@@ -3186,6 +3275,7 @@ mod tests {
                         target_path: Some("src/plugin_hooks.rs".to_string()),
                         target_name: Some("run_after_config".to_string()),
                         line_start: Some(14),
+                        site_count: 1,
                     },
                 ],
                 Vec::new(),
