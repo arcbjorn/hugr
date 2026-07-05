@@ -909,17 +909,24 @@ fn plan_go_cross_package_reference_rewrites(
             target.name
         ));
     }
-    let module = go_module_path().ok_or_else(|| {
-        "move-symbol --rewrite-references requires go.mod to resolve Go package import paths"
-            .to_string()
+    let source_module = go_module_for_path(&target.path).ok_or_else(|| {
+        format!(
+            "move-symbol --rewrite-references requires go.mod to resolve Go package import path for {}",
+            target.path
+        )
     })?;
-    let old_import = go_import_path(&module, &target.path).ok_or_else(|| {
+    let destination_module = go_module_for_path(destination_path).ok_or_else(|| {
+        format!(
+            "move-symbol --rewrite-references requires go.mod to resolve Go package import path for {destination_path}"
+        )
+    })?;
+    let old_import = go_import_path(&source_module, &target.path).ok_or_else(|| {
         format!(
             "move-symbol --rewrite-references cannot derive Go import path for {}",
             target.path
         )
     })?;
-    let new_import = go_import_path(&module, destination_path).ok_or_else(|| {
+    let new_import = go_import_path(&destination_module, destination_path).ok_or_else(|| {
         format!(
             "move-symbol --rewrite-references cannot derive Go import path for {destination_path}"
         )
@@ -987,8 +994,33 @@ fn plan_go_cross_package_reference_rewrites(
     })
 }
 
-fn go_module_path() -> Option<String> {
-    parse_go_module_path(&fs::read_to_string("go.mod").ok()?)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoModulePath {
+    module: String,
+    root_segments: Vec<String>,
+}
+
+fn go_module_for_path(path: &str) -> Option<GoModulePath> {
+    let parent = path_parent_segments(path);
+    for depth in (0..=parent.len()).rev() {
+        let root_segments = parent[..depth].to_vec();
+        let go_mod = if root_segments.is_empty() {
+            "go.mod".to_string()
+        } else {
+            format!("{}/go.mod", root_segments.join("/"))
+        };
+        let Ok(contents) = fs::read_to_string(&go_mod) else {
+            continue;
+        };
+        let Some(module) = parse_go_module_path(&contents) else {
+            continue;
+        };
+        return Some(GoModulePath {
+            module,
+            root_segments,
+        });
+    }
+    None
 }
 
 fn parse_go_module_path(contents: &str) -> Option<String> {
@@ -1007,12 +1039,16 @@ fn parse_go_module_path(contents: &str) -> Option<String> {
     None
 }
 
-fn go_import_path(module: &str, path: &str) -> Option<String> {
+fn go_import_path(module: &GoModulePath, path: &str) -> Option<String> {
     let parent = path_parent_segments(path);
-    if parent.is_empty() {
-        return Some(module.to_string());
+    if !parent.starts_with(&module.root_segments) {
+        return None;
     }
-    Some(format!("{module}/{}", parent.join("/")))
+    let relative = &parent[module.root_segments.len()..];
+    if relative.is_empty() {
+        return Some(module.module.clone());
+    }
+    Some(format!("{}/{}", module.module, relative.join("/")))
 }
 
 fn go_has_unsupported_import_alias(contents: &str, import_path: &str) -> bool {
@@ -1949,13 +1985,23 @@ fn swift_signature_is_public(signature: &str) -> bool {
 }
 
 fn swift_package_module_for_path(path: &str) -> Option<String> {
-    fs::metadata("Package.swift").ok()?;
     let segments = path_segments(path);
-    if segments.len() >= 3 && segments[0] == "Sources" {
-        return Some(segments[1].clone());
-    }
-    if segments.len() >= 3 && segments[0] == "Tests" {
-        return Some(segments[1].trim_end_matches("Tests").to_string());
+    for depth in (0..=segments.len().saturating_sub(3)).rev() {
+        let package_path = if depth == 0 {
+            "Package.swift".to_string()
+        } else {
+            format!("{}/Package.swift", segments[..depth].join("/"))
+        };
+        if fs::metadata(&package_path).is_err() {
+            continue;
+        }
+        let relative = &segments[depth..];
+        if relative.len() >= 3 && relative[0] == "Sources" {
+            return Some(relative[1].clone());
+        }
+        if relative.len() >= 3 && relative[0] == "Tests" {
+            return Some(relative[1].trim_end_matches("Tests").to_string());
+        }
     }
     None
 }
