@@ -793,69 +793,11 @@ impl Store {
         }
 
         for symbol in symbols {
-            conn.execute(
-                "
-                INSERT INTO code_symbols (
-                    project_id,
-                    path,
-                    name,
-                    kind,
-                    language,
-                    line_start,
-                    line_end,
-                    signature,
-                    indexed_at_ms
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                ",
-                params![
-                    LOCAL_PROJECT_ID,
-                    symbol.path.clone(),
-                    symbol.name.clone(),
-                    symbol.kind.clone(),
-                    symbol.language.clone(),
-                    symbol.line_start,
-                    symbol.line_end,
-                    symbol.signature.clone(),
-                    now
-                ],
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+            insert_code_symbol(&conn, symbol, now).await?;
         }
 
         for reference in references {
-            conn.execute(
-                "
-                INSERT INTO code_references (
-                    project_id,
-                    path,
-                    target_path,
-                    target_name,
-                    target_kind,
-                    kind,
-                    language,
-                    line_start,
-                    excerpt,
-                    indexed_at_ms
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                ",
-                params![
-                    LOCAL_PROJECT_ID,
-                    reference.path.clone(),
-                    reference.target_path.clone(),
-                    reference.target_name.clone(),
-                    reference.target_kind.clone(),
-                    reference.kind.clone(),
-                    reference.language.clone(),
-                    reference.line_start,
-                    reference.excerpt.clone(),
-                    now
-                ],
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+            insert_code_reference(&conn, reference, now).await?;
         }
 
         Ok(())
@@ -914,6 +856,110 @@ impl Store {
 
         summary.missing_paths = missing_paths.len();
         Ok(summary)
+    }
+
+    /// Reads every indexed symbol back from local storage. Partial re-index uses
+    /// this to keep the full target set available when only a few files are
+    /// re-parsed, so cross-file references stay resolvable.
+    pub(crate) async fn stored_code_symbols(&self) -> Result<Vec<CodeSymbol>, String> {
+        if !self.exists() {
+            return Ok(Vec::new());
+        }
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "
+                SELECT path, language, name, kind, line_start, line_end, signature
+                FROM code_symbols
+                WHERE project_id = ?1
+                ",
+                params![LOCAL_PROJECT_ID],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut symbols = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+            symbols.push(code_symbol_from_row(&row)?);
+        }
+        Ok(symbols)
+    }
+
+    /// Returns the distinct files that currently hold a stored reference whose
+    /// target lives in one of `target_paths`. Partial re-index re-scans these
+    /// inbound-reference sources so edits to a changed file's symbols correctly
+    /// update references pointing at it from unchanged files.
+    pub(crate) async fn reference_sources_targeting(
+        &self,
+        target_paths: &[String],
+    ) -> Result<Vec<String>, String> {
+        if target_paths.is_empty() || !self.exists() {
+            return Ok(Vec::new());
+        }
+        let conn = self.connect().await?;
+        let target_set = target_paths.iter().cloned().collect::<HashSet<_>>();
+        let mut rows = conn
+            .query(
+                "
+                SELECT DISTINCT path, target_path
+                FROM code_references
+                WHERE project_id = ?1
+                ",
+                params![LOCAL_PROJECT_ID],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut sources = HashSet::new();
+        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+            let path = row.get::<String>(0).map_err(|error| error.to_string())?;
+            let target_path = row.get::<String>(1).map_err(|error| error.to_string())?;
+            if target_set.contains(&target_path) {
+                sources.insert(path);
+            }
+        }
+        Ok(sources.into_iter().collect())
+    }
+
+    /// Applies a scoped index update: replaces `code_symbols` for exactly
+    /// `symbol_paths` and `code_references` for exactly `reference_paths`, then
+    /// inserts the provided rows. Unlike `record_code_index`, symbol and
+    /// reference delete scopes are independent so a partial refresh can rewrite
+    /// inbound references without disturbing an untouched file's symbols.
+    pub(crate) async fn record_code_index_scoped(
+        &self,
+        symbol_paths: &HashSet<String>,
+        reference_paths: &HashSet<String>,
+        symbols: &[CodeSymbol],
+        references: &[CodeReference],
+    ) -> Result<(), String> {
+        self.init().await?;
+        let conn = self.connect().await?;
+        let now = now_ms()?;
+
+        for path in symbol_paths {
+            conn.execute(
+                "DELETE FROM code_symbols WHERE project_id = ?1 AND path = ?2",
+                params![LOCAL_PROJECT_ID, path.clone()],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+        for path in reference_paths {
+            conn.execute(
+                "DELETE FROM code_references WHERE project_id = ?1 AND path = ?2",
+                params![LOCAL_PROJECT_ID, path.clone()],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+
+        for symbol in symbols {
+            insert_code_symbol(&conn, symbol, now).await?;
+        }
+        for reference in references {
+            insert_code_reference(&conn, reference, now).await?;
+        }
+
+        Ok(())
     }
 
     pub async fn symbols_for_target(
@@ -9854,6 +9900,82 @@ async fn project_from_conn(conn: &Connection) -> Result<Option<Project>, String>
         created_at_ms: row.get::<i64>(5).map_err(|error| error.to_string())?,
         updated_at_ms: row.get::<i64>(6).map_err(|error| error.to_string())?,
     }))
+}
+
+async fn insert_code_symbol(
+    conn: &Connection,
+    symbol: &CodeSymbol,
+    now: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "
+        INSERT INTO code_symbols (
+            project_id,
+            path,
+            name,
+            kind,
+            language,
+            line_start,
+            line_end,
+            signature,
+            indexed_at_ms
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ",
+        params![
+            LOCAL_PROJECT_ID,
+            symbol.path.clone(),
+            symbol.name.clone(),
+            symbol.kind.clone(),
+            symbol.language.clone(),
+            symbol.line_start,
+            symbol.line_end,
+            symbol.signature.clone(),
+            now
+        ],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn insert_code_reference(
+    conn: &Connection,
+    reference: &CodeReference,
+    now: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "
+        INSERT INTO code_references (
+            project_id,
+            path,
+            target_path,
+            target_name,
+            target_kind,
+            kind,
+            language,
+            line_start,
+            excerpt,
+            indexed_at_ms
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ",
+        params![
+            LOCAL_PROJECT_ID,
+            reference.path.clone(),
+            reference.target_path.clone(),
+            reference.target_name.clone(),
+            reference.target_kind.clone(),
+            reference.kind.clone(),
+            reference.language.clone(),
+            reference.line_start,
+            reference.excerpt.clone(),
+            now
+        ],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn code_symbol_from_row(row: &Row) -> Result<CodeSymbol, String> {
