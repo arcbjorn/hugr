@@ -611,12 +611,103 @@ fn extract_javascript_symbols_with_tree_sitter(
     for symbol in &mut symbols {
         symbol.language = Some("javascript".to_string());
     }
+    symbols.extend(extract_commonjs_export_symbols(path, contents)?);
     symbols.sort_by(|left, right| {
         left.line_start
             .cmp(&right.line_start)
             .then_with(|| left.name.cmp(&right.name))
     });
     Ok(symbols)
+}
+
+fn extract_commonjs_export_symbols(path: &str, contents: &str) -> Result<Vec<CodeSymbol>, String> {
+    let mut symbols = Vec::new();
+    let line_count = i64::try_from(contents.lines().count()).map_err(|error| error.to_string())?;
+
+    for (index, line) in contents.lines().enumerate() {
+        let line_number = i64::try_from(index + 1).map_err(|error| error.to_string())?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || is_comment_line(trimmed) {
+            continue;
+        }
+
+        if let Some((name, kind)) = commonjs_property_export(trimmed) {
+            symbols.push(CodeSymbol {
+                path: path.to_string(),
+                language: Some("javascript".to_string()),
+                name,
+                kind,
+                line_start: line_number,
+                line_end: Some(line_number),
+                signature: clean_signature(trimmed),
+            });
+            continue;
+        }
+
+        for name in commonjs_object_export_names(trimmed) {
+            symbols.push(CodeSymbol {
+                path: path.to_string(),
+                language: Some("javascript".to_string()),
+                name,
+                kind: "export".to_string(),
+                line_start: line_number,
+                line_end: Some(line_number),
+                signature: clean_signature(trimmed),
+            });
+        }
+    }
+
+    assign_symbol_ranges(&mut symbols, line_count);
+    Ok(symbols)
+}
+
+fn commonjs_property_export(line: &str) -> Option<(String, String)> {
+    let rest = line
+        .strip_prefix("exports.")
+        .or_else(|| line.strip_prefix("module.exports."))?;
+    let (name, value) = rest.split_once('=')?;
+    let name = first_identifier(name.trim())?;
+    let value = value.trim();
+    let kind = if value.starts_with("function") || value.contains("=>") {
+        "function"
+    } else if value.starts_with("class") {
+        "class"
+    } else {
+        "export"
+    };
+    Some((name, kind.to_string()))
+}
+
+fn commonjs_object_export_names(line: &str) -> Vec<String> {
+    let Some(rest) = line.strip_prefix("module.exports") else {
+        return Vec::new();
+    };
+    let Some((_, value)) = rest.split_once('=') else {
+        return Vec::new();
+    };
+    let value = value.trim().trim_end_matches(';').trim();
+    let Some(inner) = value
+        .strip_prefix('{')
+        .and_then(|value| value.rsplit_once('}'))
+    else {
+        return Vec::new();
+    };
+
+    inner
+        .0
+        .split(',')
+        .filter_map(|item| {
+            let item = item.trim();
+            if item.is_empty() || item.contains("...") {
+                return None;
+            }
+            let name = item
+                .split_once(':')
+                .map(|(property, _value)| property.trim())
+                .unwrap_or(item);
+            first_identifier(name)
+        })
+        .collect()
 }
 
 fn extract_go_symbols_with_tree_sitter(
@@ -1448,7 +1539,7 @@ fn is_import_line(line: &str) -> bool {
     line.starts_with("use ")
         || line.starts_with("import ")
         || line.starts_with("from ")
-        || line.starts_with("require(")
+        || line.contains("require(")
 }
 
 fn contains_call(line: &str, name: &str) -> bool {
@@ -1819,6 +1910,31 @@ const renderRegistry = () => (
         assert_eq!(arrow_function.kind, "function");
         assert_eq!(arrow_function.line_start, 12);
         assert_eq!(arrow_function.line_end, Some(14));
+    }
+
+    #[test]
+    fn extracts_commonjs_export_symbols() {
+        let symbols = extract_symbols(
+            "src/pluginHooks.js",
+            Some("javascript"),
+            r#"
+function localHelper() {
+    return true;
+}
+
+exports.runHook = function runHook() {
+    return localHelper();
+};
+module.exports.Helper = class Helper {};
+module.exports = { localHelper, renamed: runHook };
+"#,
+        )
+        .unwrap();
+
+        assert!(has_symbol(&symbols, "function", "localHelper", 2));
+        assert!(has_symbol(&symbols, "function", "runHook", 6));
+        assert!(has_symbol(&symbols, "class", "Helper", 9));
+        assert!(has_symbol(&symbols, "export", "renamed", 10));
     }
 
     #[test]
