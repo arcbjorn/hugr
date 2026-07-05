@@ -23,6 +23,10 @@ const CONTEXT_PACKS_VERSION: i64 = 9;
 const CONTEXT_PACKS_NAME: &str = "context_packs";
 const DIAGNOSTICS_VERSION: i64 = 10;
 const DIAGNOSTICS_NAME: &str = "diagnostics";
+const TEST_MAPPINGS_VERSION: i64 = 11;
+const TEST_MAPPINGS_NAME: &str = "test_mappings";
+const SOURCE_EMBEDDINGS_VERSION: i64 = 12;
+const SOURCE_EMBEDDINGS_NAME: &str = "source_embeddings";
 
 pub async fn migrate(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
@@ -157,6 +161,30 @@ pub async fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![DIAGNOSTICS_VERSION, DIAGNOSTICS_NAME, now_ms()?],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    if !applied.contains(&TEST_MAPPINGS_VERSION) {
+        conn.execute_batch(test_mappings_sql())
+            .await
+            .map_err(|error| error.to_string())?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![TEST_MAPPINGS_VERSION, TEST_MAPPINGS_NAME, now_ms()?],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    if !applied.contains(&SOURCE_EMBEDDINGS_VERSION) {
+        conn.execute_batch(&source_embeddings_sql())
+            .await
+            .map_err(|error| error.to_string())?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![SOURCE_EMBEDDINGS_VERSION, SOURCE_EMBEDDINGS_NAME, now_ms()?],
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -428,6 +456,49 @@ fn code_references_sql() -> &'static str {
     CREATE INDEX IF NOT EXISTS code_references_path_idx
     ON code_references(project_id, path, line_start);
     "
+}
+
+fn test_mappings_sql() -> &'static str {
+    "
+    CREATE TABLE IF NOT EXISTS test_mappings (
+        project_id TEXT NOT NULL,
+        source_path TEXT NOT NULL,
+        test_path TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        score INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (project_id, source_path, test_path)
+    );
+
+    CREATE INDEX IF NOT EXISTS test_mappings_source_idx
+    ON test_mappings(project_id, source_path, score DESC);
+
+    CREATE INDEX IF NOT EXISTS test_mappings_test_idx
+    ON test_mappings(project_id, test_path);
+    "
+}
+
+fn source_embeddings_sql() -> String {
+    format!(
+        "
+        CREATE TABLE IF NOT EXISTS source_embeddings (
+            project_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            model TEXT NOT NULL,
+            dimensions INTEGER NOT NULL DEFAULT {EMBEDDING_DIMENSIONS},
+            embedding F32_BLOB({EMBEDDING_DIMENSIONS}),
+            content_key TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (project_id, path)
+        );
+
+        CREATE INDEX IF NOT EXISTS source_embeddings_project_idx
+        ON source_embeddings(project_id, updated_at_ms DESC);
+
+        CREATE INDEX IF NOT EXISTS source_embeddings_vector_idx
+        ON source_embeddings (libsql_vector_idx(embedding));
+        "
+    )
 }
 
 fn sync_history_sql() -> &'static str {
