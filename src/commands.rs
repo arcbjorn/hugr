@@ -27,7 +27,7 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::Remember { text, options } => remember(&text, &options).await,
         Command::Recall { query, format } => recall(&query, format).await,
         Command::Context { task, format } => context(&task, format).await,
-        Command::Index => index().await,
+        Command::Index { paths } => index(&paths).await,
         Command::Symbols { query, format } => symbols(&query, format).await,
         Command::Impact { target, format } => impact(&target, format).await,
         Command::ReplaceSymbol {
@@ -245,7 +245,11 @@ pub(crate) async fn compile_context_pack(task: &str) -> Result<ContextPack, Stri
     Ok(pack)
 }
 
-async fn index() -> Result<(), String> {
+async fn index(paths: &[String]) -> Result<(), String> {
+    if !paths.is_empty() {
+        return index_incremental(paths).await;
+    }
+
     let summary = indexer::index_project(5000).await?;
 
     println!("indexed {} files", summary.file_count);
@@ -262,6 +266,21 @@ async fn index() -> Result<(), String> {
         "symbol_kinds: {}",
         indexer::format_classifications(&summary.symbol_kinds)
     );
+    if !summary.pruned.is_empty() {
+        println!(
+            "pruned: {} missing files, {} symbols, {} references",
+            summary.pruned.missing_paths, summary.pruned.symbols, summary.pruned.references
+        );
+    }
+    Ok(())
+}
+
+async fn index_incremental(paths: &[String]) -> Result<(), String> {
+    let summary = indexer::refresh_paths(5000, paths).await?;
+
+    println!("reparsed {} files", summary.reparsed_files);
+    println!("rescanned {} reference files", summary.reference_files);
+    println!("indexed {} symbols", summary.symbol_count);
     if !summary.pruned.is_empty() {
         println!(
             "pruned: {} missing files, {} symbols, {} references",
