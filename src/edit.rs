@@ -2,6 +2,7 @@ use crate::code::{self, CodeReference, CodeSymbol};
 use crate::context::json_string;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
+use std::fs;
 use std::path::Path;
 
 /// A structural symbol replacement that has been validated but not yet written.
@@ -322,9 +323,9 @@ pub(crate) fn plan_move(
 
     let moved_body =
         extract_line_range(source_contents, old_line_start, old_line_end, &target.path)?;
-    let source_after =
+    let mut source_after =
         remove_line_range(source_contents, old_line_start, old_line_end, &target.path)?;
-    let destination_after = append_symbol_body(destination_contents, &moved_body);
+    let mut destination_after = append_symbol_body(destination_contents, &moved_body);
     let moved_line_count =
         usize::try_from(old_line_end - old_line_start + 1).map_err(|error| error.to_string())?;
     let adjusted_inbound_references = adjusted_references_after_move(
@@ -334,6 +335,21 @@ pub(crate) fn plan_move(
         old_line_end,
         moved_line_count,
     );
+    let commonjs_export_rewrite = if source_language == Some("javascript")
+        && commonjs_exports_symbol(source_contents, &target.name)
+    {
+        let (rewritten_source, removed_exports) =
+            remove_commonjs_export(&source_after, &target.name);
+        let (rewritten_destination, added_exports) =
+            add_commonjs_export(&destination_after, &target.name);
+        source_after = rewritten_source;
+        destination_after = rewritten_destination;
+        Some((removed_exports, added_exports))
+    } else {
+        None
+    };
+    let adjusted_inbound_references =
+        filter_commonjs_export_references(&adjusted_inbound_references, &target.name);
 
     let reference_rewrite = if rewrite_references {
         plan_reference_rewrites(
@@ -388,6 +404,20 @@ pub(crate) fn plan_move(
         },
     ];
     changed_files.extend(reference_rewrite.changed_files);
+    if let Some((removed_exports, added_exports)) = commonjs_export_rewrite {
+        if removed_exports > 0 {
+            changed_files.push(SymbolMoveFile {
+                path: target.path.clone(),
+                action: "rewrote exports".to_string(),
+            });
+        }
+        if added_exports > 0 {
+            changed_files.push(SymbolMoveFile {
+                path: destination_path.to_string(),
+                action: "rewrote exports".to_string(),
+            });
+        }
+    }
     let changed_files = merge_move_changed_files(changed_files);
 
     Ok(PlannedMove {
@@ -401,7 +431,10 @@ pub(crate) fn plan_move(
             old_line_start,
             old_line_end,
             moved_line_count,
-            rewritten_reference_count: reference_rewrite.rewritten_reference_count,
+            rewritten_reference_count: reference_rewrite.rewritten_reference_count
+                + commonjs_export_rewrite
+                    .map(|(removed, added)| removed + added)
+                    .unwrap_or(0),
             changed_files,
         },
     })
@@ -455,6 +488,159 @@ fn merge_move_changed_files(files: Vec<SymbolMoveFile>) -> Vec<SymbolMoveFile> {
             action: actions.join(", "),
         })
         .collect()
+}
+
+fn filter_commonjs_export_references(
+    references: &[CodeReference],
+    symbol_name: &str,
+) -> Vec<CodeReference> {
+    references
+        .iter()
+        .filter(|reference| !commonjs_export_line_mentions(&reference.excerpt, symbol_name))
+        .cloned()
+        .collect()
+}
+
+fn commonjs_exports_symbol(contents: &str, symbol_name: &str) -> bool {
+    contents
+        .lines()
+        .any(|line| commonjs_export_line_mentions(line.trim(), symbol_name))
+}
+
+fn commonjs_export_line_mentions(line: &str, symbol_name: &str) -> bool {
+    commonjs_property_export_name(line).as_deref() == Some(symbol_name)
+        || commonjs_object_export_items(line)
+            .iter()
+            .any(|item| commonjs_object_export_item_name(item) == symbol_name)
+}
+
+fn remove_commonjs_export(contents: &str, symbol_name: &str) -> (String, usize) {
+    let trailing_newline = contents.ends_with('\n');
+    let mut removed = 0usize;
+    let mut lines = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if commonjs_property_export_name(trimmed).as_deref() == Some(symbol_name) {
+            removed += 1;
+            continue;
+        }
+        if !commonjs_object_export_items(trimmed).is_empty() {
+            let (rewritten, changes) = remove_commonjs_object_export_item(line, symbol_name);
+            removed += changes;
+            if !rewritten.trim().is_empty() {
+                lines.push(rewritten);
+            }
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+
+    let mut rendered = lines.join("\n");
+    if trailing_newline && !rendered.is_empty() {
+        rendered.push('\n');
+    }
+    (rendered, removed)
+}
+
+fn add_commonjs_export(contents: &str, symbol_name: &str) -> (String, usize) {
+    if commonjs_exports_symbol(contents, symbol_name) {
+        return (contents.to_string(), 0);
+    }
+
+    let trailing_newline = contents.ends_with('\n');
+    let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
+    if let Some(index) = lines
+        .iter()
+        .position(|line| !commonjs_object_export_items(line.trim()).is_empty())
+    {
+        lines[index] = add_commonjs_object_export_item(&lines[index], symbol_name);
+    } else {
+        lines.push(format!("module.exports = {{ {symbol_name} }};"));
+    }
+    let mut rendered = lines.join("\n");
+    if trailing_newline || !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    (rendered, 1)
+}
+
+fn commonjs_property_export_name(line: &str) -> Option<String> {
+    let rest = line
+        .strip_prefix("exports.")
+        .or_else(|| line.strip_prefix("module.exports."))?;
+    let (name, _value) = rest.split_once('=')?;
+    commonjs_identifier(name.trim())
+}
+
+fn commonjs_object_export_items(line: &str) -> Vec<String> {
+    let Some(rest) = line.trim().strip_prefix("module.exports") else {
+        return Vec::new();
+    };
+    let Some((_, value)) = rest.split_once('=') else {
+        return Vec::new();
+    };
+    let value = value.trim().trim_end_matches(';').trim();
+    let Some(inner) = value
+        .strip_prefix('{')
+        .and_then(|value| value.rsplit_once('}'))
+    else {
+        return Vec::new();
+    };
+    split_javascript_import_items(inner.0).unwrap_or_default()
+}
+
+fn commonjs_object_export_item_name(item: &str) -> String {
+    item.split_once(':')
+        .map(|(name, _value)| name.trim())
+        .unwrap_or(item.trim())
+        .to_string()
+}
+
+fn remove_commonjs_object_export_item(line: &str, symbol_name: &str) -> (String, usize) {
+    let items = commonjs_object_export_items(line);
+    if items.is_empty() {
+        return (line.to_string(), 0);
+    }
+    let kept = items
+        .into_iter()
+        .filter(|item| commonjs_object_export_item_name(item) != symbol_name)
+        .collect::<Vec<_>>();
+    if kept.is_empty() {
+        return (String::new(), 1);
+    }
+    if kept.len() == commonjs_object_export_items(line).len() {
+        return (line.to_string(), 0);
+    }
+    (render_commonjs_object_export_line(line, &kept), 1)
+}
+
+fn add_commonjs_object_export_item(line: &str, symbol_name: &str) -> String {
+    let mut items = commonjs_object_export_items(line);
+    items.push(symbol_name.to_string());
+    render_commonjs_object_export_line(line, &items)
+}
+
+fn render_commonjs_object_export_line(original: &str, items: &[String]) -> String {
+    let leading = original
+        .chars()
+        .take_while(|char| char.is_whitespace())
+        .collect::<String>();
+    format!("{leading}module.exports = {{ {} }};", items.join(", "))
+}
+
+fn commonjs_identifier(value: &str) -> Option<String> {
+    let mut identifier = String::new();
+    for char in value.chars() {
+        if identifier.is_empty() && !(char.is_ascii_alphabetic() || char == '_' || char == '$') {
+            return None;
+        }
+        if char.is_ascii_alphanumeric() || char == '_' || char == '$' {
+            identifier.push(char);
+        } else {
+            break;
+        }
+    }
+    (!identifier.is_empty()).then_some(identifier)
 }
 
 fn plan_reference_rewrites(
@@ -625,12 +811,6 @@ fn plan_go_same_package_reference_awareness(
 ) -> Result<PlannedReferenceRewrite, String> {
     let source_parent = path_parent_segments(&target.path);
     let destination_parent = path_parent_segments(destination_path);
-    if source_parent != destination_parent {
-        return Err(
-            "move-symbol --rewrite-references currently supports Go moves only within the same package directory"
-                .to_string(),
-        );
-    }
     let source_package = go_package_name(source_contents).ok_or_else(|| {
         format!(
             "move-symbol --rewrite-references cannot determine Go package for {}",
@@ -642,6 +822,16 @@ fn plan_go_same_package_reference_awareness(
             "move-symbol --rewrite-references cannot determine Go package for {destination_path}"
         )
     })?;
+    if source_parent != destination_parent {
+        return plan_go_cross_package_reference_rewrites(
+            target,
+            destination_path,
+            &source_package,
+            &destination_package,
+            references_by_path,
+            reference_contents,
+        );
+    }
     if source_package != destination_package {
         return Err(format!(
             "move-symbol --rewrite-references requires Go source and destination files to share package '{source_package}'"
@@ -703,6 +893,295 @@ fn go_package_name(contents: &str) -> Option<String> {
         return valid_identifier(name).then(|| name.to_string());
     }
     None
+}
+
+fn plan_go_cross_package_reference_rewrites(
+    target: &CodeSymbol,
+    destination_path: &str,
+    source_package: &str,
+    destination_package: &str,
+    references_by_path: BTreeMap<String, Vec<CodeReference>>,
+    reference_contents: BTreeMap<String, String>,
+) -> Result<PlannedReferenceRewrite, String> {
+    if !starts_with_uppercase(&target.name) {
+        return Err(format!(
+            "move-symbol --rewrite-references cannot move unexported Go symbol '{}' across packages",
+            target.name
+        ));
+    }
+    let module = go_module_path().ok_or_else(|| {
+        "move-symbol --rewrite-references requires go.mod to resolve Go package import paths"
+            .to_string()
+    })?;
+    let old_import = go_import_path(&module, &target.path).ok_or_else(|| {
+        format!(
+            "move-symbol --rewrite-references cannot derive Go import path for {}",
+            target.path
+        )
+    })?;
+    let new_import = go_import_path(&module, destination_path).ok_or_else(|| {
+        format!(
+            "move-symbol --rewrite-references cannot derive Go import path for {destination_path}"
+        )
+    })?;
+
+    let mut files = Vec::new();
+    let mut changed_files = Vec::new();
+    let mut rewritten_reference_count = 0;
+    for (path, references) in references_by_path {
+        let Some(contents) = reference_contents.get(&path) else {
+            return Err(format!(
+                "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
+            ));
+        };
+        if !code::parses_cleanly(&path, language_for_path(&path), contents)? {
+            return Err(format!(
+                "referencing file {path} is not valid Go code; refusing to trust stale references"
+            ));
+        }
+        let reference_package = go_package_name(contents).ok_or_else(|| {
+            format!("move-symbol --rewrite-references cannot determine Go package for {path}")
+        })?;
+        if go_has_unsupported_import_alias(contents, &old_import) {
+            return Err(format!(
+                "move-symbol --rewrite-references cannot safely rewrite aliased Go import of '{old_import}' in {path}"
+            ));
+        }
+
+        let (rewritten, changes) = go_rewrite_cross_package_references(
+            contents,
+            &references,
+            &target.name,
+            source_package,
+            destination_package,
+            &old_import,
+            &new_import,
+            &reference_package,
+        )?;
+        if changes == 0 {
+            return Err(format!(
+                "move-symbol --rewrite-references made no Go import or reference change in {path}"
+            ));
+        }
+        if !code::parses_cleanly(&path, language_for_path(&path), &rewritten)? {
+            return Err(format!(
+                "referencing file {path} would not parse after moving '{}'",
+                target.name
+            ));
+        }
+        rewritten_reference_count += references.len();
+        files.push(PlannedMoveFile {
+            path: path.clone(),
+            contents: rewritten,
+        });
+        changed_files.push(SymbolMoveFile {
+            path,
+            action: "rewrote imports".to_string(),
+        });
+    }
+
+    Ok(PlannedReferenceRewrite {
+        files,
+        changed_files,
+        rewritten_reference_count,
+    })
+}
+
+fn go_module_path() -> Option<String> {
+    parse_go_module_path(&fs::read_to_string("go.mod").ok()?)
+}
+
+fn parse_go_module_path(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        let rest = trimmed.strip_prefix("module ")?;
+        let module = rest.split_whitespace().next()?;
+        if module.is_empty() {
+            return None;
+        }
+        return Some(module.to_string());
+    }
+    None
+}
+
+fn go_import_path(module: &str, path: &str) -> Option<String> {
+    let parent = path_parent_segments(path);
+    if parent.is_empty() {
+        return Some(module.to_string());
+    }
+    Some(format!("{module}/{}", parent.join("/")))
+}
+
+fn go_has_unsupported_import_alias(contents: &str, import_path: &str) -> bool {
+    contents.lines().any(|line| {
+        let trimmed = line.trim();
+        let Some(before_quote) = trimmed.split('"').next() else {
+            return false;
+        };
+        trimmed.contains(&format!("\"{import_path}\""))
+            && before_quote.split_whitespace().count() > 1
+    })
+}
+
+fn go_rewrite_cross_package_references(
+    contents: &str,
+    references: &[CodeReference],
+    symbol_name: &str,
+    source_package: &str,
+    destination_package: &str,
+    old_import: &str,
+    new_import: &str,
+    reference_package: &str,
+) -> Result<(String, usize), String> {
+    let trailing_newline = contents.ends_with('\n');
+    let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut changes = go_rewrite_import_path(&mut lines, old_import, new_import);
+    if reference_package == destination_package {
+        changes += go_remove_import_path(&mut lines, new_import);
+    } else if !go_import_path_present(&lines, new_import) {
+        go_insert_import_path(&mut lines, new_import);
+        changes += 1;
+    }
+
+    for reference in references {
+        let index = usize::try_from(reference.line_start - 1).map_err(|error| error.to_string())?;
+        let Some(line) = lines.get(index).cloned() else {
+            return Err(format!(
+                "move-symbol reference line {} is past end",
+                reference.line_start
+            ));
+        };
+        let (rewritten, replacements) = if reference_package == destination_package {
+            replace_go_selector_in_line(&line, source_package, symbol_name, symbol_name)
+        } else if reference_package == source_package {
+            replace_go_identifier_with_selector(&line, symbol_name, destination_package)
+        } else {
+            replace_go_selector_in_line(
+                &line,
+                source_package,
+                symbol_name,
+                &format!("{destination_package}.{symbol_name}"),
+            )
+        };
+        if replacements == 0 {
+            return Err(format!(
+                "move-symbol --rewrite-references could not rewrite Go reference '{}' on line {}; rerun hugr index",
+                symbol_name, reference.line_start
+            ));
+        }
+        lines[index] = rewritten;
+        changes += replacements;
+    }
+
+    let mut rendered = lines.join("\n");
+    if trailing_newline {
+        rendered.push('\n');
+    }
+    Ok((rendered, changes))
+}
+
+fn go_import_path_present(lines: &[String], import_path: &str) -> bool {
+    lines
+        .iter()
+        .any(|line| line.trim().contains(&format!("\"{import_path}\"")))
+}
+
+fn go_rewrite_import_path(lines: &mut [String], old_import: &str, new_import: &str) -> usize {
+    let mut changes = 0;
+    for line in lines {
+        let old = format!("\"{old_import}\"");
+        if line.contains(&old) {
+            *line = line.replace(&old, &format!("\"{new_import}\""));
+            changes += 1;
+        }
+    }
+    changes
+}
+
+fn go_remove_import_path(lines: &mut Vec<String>, import_path: &str) -> usize {
+    let old_len = lines.len();
+    let quoted = format!("\"{import_path}\"");
+    lines.retain(|line| !line.trim().contains(&quoted));
+    old_len.saturating_sub(lines.len())
+}
+
+fn go_insert_import_path(lines: &mut Vec<String>, import_path: &str) {
+    let import_line = format!("import \"{import_path}\"");
+    if let Some(index) = lines.iter().position(|line| line.trim() == "import (") {
+        lines.insert(index + 1, format!("\t\"{import_path}\""));
+        return;
+    }
+    let insert_at = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("import "))
+        .map(|index| index + 1)
+        .or_else(|| {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with("package "))
+                .map(|index| index + 1)
+        })
+        .unwrap_or(0);
+    lines.insert(insert_at, import_line);
+}
+
+fn replace_go_selector_in_line(
+    line: &str,
+    old_package: &str,
+    symbol_name: &str,
+    replacement: &str,
+) -> (String, usize) {
+    replace_identifier_path_in_line(line, &format!("{old_package}.{symbol_name}"), replacement)
+}
+
+fn replace_go_identifier_with_selector(
+    line: &str,
+    symbol_name: &str,
+    destination_package: &str,
+) -> (String, usize) {
+    replace_identifier_path_in_line(
+        line,
+        symbol_name,
+        &format!("{destination_package}.{symbol_name}"),
+    )
+}
+
+fn replace_identifier_path_in_line(line: &str, old: &str, new: &str) -> (String, usize) {
+    let mut rendered = String::new();
+    let mut cursor = 0;
+    let mut replacements = 0;
+    for (start, matched) in line.match_indices(old) {
+        let end = start + matched.len();
+        if !identifier_path_boundary_before(line[..start].chars().next_back())
+            || !identifier_path_boundary_after(line[end..].chars().next())
+        {
+            continue;
+        }
+        rendered.push_str(&line[cursor..start]);
+        rendered.push_str(new);
+        cursor = end;
+        replacements += 1;
+    }
+    if replacements == 0 {
+        return (line.to_string(), 0);
+    }
+    rendered.push_str(&line[cursor..]);
+    (rendered, replacements)
+}
+
+fn identifier_path_boundary_before(char: Option<char>) -> bool {
+    char.is_none_or(|char| !(char.is_alphanumeric() || char == '_' || char == '.'))
+}
+
+fn identifier_path_boundary_after(char: Option<char>) -> bool {
+    char.is_none_or(|char| !(char.is_alphanumeric() || char == '_'))
+}
+
+fn starts_with_uppercase(value: &str) -> bool {
+    value.chars().next().is_some_and(char::is_uppercase)
 }
 
 fn plan_java_same_package_type_reference_awareness(
@@ -1301,15 +1780,43 @@ fn plan_swift_same_module_reference_awareness(
     // so the enclosing directory stands in for the module boundary.
     let source_parent = path_parent_segments(&target.path);
     let destination_parent = path_parent_segments(destination_path);
+    let source_module = swift_package_module_for_path(&target.path);
+    let destination_module = swift_package_module_for_path(destination_path);
     if source_parent != destination_parent {
-        return Err(
-            "move-symbol --rewrite-references currently supports Swift moves only within the same module directory"
-                .to_string(),
-        );
+        match (source_module.clone(), destination_module.clone()) {
+            (Some(source_module), Some(destination_module))
+                if source_module != destination_module =>
+            {
+                return plan_swift_cross_module_reference_awareness(
+                    target,
+                    destination_path,
+                    Some(source_module),
+                    Some(destination_module),
+                    references_by_path,
+                    reference_contents,
+                );
+            }
+            (Some(_), Some(_)) => {}
+            _ => {
+                return Err(
+                    "move-symbol --rewrite-references cannot keep Swift reference valid across module directories without Package.swift"
+                        .to_string(),
+                );
+            }
+        }
     }
 
     for (path, references) in references_by_path {
-        if path_parent_segments(&path) != source_parent {
+        if source_parent != destination_parent {
+            let reference_module = swift_package_module_for_path(&path).ok_or_else(|| {
+                format!("move-symbol --rewrite-references cannot resolve Swift module for {path}")
+            })?;
+            if Some(reference_module) != source_module {
+                return Err(format!(
+                    "move-symbol --rewrite-references cannot keep Swift reference {path} valid across module directories"
+                ));
+            }
+        } else if path_parent_segments(&path) != source_parent {
             return Err(format!(
                 "move-symbol --rewrite-references cannot keep Swift reference {path} valid across module directories"
             ));
@@ -1342,6 +1849,139 @@ fn plan_swift_same_module_reference_awareness(
     }
 
     Ok(PlannedReferenceRewrite::default())
+}
+
+fn plan_swift_cross_module_reference_awareness(
+    target: &CodeSymbol,
+    destination_path: &str,
+    source_module: Option<String>,
+    destination_module: Option<String>,
+    references_by_path: BTreeMap<String, Vec<CodeReference>>,
+    reference_contents: BTreeMap<String, String>,
+) -> Result<PlannedReferenceRewrite, String> {
+    let Some(source_module) = source_module else {
+        return Err(format!(
+            "move-symbol --rewrite-references requires Package.swift to resolve Swift module for {}",
+            target.path
+        ));
+    };
+    let Some(destination_module) = destination_module else {
+        return Err(format!(
+            "move-symbol --rewrite-references requires Package.swift to resolve Swift module for {destination_path}"
+        ));
+    };
+    if source_module == destination_module {
+        return Ok(PlannedReferenceRewrite::default());
+    }
+    if !swift_signature_is_public(&target.signature) {
+        return Err(format!(
+            "move-symbol --rewrite-references cannot move internal Swift {} '{}' across modules",
+            target.kind, target.name
+        ));
+    }
+
+    let mut files = Vec::new();
+    let mut changed_files = Vec::new();
+    let mut rewritten_reference_count = 0;
+    for (path, references) in references_by_path {
+        let Some(contents) = reference_contents.get(&path) else {
+            return Err(format!(
+                "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
+            ));
+        };
+        if !code::parses_cleanly(&path, language_for_path(&path), contents)? {
+            return Err(format!(
+                "referencing file {path} is not valid Swift code; refusing to trust stale references"
+            ));
+        }
+        let reference_module = swift_package_module_for_path(&path).ok_or_else(|| {
+            format!("move-symbol --rewrite-references cannot resolve Swift module for {path}")
+        })?;
+        for reference in &references {
+            let line = line_at(contents, reference.line_start).ok_or_else(|| {
+                format!(
+                    "move-symbol reference line {} is past end of {path}",
+                    reference.line_start
+                )
+            })?;
+            let (_line, matches) = replace_identifier_in_line(line, &target.name, &target.name);
+            if matches == 0 {
+                return Err(format!(
+                    "move-symbol --rewrite-references could not verify Swift reference '{}' on {path}:{}; rerun hugr index",
+                    target.name, reference.line_start
+                ));
+            }
+        }
+        if reference_module == destination_module {
+            continue;
+        }
+        let (rewritten, changes) = swift_insert_import(contents, &destination_module);
+        if changes == 0 {
+            continue;
+        }
+        if !code::parses_cleanly(&path, language_for_path(&path), &rewritten)? {
+            return Err(format!(
+                "referencing file {path} would not parse after moving '{}'",
+                target.name
+            ));
+        }
+        rewritten_reference_count += references.len();
+        files.push(PlannedMoveFile {
+            path: path.clone(),
+            contents: rewritten,
+        });
+        changed_files.push(SymbolMoveFile {
+            path,
+            action: "rewrote imports".to_string(),
+        });
+    }
+
+    Ok(PlannedReferenceRewrite {
+        files,
+        changed_files,
+        rewritten_reference_count,
+    })
+}
+
+fn swift_signature_is_public(signature: &str) -> bool {
+    let signature = signature.trim_start();
+    signature.starts_with("public ") || signature.starts_with("open ")
+}
+
+fn swift_package_module_for_path(path: &str) -> Option<String> {
+    fs::metadata("Package.swift").ok()?;
+    let segments = path_segments(path);
+    if segments.len() >= 3 && segments[0] == "Sources" {
+        return Some(segments[1].clone());
+    }
+    if segments.len() >= 3 && segments[0] == "Tests" {
+        return Some(segments[1].trim_end_matches("Tests").to_string());
+    }
+    None
+}
+
+fn swift_insert_import(contents: &str, module: &str) -> (String, usize) {
+    if contents
+        .lines()
+        .any(|line| line.trim() == format!("import {module}"))
+    {
+        return (contents.to_string(), 0);
+    }
+    let trailing_newline = contents.ends_with('\n');
+    let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
+    let insert_at = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.trim_start().starts_with("import "))
+        .map(|(index, _)| index + 1)
+        .last()
+        .unwrap_or(0);
+    lines.insert(insert_at, format!("import {module}"));
+    let mut rendered = lines.join("\n");
+    if trailing_newline {
+        rendered.push('\n');
+    }
+    (rendered, 1)
 }
 
 fn swift_reference_safe_kind(kind: &str) -> bool {
@@ -2410,6 +3050,16 @@ fn rewrite_javascript_references_on_lines(
         destination_path,
         &used_namespace_aliases,
     );
+    let commonjs_aliases = javascript_commonjs_aliases_for_source(&lines, path, source_path);
+    let used_commonjs_aliases =
+        javascript_used_namespace_aliases(&lines, line_numbers, &commonjs_aliases, symbol_name)?;
+    replacement_count += rewrite_javascript_commonjs_namespace_require_lines(
+        &mut lines,
+        path,
+        source_path,
+        destination_path,
+        &used_commonjs_aliases,
+    );
 
     for line_number in line_numbers.iter().rev() {
         if *line_number < 1 {
@@ -2479,6 +3129,16 @@ fn rewrite_javascript_reference_line(
     symbol_name: &str,
 ) -> (Vec<String>, usize) {
     if let Some((rewritten, replacements)) = rewrite_javascript_named_import_line(
+        line,
+        reference_path,
+        source_path,
+        destination_path,
+        symbol_name,
+    ) {
+        return (rewritten, replacements);
+    }
+
+    if let Some((rewritten, replacements)) = rewrite_javascript_commonjs_require_line(
         line,
         reference_path,
         source_path,
@@ -2609,6 +3269,176 @@ fn javascript_namespace_aliases_for_source(
     aliases
 }
 
+fn javascript_commonjs_aliases_for_source(
+    lines: &[String],
+    reference_path: &str,
+    source_path: &str,
+) -> BTreeSet<String> {
+    let mut aliases = BTreeSet::new();
+    for line in lines {
+        let Some(parts) = javascript_commonjs_namespace_require_parts(line) else {
+            continue;
+        };
+        if javascript_module_spec_targets_path(&parts.module_spec, reference_path, source_path) {
+            aliases.insert(parts.alias);
+        }
+    }
+    aliases
+}
+
+fn rewrite_javascript_commonjs_namespace_require_lines(
+    lines: &mut [String],
+    reference_path: &str,
+    source_path: &str,
+    destination_path: &str,
+    used_aliases: &BTreeSet<String>,
+) -> usize {
+    if used_aliases.is_empty() {
+        return 0;
+    }
+
+    let mut replacement_count = 0;
+    for line in lines {
+        let Some(parts) = javascript_commonjs_namespace_require_parts(line) else {
+            continue;
+        };
+        if !used_aliases.contains(&parts.alias)
+            || !javascript_module_spec_targets_path(&parts.module_spec, reference_path, source_path)
+        {
+            continue;
+        }
+        let Some(new_module_spec) = javascript_module_spec_for_destination(
+            reference_path,
+            destination_path,
+            &parts.module_spec,
+        ) else {
+            continue;
+        };
+        *line = render_javascript_commonjs_namespace_require_line(
+            &parts.leading,
+            &parts.keyword,
+            &parts.alias,
+            &parts.quote,
+            &new_module_spec,
+            &parts.suffix,
+        );
+        replacement_count += 1;
+    }
+    replacement_count
+}
+
+fn rewrite_javascript_commonjs_require_line(
+    line: &str,
+    reference_path: &str,
+    source_path: &str,
+    destination_path: &str,
+    symbol_name: &str,
+) -> Option<(Vec<String>, usize)> {
+    if let Some(result) = rewrite_javascript_commonjs_destructured_require_line(
+        line,
+        reference_path,
+        source_path,
+        destination_path,
+        symbol_name,
+    ) {
+        return Some(result);
+    }
+
+    rewrite_javascript_commonjs_property_require_line(
+        line,
+        reference_path,
+        source_path,
+        destination_path,
+        symbol_name,
+    )
+}
+
+fn rewrite_javascript_commonjs_destructured_require_line(
+    line: &str,
+    reference_path: &str,
+    source_path: &str,
+    destination_path: &str,
+    symbol_name: &str,
+) -> Option<(Vec<String>, usize)> {
+    let parts = javascript_commonjs_destructured_require_parts(line)?;
+    if !javascript_module_spec_targets_path(&parts.module_spec, reference_path, source_path) {
+        return None;
+    }
+    let new_module_spec = javascript_module_spec_for_destination(
+        reference_path,
+        destination_path,
+        &parts.module_spec,
+    )?;
+
+    let mut moved_items = Vec::new();
+    let mut kept_items = Vec::new();
+    for item in parts.items {
+        if javascript_import_item_name(&item.replace(':', " as ")) == symbol_name
+            || javascript_commonjs_item_name(&item) == symbol_name
+        {
+            moved_items.push(item);
+        } else {
+            kept_items.push(item);
+        }
+    }
+    if moved_items.is_empty() {
+        return None;
+    }
+
+    let mut rewritten = Vec::new();
+    if !kept_items.is_empty() {
+        rewritten.push(render_javascript_commonjs_destructured_require_line(
+            &parts.leading,
+            &parts.keyword,
+            &kept_items,
+            &parts.quote,
+            &parts.module_spec,
+            &parts.suffix,
+        ));
+    }
+    rewritten.push(render_javascript_commonjs_destructured_require_line(
+        &parts.leading,
+        &parts.keyword,
+        &moved_items,
+        &parts.quote,
+        &new_module_spec,
+        &parts.suffix,
+    ));
+    Some((rewritten, moved_items.len()))
+}
+
+fn rewrite_javascript_commonjs_property_require_line(
+    line: &str,
+    reference_path: &str,
+    source_path: &str,
+    destination_path: &str,
+    symbol_name: &str,
+) -> Option<(Vec<String>, usize)> {
+    let parts = javascript_commonjs_property_require_parts(line)?;
+    if parts.property != symbol_name
+        || !javascript_module_spec_targets_path(&parts.module_spec, reference_path, source_path)
+    {
+        return None;
+    }
+    let new_module_spec = javascript_module_spec_for_destination(
+        reference_path,
+        destination_path,
+        &parts.module_spec,
+    )?;
+    Some((
+        vec![render_javascript_commonjs_property_require_line(
+            &parts.leading,
+            &parts.keyword,
+            &parts.alias,
+            &parts.quote,
+            &new_module_spec,
+            &parts.property,
+            &parts.suffix,
+        )],
+        1,
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct JavascriptNamedImportParts {
     leading: String,
@@ -2625,6 +3455,37 @@ struct JavascriptNamespaceImportParts {
     alias: String,
     quote: String,
     module_spec: String,
+    suffix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JavascriptCommonJsDestructuredRequireParts {
+    leading: String,
+    keyword: String,
+    items: Vec<String>,
+    quote: String,
+    module_spec: String,
+    suffix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JavascriptCommonJsNamespaceRequireParts {
+    leading: String,
+    keyword: String,
+    alias: String,
+    quote: String,
+    module_spec: String,
+    suffix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JavascriptCommonJsPropertyRequireParts {
+    leading: String,
+    keyword: String,
+    alias: String,
+    quote: String,
+    module_spec: String,
+    property: String,
     suffix: String,
 }
 
@@ -2665,6 +3526,112 @@ fn javascript_namespace_import_parts(line: &str) -> Option<JavascriptNamespaceIm
         module_spec,
         suffix,
     })
+}
+
+fn javascript_commonjs_destructured_require_parts(
+    line: &str,
+) -> Option<JavascriptCommonJsDestructuredRequireParts> {
+    if javascript_import_line_is_unsupported(line) {
+        return None;
+    }
+    let trimmed = line.trim_start();
+    let leading = line[..line.len().saturating_sub(trimmed.len())].to_string();
+    let (keyword, rest) = javascript_variable_keyword_and_rest(trimmed)?;
+    let rest = rest.trim_start();
+    let after_open = rest.strip_prefix('{')?;
+    let close_index = after_open.find('}')?;
+    let item_text = &after_open[..close_index];
+    let after_brace = after_open[close_index + 1..].trim_start();
+    let after_equals = after_brace.strip_prefix('=')?.trim_start();
+    let after_require = after_equals.strip_prefix("require")?.trim_start();
+    let (quote, module_spec, suffix) = javascript_require_call_parts(after_require)?;
+    Some(JavascriptCommonJsDestructuredRequireParts {
+        leading,
+        keyword,
+        items: split_javascript_import_items(item_text)?,
+        quote,
+        module_spec,
+        suffix,
+    })
+}
+
+fn javascript_commonjs_namespace_require_parts(
+    line: &str,
+) -> Option<JavascriptCommonJsNamespaceRequireParts> {
+    if javascript_import_line_is_unsupported(line) {
+        return None;
+    }
+    let trimmed = line.trim_start();
+    let leading = line[..line.len().saturating_sub(trimmed.len())].to_string();
+    let (keyword, rest) = javascript_variable_keyword_and_rest(trimmed)?;
+    let (alias, after_alias) = split_javascript_identifier(rest.trim_start())?;
+    let after_equals = after_alias.trim_start().strip_prefix('=')?.trim_start();
+    let after_require = after_equals.strip_prefix("require")?.trim_start();
+    let (quote, module_spec, suffix) = javascript_require_call_parts(after_require)?;
+    Some(JavascriptCommonJsNamespaceRequireParts {
+        leading,
+        keyword,
+        alias: alias.to_string(),
+        quote,
+        module_spec,
+        suffix,
+    })
+}
+
+fn javascript_commonjs_property_require_parts(
+    line: &str,
+) -> Option<JavascriptCommonJsPropertyRequireParts> {
+    if javascript_import_line_is_unsupported(line) {
+        return None;
+    }
+    let trimmed = line.trim_start();
+    let leading = line[..line.len().saturating_sub(trimmed.len())].to_string();
+    let (keyword, rest) = javascript_variable_keyword_and_rest(trimmed)?;
+    let (alias, after_alias) = split_javascript_identifier(rest.trim_start())?;
+    let after_equals = after_alias.trim_start().strip_prefix('=')?.trim_start();
+    let after_require = after_equals.strip_prefix("require")?.trim_start();
+    let (quote, module_spec, after_call) = javascript_require_call_parts(after_require)?;
+    let property_rest = after_call.trim_start().strip_prefix('.')?;
+    let (property, suffix) = split_javascript_identifier(property_rest)?;
+    let suffix = suffix.trim().to_string();
+    if suffix != ";" && !suffix.is_empty() {
+        return None;
+    }
+    Some(JavascriptCommonJsPropertyRequireParts {
+        leading,
+        keyword,
+        alias: alias.to_string(),
+        quote,
+        module_spec,
+        property: property.to_string(),
+        suffix,
+    })
+}
+
+fn javascript_variable_keyword_and_rest(trimmed: &str) -> Option<(String, &str)> {
+    for keyword in ["const", "let", "var"] {
+        if let Some(rest) = trimmed.strip_prefix(keyword)
+            && rest.starts_with(char::is_whitespace)
+        {
+            return Some((keyword.to_string(), rest));
+        }
+    }
+    None
+}
+
+fn javascript_require_call_parts(value: &str) -> Option<(String, String, String)> {
+    let value = value.trim_start();
+    let after_open = value.strip_prefix('(')?.trim_start();
+    let quote = after_open.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let after_quote = &after_open[quote.len_utf8()..];
+    let end_quote = after_quote.find(quote)?;
+    let module_spec = after_quote[..end_quote].to_string();
+    let after_module = after_quote[end_quote + quote.len_utf8()..].trim_start();
+    let suffix = after_module.strip_prefix(')')?.trim();
+    Some((quote.to_string(), module_spec, suffix.to_string()))
 }
 
 fn javascript_import_keyword_and_rest(trimmed: &str) -> Option<(String, &str)> {
@@ -2777,6 +3744,50 @@ fn javascript_import_item_name(item: &str) -> String {
         .map(|(name, _alias)| name.trim())
         .unwrap_or(item)
         .to_string()
+}
+
+fn javascript_commonjs_item_name(item: &str) -> String {
+    item.split_once(':')
+        .map(|(name, _alias)| name.trim())
+        .unwrap_or(item.trim())
+        .to_string()
+}
+
+fn render_javascript_commonjs_destructured_require_line(
+    leading: &str,
+    keyword: &str,
+    items: &[String],
+    quote: &str,
+    module_spec: &str,
+    suffix: &str,
+) -> String {
+    format!(
+        "{leading}{keyword} {{ {} }} = require({quote}{module_spec}{quote}){suffix}",
+        items.join(", ")
+    )
+}
+
+fn render_javascript_commonjs_namespace_require_line(
+    leading: &str,
+    keyword: &str,
+    alias: &str,
+    quote: &str,
+    module_spec: &str,
+    suffix: &str,
+) -> String {
+    format!("{leading}{keyword} {alias} = require({quote}{module_spec}{quote}){suffix}")
+}
+
+fn render_javascript_commonjs_property_require_line(
+    leading: &str,
+    keyword: &str,
+    alias: &str,
+    quote: &str,
+    module_spec: &str,
+    property: &str,
+    suffix: &str,
+) -> String {
+    format!("{leading}{keyword} {alias} = require({quote}{module_spec}{quote}).{property}{suffix}")
 }
 
 fn javascript_line_has_member_reference(
@@ -4105,6 +5116,111 @@ mod tests {
     }
 
     #[test]
+    fn plans_move_with_commonjs_requires_and_exports() {
+        let source = "function helper() {\n    return 1;\n}\n\nfunction other() {\n    return 2;\n}\n\nmodule.exports = { helper, other };\n";
+        let destination =
+            "function existing() {\n    return 0;\n}\n\nmodule.exports = { existing };\n";
+        let caller = "const { helper: runHelper, other } = require(\"./pluginHooks.js\");\nconst hooks = require(\"./pluginHooks.js\");\nconst direct = require(\"./pluginHooks.js\").helper;\n\nconst value = runHelper() + hooks.helper() + direct();\n";
+        let target = resolve_symbol_in_source(
+            "src/pluginHooks.js",
+            source,
+            "helper",
+            Some("function"),
+            "move",
+        )
+        .unwrap();
+        let references = vec![
+            CodeReference {
+                path: "src/main.js".to_string(),
+                language: Some("javascript".to_string()),
+                target_path: "src/pluginHooks.js".to_string(),
+                target_name: "helper".to_string(),
+                target_kind: "function".to_string(),
+                kind: "import".to_string(),
+                line_start: 1,
+                excerpt: "const { helper: runHelper, other } = require(\"./pluginHooks.js\");"
+                    .to_string(),
+            },
+            CodeReference {
+                path: "src/main.js".to_string(),
+                language: Some("javascript".to_string()),
+                target_path: "src/pluginHooks.js".to_string(),
+                target_name: "helper".to_string(),
+                target_kind: "function".to_string(),
+                kind: "import".to_string(),
+                line_start: 3,
+                excerpt: "const direct = require(\"./pluginHooks.js\").helper;".to_string(),
+            },
+            CodeReference {
+                path: "src/main.js".to_string(),
+                language: Some("javascript".to_string()),
+                target_path: "src/pluginHooks.js".to_string(),
+                target_name: "helper".to_string(),
+                target_kind: "function".to_string(),
+                kind: "call".to_string(),
+                line_start: 5,
+                excerpt: "const value = runHelper() + hooks.helper() + direct();".to_string(),
+            },
+        ];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "src/helpers.js",
+            destination,
+            vec![("src/main.js".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+        let source_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/pluginHooks.js")
+            .unwrap();
+        let destination_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/helpers.js")
+            .unwrap();
+        let caller_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/main.js")
+            .unwrap();
+
+        assert!(!source_file.contents.contains("function helper"));
+        assert!(source_file.contents.contains("module.exports = { other };"));
+        assert!(destination_file.contents.contains("function helper()"));
+        assert!(
+            destination_file
+                .contents
+                .contains("module.exports = { existing, helper };")
+        );
+        assert!(
+            caller_file
+                .contents
+                .contains("const { other } = require(\"./pluginHooks.js\");")
+        );
+        assert!(
+            caller_file
+                .contents
+                .contains("const { helper: runHelper } = require(\"./helpers.js\");")
+        );
+        assert!(
+            caller_file
+                .contents
+                .contains("const hooks = require(\"./helpers.js\");")
+        );
+        assert!(
+            caller_file
+                .contents
+                .contains("const direct = require(\"./helpers.js\").helper;")
+        );
+        assert_eq!(planned.summary.rewritten_reference_count, 5);
+    }
+
+    #[test]
     fn plans_go_same_package_move_with_references_without_text_rewrites() {
         let source = "package plugin\n\nfunc helper() int {\n    return 1\n}\n\nfunc other() int {\n    return 2\n}\n";
         let destination = "package plugin\n\nfunc existing() int {\n    return 0\n}\n";
@@ -4237,7 +5353,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.contains("same package directory"), "{error}");
+        assert!(error.contains("unexported Go symbol"), "{error}");
     }
 
     #[test]
@@ -4766,7 +5882,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.contains("same module directory"), "{error}");
+        assert!(error.contains("without Package.swift"), "{error}");
     }
 
     #[test]
