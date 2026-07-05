@@ -415,12 +415,6 @@ fn plan_reference_rewrites(
     if inbound_references.is_empty() {
         return Ok(PlannedReferenceRewrite::default());
     }
-    if source_language != Some("rust") || destination_language != Some("rust") {
-        return Err(
-            "move-symbol --rewrite-references currently supports Rust source files only"
-                .to_string(),
-        );
-    }
     if inbound_references
         .iter()
         .any(|reference| reference.path == target.path || reference.path == destination_path)
@@ -431,18 +425,6 @@ fn plan_reference_rewrites(
         );
     }
 
-    let old_module = rust_module_path_for_source(&target.path).ok_or_else(|| {
-        format!(
-            "move-symbol --rewrite-references cannot derive a Rust module path for {}",
-            target.path
-        )
-    })?;
-    let new_module = rust_module_path_for_source(destination_path).ok_or_else(|| {
-        format!(
-            "move-symbol --rewrite-references cannot derive a Rust module path for {destination_path}"
-        )
-    })?;
-    let old_qualified = format!("{old_module}::{}", target.name);
     let reference_contents = reference_files.into_iter().collect::<BTreeMap<_, _>>();
     let mut references_by_path = BTreeMap::<String, Vec<CodeReference>>::new();
     for reference in inbound_references {
@@ -452,6 +434,84 @@ fn plan_reference_rewrites(
             .push(reference.clone());
     }
 
+    if source_language == Some("rust") && destination_language == Some("rust") {
+        let old_module = rust_module_path_for_source(&target.path).ok_or_else(|| {
+            format!(
+                "move-symbol --rewrite-references cannot derive a Rust module path for {}",
+                target.path
+            )
+        })?;
+        let new_module = rust_module_path_for_source(destination_path).ok_or_else(|| {
+            format!(
+                "move-symbol --rewrite-references cannot derive a Rust module path for {destination_path}"
+            )
+        })?;
+        let old_qualified = format!("{old_module}::{}", target.name);
+        return rewrite_reference_files(
+            target,
+            references_by_path,
+            reference_contents,
+            &old_qualified,
+            |path, contents, line_numbers| {
+                rewrite_rust_references_on_lines(
+                    path,
+                    contents,
+                    &old_module,
+                    &new_module,
+                    &target.name,
+                    line_numbers,
+                )
+            },
+        );
+    }
+
+    if source_language == Some("python") && destination_language == Some("python") {
+        let old_module = python_module_path_for_source(&target.path).ok_or_else(|| {
+            format!(
+                "move-symbol --rewrite-references cannot derive a Python module path for {}",
+                target.path
+            )
+        })?;
+        let new_module = python_module_path_for_source(destination_path).ok_or_else(|| {
+            format!(
+                "move-symbol --rewrite-references cannot derive a Python module path for {destination_path}"
+            )
+        })?;
+        let old_qualified = format!("{old_module}.{}", target.name);
+        return rewrite_reference_files(
+            target,
+            references_by_path,
+            reference_contents,
+            &old_qualified,
+            |path, contents, line_numbers| {
+                rewrite_python_references_on_lines(
+                    path,
+                    contents,
+                    &old_module,
+                    &new_module,
+                    &target.name,
+                    line_numbers,
+                )
+            },
+        );
+    }
+
+    Err(
+        "move-symbol --rewrite-references currently supports Rust and Python source files only"
+            .to_string(),
+    )
+}
+
+fn rewrite_reference_files<F>(
+    target: &CodeSymbol,
+    references_by_path: BTreeMap<String, Vec<CodeReference>>,
+    reference_contents: BTreeMap<String, String>,
+    old_reference_description: &str,
+    mut rewrite_file: F,
+) -> Result<PlannedReferenceRewrite, String>
+where
+    F: FnMut(&str, &str, &BTreeSet<i64>) -> Result<(String, usize), String>,
+{
     let mut files = Vec::new();
     let mut changed_files = Vec::new();
     let mut rewritten_reference_count = 0;
@@ -465,17 +525,10 @@ fn plan_reference_rewrites(
         for reference in &references {
             line_numbers.insert(reference.line_start);
         }
-        let (rewritten, replacement_count) = rewrite_rust_references_on_lines(
-            &path,
-            contents,
-            &old_module,
-            &new_module,
-            &target.name,
-            &line_numbers,
-        )?;
+        let (rewritten, replacement_count) = rewrite_file(&path, contents, &line_numbers)?;
         if replacement_count == 0 {
             return Err(format!(
-                "move-symbol --rewrite-references could not rewrite {old_qualified} in indexed references for {path}"
+                "move-symbol --rewrite-references could not rewrite {old_reference_description} in indexed references for {path}"
             ));
         }
         if !code::parses_cleanly(&path, language_for_path(&path), &rewritten)? {
@@ -949,7 +1002,11 @@ fn matches_direct_rust_use_item(item: &RustUseTree, symbol_name: &str) -> bool {
 }
 
 fn rust_use_tree_is_empty(tree: &RustUseTree) -> bool {
-    matches!(tree, RustUseTree::Group(items) if items.is_empty())
+    match tree {
+        RustUseTree::Group(items) => items.is_empty(),
+        RustUseTree::Path { child, .. } => rust_use_tree_is_empty(child),
+        RustUseTree::Name(_) => false,
+    }
 }
 
 fn rust_use_item_imports_symbol(item: &str, symbol_name: &str) -> bool {
@@ -1048,6 +1105,430 @@ fn collect_rust_module_aliases_from_child(tree: &RustUseTree, aliases: &mut BTre
             }
         }
     }
+}
+
+fn python_module_path_for_source(path: &str) -> Option<String> {
+    let without_extension = path.strip_suffix(".py")?;
+    let module = if without_extension == "__init__" {
+        String::new()
+    } else if let Some(package) = without_extension.strip_suffix("/__init__") {
+        package.replace('/', ".")
+    } else {
+        without_extension.replace('/', ".")
+    };
+    if module.is_empty() {
+        None
+    } else {
+        Some(module)
+    }
+}
+
+fn rewrite_python_references_on_lines(
+    path: &str,
+    contents: &str,
+    old_module: &str,
+    new_module: &str,
+    symbol_name: &str,
+    line_numbers: &BTreeSet<i64>,
+) -> Result<(String, usize), String> {
+    let trailing_newline = contents.ends_with('\n');
+    let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
+    let old_module_leaf = python_module_leaf(old_module);
+    let new_module_leaf = python_module_leaf(new_module);
+    let mut replacement_count = rewrite_python_module_import_lines(
+        &mut lines,
+        old_module,
+        new_module,
+        &old_module_leaf,
+        &new_module_leaf,
+    );
+    let allow_module_qualified_rewrites = replacement_count > 0;
+
+    for line_number in line_numbers.iter().rev() {
+        if *line_number < 1 {
+            return Err(format!(
+                "move-symbol reference line {line_number} in {path} is invalid"
+            ));
+        }
+        let index = usize::try_from(line_number - 1).map_err(|error| error.to_string())?;
+        let Some(line) = lines.get(index) else {
+            return Err(format!(
+                "move-symbol reference line {line_number} is past end of {path}"
+            ));
+        };
+        let (rewritten, line_replacements) = rewrite_python_reference_line(
+            line,
+            old_module,
+            new_module,
+            &old_module_leaf,
+            &new_module_leaf,
+            symbol_name,
+            allow_module_qualified_rewrites,
+        );
+        if line_replacements > 0 {
+            lines.splice(index..=index, rewritten);
+            replacement_count += line_replacements;
+        }
+    }
+
+    let mut rendered = lines.join("\n");
+    if trailing_newline {
+        rendered.push('\n');
+    }
+    Ok((rendered, replacement_count))
+}
+
+fn python_module_leaf(module_path: &str) -> String {
+    module_path
+        .rsplit('.')
+        .next()
+        .unwrap_or(module_path)
+        .to_string()
+}
+
+fn rewrite_python_module_import_lines(
+    lines: &mut [String],
+    old_module: &str,
+    new_module: &str,
+    old_module_leaf: &str,
+    new_module_leaf: &str,
+) -> usize {
+    let mut replacement_count = 0;
+    for line in lines {
+        if python_import_line_is_unsupported(line) {
+            continue;
+        }
+        if let Some((rewritten, replacements)) = rewrite_python_import_line(
+            line,
+            old_module,
+            new_module,
+            old_module_leaf,
+            new_module_leaf,
+        ) {
+            *line = rewritten;
+            replacement_count += replacements;
+        } else if let Some((rewritten, replacements)) = rewrite_python_from_module_import_line(
+            line,
+            old_module,
+            new_module,
+            old_module_leaf,
+            new_module_leaf,
+        ) {
+            *line = rewritten;
+            replacement_count += replacements;
+        }
+    }
+    replacement_count
+}
+
+fn rewrite_python_reference_line(
+    line: &str,
+    old_module: &str,
+    new_module: &str,
+    old_module_leaf: &str,
+    new_module_leaf: &str,
+    symbol_name: &str,
+    allow_module_qualified_rewrites: bool,
+) -> (Vec<String>, usize) {
+    if let Some((rewritten, replacements)) = rewrite_python_from_symbol_import_line(
+        line,
+        old_module,
+        new_module,
+        old_module_leaf,
+        new_module_leaf,
+        symbol_name,
+    ) {
+        return (rewritten, replacements);
+    }
+
+    if !allow_module_qualified_rewrites {
+        return (vec![line.to_string()], 0);
+    }
+
+    let old_qualified = format!("{old_module}.{symbol_name}");
+    let new_qualified = format!("{new_module}.{symbol_name}");
+    let (rewritten, qualified_replacements) =
+        replace_python_attr_in_line(line, &old_qualified, &new_qualified);
+    if qualified_replacements > 0 {
+        return (vec![rewritten], qualified_replacements);
+    }
+
+    let old_leaf_qualified = format!("{old_module_leaf}.{symbol_name}");
+    let new_leaf_qualified = format!("{new_module_leaf}.{symbol_name}");
+    let (rewritten, leaf_replacements) =
+        replace_python_attr_in_line(line, &old_leaf_qualified, &new_leaf_qualified);
+    if leaf_replacements > 0 {
+        return (vec![rewritten], leaf_replacements);
+    }
+
+    (vec![line.to_string()], 0)
+}
+
+fn rewrite_python_from_symbol_import_line(
+    line: &str,
+    old_module: &str,
+    new_module: &str,
+    old_module_leaf: &str,
+    new_module_leaf: &str,
+    symbol_name: &str,
+) -> Option<(Vec<String>, usize)> {
+    if python_import_line_is_unsupported(line) {
+        return None;
+    }
+    let (prefix, module, items) = python_from_import_parts(line)?;
+    let rewritten_module = python_new_module_for_import(
+        module,
+        old_module,
+        new_module,
+        old_module_leaf,
+        new_module_leaf,
+    )?;
+    let mut moved_items = Vec::new();
+    let mut kept_items = Vec::new();
+    for item in items {
+        if python_import_item_name(&item) == symbol_name {
+            moved_items.push(item);
+        } else {
+            kept_items.push(item);
+        }
+    }
+    if moved_items.is_empty() {
+        return None;
+    }
+
+    let mut rewritten = Vec::new();
+    if !kept_items.is_empty() {
+        rewritten.push(format!(
+            "{prefix}from {module} import {}",
+            kept_items.join(", ")
+        ));
+    }
+    rewritten.push(format!(
+        "{prefix}from {rewritten_module} import {}",
+        moved_items.join(", ")
+    ));
+    Some((rewritten, moved_items.len()))
+}
+
+fn rewrite_python_import_line(
+    line: &str,
+    old_module: &str,
+    new_module: &str,
+    old_module_leaf: &str,
+    new_module_leaf: &str,
+) -> Option<(String, usize)> {
+    let (prefix, items) = python_import_parts(line)?;
+    let mut replacements = 0;
+    let rewritten_items = items
+        .into_iter()
+        .map(|item| {
+            let name = python_import_item_name(&item);
+            if let Some(rewritten_name) = python_new_module_for_import(
+                &name,
+                old_module,
+                new_module,
+                old_module_leaf,
+                new_module_leaf,
+            ) {
+                replacements += 1;
+                python_replace_import_item_name(&item, &rewritten_name)
+            } else {
+                item
+            }
+        })
+        .collect::<Vec<_>>();
+    if replacements == 0 {
+        None
+    } else {
+        Some((
+            format!("{prefix}import {}", rewritten_items.join(", ")),
+            replacements,
+        ))
+    }
+}
+
+fn rewrite_python_from_module_import_line(
+    line: &str,
+    old_module: &str,
+    new_module: &str,
+    old_module_leaf: &str,
+    new_module_leaf: &str,
+) -> Option<(String, usize)> {
+    let (prefix, module, items) = python_from_import_parts(line)?;
+    let mut replacements = 0;
+    let rewritten_items = items
+        .into_iter()
+        .map(|item| {
+            let item_name = python_import_item_name(&item);
+            if python_from_item_resolves_to_old_module(
+                module,
+                &item_name,
+                old_module,
+                old_module_leaf,
+            ) {
+                replacements += 1;
+                python_replace_import_item_name(
+                    &item,
+                    &python_from_item_new_name(module, new_module, new_module_leaf),
+                )
+            } else {
+                item
+            }
+        })
+        .collect::<Vec<_>>();
+    if replacements == 0 {
+        None
+    } else {
+        Some((
+            format!(
+                "{prefix}from {module} import {}",
+                rewritten_items.join(", ")
+            ),
+            replacements,
+        ))
+    }
+}
+
+fn python_import_line_is_unsupported(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.contains('#')
+        || trimmed.contains('\\')
+        || trimmed.contains('(')
+        || trimmed.contains(')')
+        || trimmed.ends_with(',')
+}
+
+fn python_import_parts(line: &str) -> Option<(&str, Vec<String>)> {
+    let trimmed = line.trim_start();
+    let prefix_len = line.len().saturating_sub(trimmed.len());
+    let rest = trimmed.strip_prefix("import ")?;
+    if rest.trim().is_empty() || rest.contains(" import ") {
+        return None;
+    }
+    Some((&line[..prefix_len], split_python_import_items(rest)?))
+}
+
+fn python_from_import_parts(line: &str) -> Option<(&str, &str, Vec<String>)> {
+    let trimmed = line.trim_start();
+    let prefix_len = line.len().saturating_sub(trimmed.len());
+    let rest = trimmed.strip_prefix("from ")?;
+    let (module, items) = rest.split_once(" import ")?;
+    let module = module.trim();
+    if module.is_empty() || items.trim().is_empty() {
+        return None;
+    }
+    Some((
+        &line[..prefix_len],
+        module,
+        split_python_import_items(items)?,
+    ))
+}
+
+fn split_python_import_items(items: &str) -> Option<Vec<String>> {
+    let parsed = items
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+fn python_new_module_for_import(
+    module: &str,
+    old_module: &str,
+    new_module: &str,
+    old_module_leaf: &str,
+    new_module_leaf: &str,
+) -> Option<String> {
+    if module == old_module {
+        Some(new_module.to_string())
+    } else if module == old_module_leaf {
+        Some(new_module_leaf.to_string())
+    } else if module == format!(".{old_module_leaf}") {
+        Some(format!(".{new_module_leaf}"))
+    } else {
+        None
+    }
+}
+
+fn python_from_item_resolves_to_old_module(
+    from_module: &str,
+    item_name: &str,
+    old_module: &str,
+    old_module_leaf: &str,
+) -> bool {
+    if item_name != old_module_leaf {
+        return false;
+    }
+    if from_module.starts_with('.') {
+        return true;
+    }
+    let joined = format!("{from_module}.{item_name}");
+    joined == old_module
+}
+
+fn python_from_item_new_name(from_module: &str, new_module: &str, new_module_leaf: &str) -> String {
+    if from_module.starts_with('.') {
+        new_module_leaf.to_string()
+    } else {
+        new_module
+            .rsplit_once('.')
+            .map(|(_parent, leaf)| leaf.to_string())
+            .unwrap_or_else(|| new_module_leaf.to_string())
+    }
+}
+
+fn python_import_item_name(item: &str) -> String {
+    item.split_once(" as ")
+        .map(|(name, _alias)| name.trim())
+        .unwrap_or_else(|| item.trim())
+        .to_string()
+}
+
+fn python_replace_import_item_name(item: &str, new_name: &str) -> String {
+    if let Some((_name, alias)) = item.split_once(" as ") {
+        format!("{new_name} as {}", alias.trim())
+    } else {
+        new_name.to_string()
+    }
+}
+
+fn replace_python_attr_in_line(line: &str, old_attr: &str, new_attr: &str) -> (String, usize) {
+    let mut rendered = String::new();
+    let mut cursor = 0;
+    let mut replacements = 0;
+
+    for (start, matched) in line.match_indices(old_attr) {
+        let end = start + matched.len();
+        if !python_attr_boundary_before(line[..start].chars().next_back())
+            || !python_attr_boundary_after(line[end..].chars().next())
+        {
+            continue;
+        }
+        rendered.push_str(&line[cursor..start]);
+        rendered.push_str(new_attr);
+        cursor = end;
+        replacements += 1;
+    }
+
+    if replacements == 0 {
+        return (line.to_string(), 0);
+    }
+    rendered.push_str(&line[cursor..]);
+    (rendered, replacements)
+}
+
+fn python_attr_boundary_before(char: Option<char>) -> bool {
+    char.is_none_or(|char| !(char.is_alphanumeric() || char == '_' || char == '.'))
+}
+
+fn python_attr_boundary_after(char: Option<char>) -> bool {
+    char.is_none_or(|char| !(char.is_alphanumeric() || char == '_'))
 }
 
 fn language_for_path(path: &str) -> Option<&'static str> {
@@ -2053,6 +2534,95 @@ mod tests {
     }
 
     #[test]
+    fn plans_move_with_python_from_import_rewrite() {
+        let source = "def helper():\n    return 1\n\n\ndef other():\n    return 2\n";
+        let destination = "def existing():\n    return 0\n";
+        let caller =
+            "from plugin_hooks import helper as run_helper, other\n\nvalue = run_helper()\n";
+        let target =
+            resolve_symbol_in_source("plugin_hooks.py", source, "helper", None, "move").unwrap();
+        let references = vec![CodeReference {
+            path: "main.py".to_string(),
+            language: Some("python".to_string()),
+            target_path: "plugin_hooks.py".to_string(),
+            target_name: "helper".to_string(),
+            target_kind: "function".to_string(),
+            kind: "import".to_string(),
+            line_start: 1,
+            excerpt: "from plugin_hooks import helper as run_helper, other".to_string(),
+        }];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "helpers.py",
+            destination,
+            vec![("main.py".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+        let caller_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "main.py")
+            .unwrap();
+
+        assert!(
+            caller_file
+                .contents
+                .contains("from plugin_hooks import other")
+        );
+        assert!(
+            caller_file
+                .contents
+                .contains("from helpers import helper as run_helper")
+        );
+        assert!(caller_file.contents.contains("run_helper()"));
+        assert_eq!(planned.summary.rewritten_reference_count, 1);
+    }
+
+    #[test]
+    fn plans_move_with_python_module_import_and_qualified_call_rewrite() {
+        let source = "def helper():\n    return 1\n\n\ndef other():\n    return 2\n";
+        let destination = "def existing():\n    return 0\n";
+        let caller = "import plugin_hooks\n\nvalue = plugin_hooks.helper()\n";
+        let target =
+            resolve_symbol_in_source("plugin_hooks.py", source, "helper", None, "move").unwrap();
+        let references = vec![CodeReference {
+            path: "main.py".to_string(),
+            language: Some("python".to_string()),
+            target_path: "plugin_hooks.py".to_string(),
+            target_name: "helper".to_string(),
+            target_kind: "function".to_string(),
+            kind: "call".to_string(),
+            line_start: 3,
+            excerpt: "value = plugin_hooks.helper()".to_string(),
+        }];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "helpers.py",
+            destination,
+            vec![("main.py".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+        let caller_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "main.py")
+            .unwrap();
+
+        assert!(caller_file.contents.contains("import helpers"));
+        assert!(caller_file.contents.contains("value = helpers.helper()"));
+        assert!(!caller_file.contents.contains("plugin_hooks"));
+        assert_eq!(planned.summary.rewritten_reference_count, 2);
+    }
+
+    #[test]
     fn rejects_move_when_inbound_references_exist() {
         let target =
             resolve_symbol_in_source("src/lib.rs", RUST_SOURCE, "greet", None, "move").unwrap();
@@ -2219,6 +2789,52 @@ mod tests {
                 .contains("use crate::helpers::{helper};")
         );
         assert!(caller_file.contents.contains("helper();"));
+        assert_eq!(planned.summary.rewritten_reference_count, 1);
+    }
+
+    #[test]
+    fn plans_move_with_braced_rust_import_rewrite_without_empty_old_import() {
+        let source = "pub fn helper() -> u8 {\n    1\n}\n";
+        let destination = "pub fn existing() {}\n";
+        let caller =
+            "use crate::plugin_hooks::{helper};\n\nfn main() {\n    let _ = helper();\n}\n";
+        let target =
+            resolve_symbol_in_source("src/plugin_hooks.rs", source, "helper", None, "move")
+                .unwrap();
+        let references = vec![CodeReference {
+            path: "src/main.rs".to_string(),
+            language: Some("rust".to_string()),
+            target_path: "src/plugin_hooks.rs".to_string(),
+            target_name: "helper".to_string(),
+            target_kind: "function".to_string(),
+            kind: "import".to_string(),
+            line_start: 1,
+            excerpt: "use crate::plugin_hooks::{helper};".to_string(),
+        }];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "src/helpers.rs",
+            destination,
+            vec![("src/main.rs".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+        let caller_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/main.rs")
+            .unwrap();
+
+        assert!(!caller_file.contents.contains("plugin_hooks::{}"));
+        assert!(!caller_file.contents.contains("plugin_hooks::{"));
+        assert!(
+            caller_file
+                .contents
+                .contains("use crate::helpers::{helper};")
+        );
         assert_eq!(planned.summary.rewritten_reference_count, 1);
     }
 
