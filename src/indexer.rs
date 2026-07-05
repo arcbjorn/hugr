@@ -50,7 +50,25 @@ pub(crate) async fn index_candidates(
 ) -> Result<Vec<CodeSymbol>, String> {
     store.record_discovered_files(files).await?;
     let symbols = code::index_files(root, files)?;
-    let references = code::extract_references(root, files, &symbols)?;
+
+    // References must resolve against the freshly parsed symbols for the
+    // candidate files plus the stored symbols for every other file. Scoping
+    // targets to the candidates alone would drop cross-file edges from these
+    // files each time a partial index runs (context compilation indexes only
+    // its 12 file candidates).
+    let candidate_paths = files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<HashSet<_>>();
+    let mut reference_symbols = symbols.clone();
+    reference_symbols.extend(
+        store
+            .stored_code_symbols()
+            .await?
+            .into_iter()
+            .filter(|symbol| !candidate_paths.contains(symbol.path.as_str())),
+    );
+    let references = code::extract_references(root, files, &reference_symbols)?;
     store
         .record_code_index(files, &symbols, &references)
         .await?;
