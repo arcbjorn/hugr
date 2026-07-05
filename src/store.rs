@@ -71,6 +71,8 @@ enum SyncTableKind {
     CodeSymbols,
     Edges,
     CodeReferences,
+    TestMappings,
+    SourceEmbeddings,
     Sessions,
     ContextPacks,
     Diagnostics,
@@ -163,6 +165,8 @@ pub struct PruneSummary {
     pub discovered_files: u64,
     pub symbols: u64,
     pub references: u64,
+    pub test_mappings: u64,
+    pub source_embeddings: u64,
 }
 
 impl PruneSummary {
@@ -760,24 +764,30 @@ impl Store {
 
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
-            return record_code_index_via_hugr_api(&storage_config, files, symbols, references);
+            return record_code_index_via_hugr_api(
+                &storage_config,
+                self.embedding_provider()?,
+                files,
+                symbols,
+                references,
+            );
         }
 
         self.init().await?;
         let conn = self.connect().await?;
         let now = now_ms()?;
-        let mut paths = files
+        let paths = files
             .iter()
-            .map(|file| file.path.as_str())
+            .map(|file| file.path.clone())
             .collect::<HashSet<_>>();
 
-        for path in paths.drain() {
+        for path in &paths {
             conn.execute(
                 "
                 DELETE FROM code_symbols
                 WHERE project_id = ?1 AND path = ?2
                 ",
-                params![LOCAL_PROJECT_ID, path],
+                params![LOCAL_PROJECT_ID, path.clone()],
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -786,7 +796,7 @@ impl Store {
                 DELETE FROM code_references
                 WHERE project_id = ?1 AND path = ?2
                 ",
-                params![LOCAL_PROJECT_ID, path],
+                params![LOCAL_PROJECT_ID, path.clone()],
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -799,6 +809,9 @@ impl Store {
         for reference in references {
             insert_code_reference(&conn, reference, now).await?;
         }
+        refresh_test_mappings_for_paths(&conn, &paths, now).await?;
+        refresh_source_embeddings_for_files(&conn, files, symbols, now, self.embedding_provider()?)
+            .await?;
 
         Ok(())
     }
@@ -816,10 +829,17 @@ impl Store {
 
         let conn = self.connect().await?;
         let mut stored_paths = HashSet::new();
-        for table in ["discovered_files", "code_symbols", "code_references"] {
+        for table in [
+            "discovered_files",
+            "code_symbols",
+            "code_references",
+            "source_embeddings",
+        ] {
             collect_stored_paths(&conn, table, "path", &mut stored_paths).await?;
         }
         collect_stored_paths(&conn, "code_references", "target_path", &mut stored_paths).await?;
+        collect_stored_paths(&conn, "test_mappings", "source_path", &mut stored_paths).await?;
+        collect_stored_paths(&conn, "test_mappings", "test_path", &mut stored_paths).await?;
 
         let missing_paths = stored_paths
             .into_iter()
@@ -848,6 +868,20 @@ impl Store {
             summary.references += conn
                 .execute(
                     "DELETE FROM code_references WHERE project_id = ?1 AND (path = ?2 OR target_path = ?2)",
+                    params![LOCAL_PROJECT_ID, path.clone()],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            summary.test_mappings += conn
+                .execute(
+                    "DELETE FROM test_mappings WHERE project_id = ?1 AND (source_path = ?2 OR test_path = ?2)",
+                    params![LOCAL_PROJECT_ID, path.clone()],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            summary.source_embeddings += conn
+                .execute(
+                    "DELETE FROM source_embeddings WHERE project_id = ?1 AND path = ?2",
                     params![LOCAL_PROJECT_ID, path.clone()],
                 )
                 .await
@@ -958,6 +992,15 @@ impl Store {
         for reference in references {
             insert_code_reference(&conn, reference, now).await?;
         }
+        refresh_test_mappings_for_paths(&conn, symbol_paths, now).await?;
+        refresh_source_embeddings_for_paths(
+            &conn,
+            symbol_paths,
+            symbols,
+            now,
+            self.embedding_provider()?,
+        )
+        .await?;
 
         Ok(())
     }
@@ -1372,25 +1415,13 @@ impl Store {
 
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
-        let mut rows = conn
-            .query(
-                "
-                SELECT path
-                FROM discovered_files
-                WHERE project_id = ?1
-                ORDER BY path ASC
-                ",
-                params![LOCAL_PROJECT_ID],
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut known_files = Vec::new();
-
-        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-            known_files.push(row.get::<String>(0).map_err(|error| error.to_string())?);
-        }
-
-        Ok(testmap::likely_tests_for_files(files, &known_files, limit))
+        let mut candidates = stored_test_candidates_for_files(&conn, files, limit).await?;
+        let known_files = load_known_file_paths(&conn).await?;
+        merge_test_candidates(
+            &mut candidates,
+            testmap::likely_tests_for_files(files, &known_files, limit),
+        );
+        Ok(finalize_test_candidates(candidates, limit))
     }
 
     pub async fn recall_symbols(
@@ -2043,6 +2074,12 @@ impl Store {
                 Some(SyncTableKind::CodeReferences) => {
                     apply_api_push_code_reference_records(&conn, &payload.records).await?
                 }
+                Some(SyncTableKind::TestMappings) => {
+                    apply_api_push_test_mapping_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::SourceEmbeddings) => {
+                    apply_api_push_source_embedding_records(&conn, &payload.records).await?
+                }
                 Some(SyncTableKind::Sessions) => {
                     apply_api_push_session_records(&conn, &payload.records).await?
                 }
@@ -2196,6 +2233,8 @@ impl Store {
             SyncTableKind::CodeSymbols,
             SyncTableKind::Edges,
             SyncTableKind::CodeReferences,
+            SyncTableKind::TestMappings,
+            SyncTableKind::SourceEmbeddings,
             SyncTableKind::Sessions,
             SyncTableKind::ContextPacks,
             SyncTableKind::Diagnostics,
@@ -2272,6 +2311,12 @@ impl Store {
                 }
                 Some(SyncTableKind::CodeReferences) => {
                     apply_api_push_code_reference_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::TestMappings) => {
+                    apply_api_push_test_mapping_records(&conn, &payload.records).await?
+                }
+                Some(SyncTableKind::SourceEmbeddings) => {
+                    apply_api_push_source_embedding_records(&conn, &payload.records).await?
                 }
                 Some(SyncTableKind::Sessions) => {
                     apply_api_push_session_records(&conn, &payload.records).await?
@@ -2682,6 +2727,8 @@ impl SyncTableKind {
             "code_symbols" => Some(Self::CodeSymbols),
             "edges" => Some(Self::Edges),
             "code_references" => Some(Self::CodeReferences),
+            "test_mappings" => Some(Self::TestMappings),
+            "source_embeddings" => Some(Self::SourceEmbeddings),
             "sessions" => Some(Self::Sessions),
             "context_packs" => Some(Self::ContextPacks),
             "diagnostics" => Some(Self::Diagnostics),
@@ -2700,6 +2747,8 @@ impl SyncTableKind {
             Self::CodeSymbols => "code_symbols",
             Self::Edges => "edges",
             Self::CodeReferences => "code_references",
+            Self::TestMappings => "test_mappings",
+            Self::SourceEmbeddings => "source_embeddings",
             Self::Sessions => "sessions",
             Self::ContextPacks => "context_packs",
             Self::Diagnostics => "diagnostics",
@@ -2711,7 +2760,8 @@ impl SyncTableKind {
             Self::Projects => "project_metadata",
             Self::Memories => "memories",
             Self::MemoryEmbeddings => "embeddings",
-            Self::Sources | Self::DiscoveredFiles => "sources",
+            Self::Sources | Self::DiscoveredFiles | Self::TestMappings => "sources",
+            Self::SourceEmbeddings => "embeddings",
             Self::Entities | Self::CodeSymbols => "entities",
             Self::Edges | Self::CodeReferences => "edges",
             Self::Sessions => "session_summaries",
@@ -2732,6 +2782,7 @@ fn sync_tables_for_config(config: &StorageConfig) -> Vec<SyncTableKind> {
             SyncClass::Sources => {
                 push_sync_table(&mut tables, &mut seen, SyncTableKind::Sources);
                 push_sync_table(&mut tables, &mut seen, SyncTableKind::DiscoveredFiles);
+                push_sync_table(&mut tables, &mut seen, SyncTableKind::TestMappings);
             }
             SyncClass::Entities => {
                 push_sync_table(&mut tables, &mut seen, SyncTableKind::Entities);
@@ -2742,7 +2793,8 @@ fn sync_tables_for_config(config: &StorageConfig) -> Vec<SyncTableKind> {
                 push_sync_table(&mut tables, &mut seen, SyncTableKind::CodeReferences);
             }
             SyncClass::Embeddings => {
-                push_sync_table(&mut tables, &mut seen, SyncTableKind::MemoryEmbeddings)
+                push_sync_table(&mut tables, &mut seen, SyncTableKind::MemoryEmbeddings);
+                push_sync_table(&mut tables, &mut seen, SyncTableKind::SourceEmbeddings);
             }
             SyncClass::SessionSummaries => {
                 push_sync_table(&mut tables, &mut seen, SyncTableKind::Sessions)
@@ -3042,6 +3094,29 @@ fn code_reference_sync_record_value(record: &CodeReferenceSyncRecord) -> serde_j
     })
 }
 
+fn test_mapping_sync_record_value(record: &TestMappingSyncRecord) -> serde_json::Value {
+    json!({
+        "project_id": &record.project_id,
+        "source_path": &record.source_path,
+        "test_path": &record.test_path,
+        "reason": &record.reason,
+        "score": record.score,
+        "updated_at_ms": record.updated_at_ms
+    })
+}
+
+fn source_embedding_sync_record_value(record: &SourceEmbeddingSyncRecord) -> serde_json::Value {
+    json!({
+        "project_id": &record.project_id,
+        "path": &record.path,
+        "model": &record.model,
+        "dimensions": record.dimensions,
+        "embedding": &record.embedding,
+        "content_key": &record.content_key,
+        "updated_at_ms": record.updated_at_ms
+    })
+}
+
 fn session_sync_record_value(record: &SessionSyncRecord) -> serde_json::Value {
     json!({
         "id": &record.id,
@@ -3191,6 +3266,7 @@ fn record_discovered_files_via_hugr_api(
 
 fn record_code_index_via_hugr_api(
     config: &StorageConfig,
+    embedding_provider: &SelectedEmbeddingProvider,
     files: &[FileCandidate],
     symbols: &[CodeSymbol],
     references: &[CodeReference],
@@ -3229,6 +3305,14 @@ fn record_code_index_via_hugr_api(
             })
         })
         .collect::<Vec<_>>();
+    let indexed_paths = files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    let test_mapping_records =
+        build_test_mapping_sync_records(&indexed_paths, &indexed_paths, now)?;
+    let source_embedding_records =
+        build_source_embedding_sync_records(files, symbols, now, embedding_provider)?;
     let replace_paths = files
         .iter()
         .map(|file| file.path.clone())
@@ -3236,6 +3320,8 @@ fn record_code_index_via_hugr_api(
     let payloads = vec![
         api_payload_for_records(SyncTableKind::CodeSymbols, symbol_records),
         api_payload_for_records(SyncTableKind::CodeReferences, reference_records),
+        api_payload_for_records(SyncTableKind::TestMappings, test_mapping_records),
+        api_payload_for_records(SyncTableKind::SourceEmbeddings, source_embedding_records),
     ];
     post_hugr_api_storage_payloads(
         config,
@@ -3246,6 +3332,72 @@ fn record_code_index_via_hugr_api(
         &replace_paths,
     )?;
     Ok(())
+}
+
+fn build_test_mapping_sync_records(
+    source_paths: &[String],
+    known_files: &[String],
+    now: i64,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut records = Vec::new();
+    let mut unique_sources = source_paths.to_vec();
+    unique_sources.sort();
+    unique_sources.dedup();
+
+    for source_path in unique_sources {
+        for candidate in
+            testmap::likely_tests_for_files(std::slice::from_ref(&source_path), known_files, 32)
+        {
+            records.push(test_mapping_sync_record_value(&TestMappingSyncRecord {
+                project_id: LOCAL_PROJECT_ID.to_string(),
+                source_path: source_path.clone(),
+                test_path: candidate.path,
+                reason: candidate.reason,
+                score: i64::try_from(candidate.score).map_err(|error| error.to_string())?,
+                updated_at_ms: now,
+            }));
+        }
+    }
+
+    Ok(records)
+}
+
+fn build_source_embedding_sync_records(
+    files: &[FileCandidate],
+    symbols: &[CodeSymbol],
+    now: i64,
+    embedding_provider: &SelectedEmbeddingProvider,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut records = Vec::new();
+    for file in files {
+        let size_bytes = file
+            .size_bytes
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let input = SourceEmbeddingInput {
+            path: file.path.clone(),
+            language: file.language.clone(),
+            size_bytes,
+        };
+        let summary = source_embedding_summary(&input, symbols);
+        let embedding = embedding_provider.embed(&summary)?;
+        let dimensions =
+            i64::try_from(embedding.dimensions()).map_err(|error| error.to_string())?;
+        let embedding_blob = embedding.to_f32_blob();
+        records.push(source_embedding_sync_record_value(
+            &SourceEmbeddingSyncRecord {
+                project_id: LOCAL_PROJECT_ID.to_string(),
+                path: file.path.clone(),
+                model: embedding.model,
+                dimensions,
+                embedding: embedding_blob,
+                content_key: source_embedding_content_key(&summary),
+                updated_at_ms: now,
+            },
+        ));
+    }
+    Ok(records)
 }
 
 fn symbols_for_target_via_hugr_api(
@@ -4518,11 +4670,18 @@ fn likely_tests_for_files_via_hugr_api(
     if limit == 0 || files.is_empty() {
         return Ok(Vec::new());
     }
-    let known_files = storage_discovered_files(&fetch_hugr_api_storage_snapshot(config)?)?
+    let snapshot = fetch_hugr_api_storage_snapshot(config)?;
+    let mut candidates =
+        test_candidates_from_mappings(&storage_test_mappings(&snapshot)?, files, limit);
+    let known_files = storage_discovered_files(&snapshot)?
         .into_iter()
         .map(|record| record.path)
         .collect::<Vec<_>>();
-    Ok(testmap::likely_tests_for_files(files, &known_files, limit))
+    merge_test_candidates(
+        &mut candidates,
+        testmap::likely_tests_for_files(files, &known_files, limit),
+    );
+    Ok(finalize_test_candidates(candidates, limit))
 }
 
 fn recall_symbols_via_hugr_api(
@@ -4966,6 +5125,15 @@ fn storage_discovered_files(
     storage_payload_records(snapshot, SyncTableKind::DiscoveredFiles)
         .iter()
         .map(discovered_file_sync_record_from_value)
+        .collect()
+}
+
+fn storage_test_mappings(
+    snapshot: &HugrApiStorageSnapshot,
+) -> Result<Vec<TestMappingSyncRecord>, String> {
+    storage_payload_records(snapshot, SyncTableKind::TestMappings)
+        .iter()
+        .map(test_mapping_sync_record_from_value)
         .collect()
 }
 
@@ -5927,6 +6095,8 @@ fn api_table_supports_records(table: SyncTableKind) -> bool {
             | SyncTableKind::CodeSymbols
             | SyncTableKind::Edges
             | SyncTableKind::CodeReferences
+            | SyncTableKind::TestMappings
+            | SyncTableKind::SourceEmbeddings
             | SyncTableKind::Sessions
             | SyncTableKind::ContextPacks
             | SyncTableKind::Diagnostics
@@ -5943,6 +6113,8 @@ fn api_storage_table_supports_records(table: SyncTableKind) -> bool {
             | SyncTableKind::CodeSymbols
             | SyncTableKind::Edges
             | SyncTableKind::CodeReferences
+            | SyncTableKind::TestMappings
+            | SyncTableKind::SourceEmbeddings
             | SyncTableKind::Sessions
             | SyncTableKind::ContextPacks
             | SyncTableKind::Diagnostics
@@ -5963,6 +6135,8 @@ async fn api_sync_records_for_table(
         SyncTableKind::CodeSymbols => code_symbol_sync_records(conn).await,
         SyncTableKind::Edges => edge_sync_records(conn).await,
         SyncTableKind::CodeReferences => code_reference_sync_records(conn).await,
+        SyncTableKind::TestMappings => test_mapping_sync_records(conn).await,
+        SyncTableKind::SourceEmbeddings => source_embedding_sync_records(conn).await,
         SyncTableKind::Sessions => session_sync_records(conn).await,
         SyncTableKind::ContextPacks => context_pack_sync_records(conn).await,
         SyncTableKind::Diagnostics => diagnostic_sync_records(conn).await,
@@ -6213,6 +6387,65 @@ async fn code_reference_sync_records(conn: &Connection) -> Result<Vec<serde_json
             "line_start": row.get::<i64>(7).map_err(|error| error.to_string())?,
             "excerpt": row.get::<String>(8).map_err(|error| error.to_string())?,
             "indexed_at_ms": row.get::<i64>(9).map_err(|error| error.to_string())?
+        }));
+    }
+
+    Ok(records)
+}
+
+async fn test_mapping_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT project_id, source_path, test_path, reason, score, updated_at_ms
+            FROM test_mappings
+            ORDER BY project_id, source_path, score DESC, test_path
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(json!({
+            "project_id": row.get::<String>(0).map_err(|error| error.to_string())?,
+            "source_path": row.get::<String>(1).map_err(|error| error.to_string())?,
+            "test_path": row.get::<String>(2).map_err(|error| error.to_string())?,
+            "reason": row.get::<String>(3).map_err(|error| error.to_string())?,
+            "score": row.get::<i64>(4).map_err(|error| error.to_string())?,
+            "updated_at_ms": row.get::<i64>(5).map_err(|error| error.to_string())?
+        }));
+    }
+
+    Ok(records)
+}
+
+async fn source_embedding_sync_records(
+    conn: &Connection,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT project_id, path, model, dimensions, embedding, content_key, updated_at_ms
+            FROM source_embeddings
+            ORDER BY project_id, path
+            ",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        records.push(json!({
+            "project_id": row.get::<String>(0).map_err(|error| error.to_string())?,
+            "path": row.get::<String>(1).map_err(|error| error.to_string())?,
+            "model": row.get::<String>(2).map_err(|error| error.to_string())?,
+            "dimensions": row.get::<i64>(3).map_err(|error| error.to_string())?,
+            "embedding": row.get::<Vec<u8>>(4).map_err(|error| error.to_string())?,
+            "content_key": row.get::<String>(5).map_err(|error| error.to_string())?,
+            "updated_at_ms": row.get::<i64>(6).map_err(|error| error.to_string())?
         }));
     }
 
@@ -6599,6 +6832,27 @@ struct CodeReferenceSyncRecord {
     indexed_at_ms: i64,
 }
 
+#[derive(Debug, Clone)]
+struct TestMappingSyncRecord {
+    project_id: String,
+    source_path: String,
+    test_path: String,
+    reason: String,
+    score: i64,
+    updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct SourceEmbeddingSyncRecord {
+    project_id: String,
+    path: String,
+    model: String,
+    dimensions: i64,
+    embedding: Vec<u8>,
+    content_key: String,
+    updated_at_ms: i64,
+}
+
 fn code_reference_sync_record_from_value(
     value: &serde_json::Value,
 ) -> Result<CodeReferenceSyncRecord, String> {
@@ -6613,6 +6867,33 @@ fn code_reference_sync_record_from_value(
         line_start: json_i64_field(value, "line_start")?,
         excerpt: json_string_field(value, "excerpt")?,
         indexed_at_ms: json_i64_field(value, "indexed_at_ms")?,
+    })
+}
+
+fn test_mapping_sync_record_from_value(
+    value: &serde_json::Value,
+) -> Result<TestMappingSyncRecord, String> {
+    Ok(TestMappingSyncRecord {
+        project_id: json_string_field(value, "project_id")?,
+        source_path: json_string_field(value, "source_path")?,
+        test_path: json_string_field(value, "test_path")?,
+        reason: json_string_field(value, "reason")?,
+        score: json_i64_field(value, "score")?,
+        updated_at_ms: json_i64_field(value, "updated_at_ms")?,
+    })
+}
+
+fn source_embedding_sync_record_from_value(
+    value: &serde_json::Value,
+) -> Result<SourceEmbeddingSyncRecord, String> {
+    Ok(SourceEmbeddingSyncRecord {
+        project_id: json_string_field(value, "project_id")?,
+        path: json_string_field(value, "path")?,
+        model: json_string_field(value, "model")?,
+        dimensions: json_i64_field(value, "dimensions")?,
+        embedding: json_bytes_field(value, "embedding")?,
+        content_key: json_string_field(value, "content_key")?,
+        updated_at_ms: json_i64_field(value, "updated_at_ms")?,
     })
 }
 
@@ -7445,6 +7726,178 @@ async fn apply_api_pull_code_reference_records(
     finish_sync_table_result(conn, table, before_count, stats).await
 }
 
+async fn apply_api_push_test_mapping_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::TestMappings;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = test_mapping_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO test_mappings (
+                    project_id, source_path, test_path, reason, score, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(project_id, source_path, test_path) DO UPDATE SET
+                    reason = excluded.reason,
+                    score = excluded.score,
+                    updated_at_ms = excluded.updated_at_ms
+                ",
+                params![
+                    record.project_id,
+                    record.source_path,
+                    record.test_path,
+                    record.reason,
+                    record.score,
+                    record.updated_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_pull_test_mapping_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::TestMappings;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = test_mapping_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO test_mappings (
+                    project_id, source_path, test_path, reason, score, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(project_id, source_path, test_path) DO UPDATE SET
+                    reason = excluded.reason,
+                    score = excluded.score,
+                    updated_at_ms = excluded.updated_at_ms
+                WHERE excluded.updated_at_ms > test_mappings.updated_at_ms
+                ",
+                params![
+                    record.project_id,
+                    record.source_path,
+                    record.test_path,
+                    record.reason,
+                    record.score,
+                    record.updated_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_newer_or_equal");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_push_source_embedding_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::SourceEmbeddings;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = source_embedding_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO source_embeddings (
+                    project_id, path, model, dimensions, embedding, content_key, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(project_id, path) DO UPDATE SET
+                    model = excluded.model,
+                    dimensions = excluded.dimensions,
+                    embedding = excluded.embedding,
+                    content_key = excluded.content_key,
+                    updated_at_ms = excluded.updated_at_ms
+                ",
+                params![
+                    record.project_id,
+                    record.path,
+                    record.model,
+                    record.dimensions,
+                    record.embedding,
+                    record.content_key,
+                    record.updated_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        stats.record_affected(affected)?;
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
+async fn apply_api_pull_source_embedding_records(
+    conn: &Connection,
+    records: &[serde_json::Value],
+) -> Result<SyncTableResult, String> {
+    let table = SyncTableKind::SourceEmbeddings;
+    let before_count = table_row_count(conn, table.table_name()).await?;
+    let mut stats = SyncApplyStats::default();
+
+    for value in records {
+        let record = source_embedding_sync_record_from_value(value)?;
+        let affected = conn
+            .execute(
+                "
+                INSERT INTO source_embeddings (
+                    project_id, path, model, dimensions, embedding, content_key, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(project_id, path) DO UPDATE SET
+                    model = excluded.model,
+                    dimensions = excluded.dimensions,
+                    embedding = excluded.embedding,
+                    content_key = excluded.content_key,
+                    updated_at_ms = excluded.updated_at_ms
+                WHERE excluded.updated_at_ms > source_embeddings.updated_at_ms
+                ",
+                params![
+                    record.project_id,
+                    record.path,
+                    record.model,
+                    record.dimensions,
+                    record.embedding,
+                    record.content_key,
+                    record.updated_at_ms
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if affected == 0 {
+            stats.record_skip("local_row_newer_or_equal");
+        } else {
+            stats.record_affected(affected)?;
+        }
+    }
+
+    finish_sync_table_result(conn, table, before_count, stats).await
+}
+
 async fn apply_api_push_session_records(
     conn: &Connection,
     records: &[serde_json::Value],
@@ -7719,6 +8172,13 @@ async fn apply_api_pull_payloads(
             Some(SyncTableKind::CodeReferences) if !payload.records.is_empty() => {
                 results.push(apply_api_pull_code_reference_records(conn, &payload.records).await?);
             }
+            Some(SyncTableKind::TestMappings) if !payload.records.is_empty() => {
+                results.push(apply_api_pull_test_mapping_records(conn, &payload.records).await?);
+            }
+            Some(SyncTableKind::SourceEmbeddings) if !payload.records.is_empty() => {
+                results
+                    .push(apply_api_pull_source_embedding_records(conn, &payload.records).await?);
+            }
             Some(SyncTableKind::Sessions) if !payload.records.is_empty() => {
                 results.push(apply_api_pull_session_records(conn, &payload.records).await?);
             }
@@ -7850,6 +8310,24 @@ async fn delete_code_index_paths(conn: &Connection, paths: &[String]) -> Result<
         conn.execute(
             "
             DELETE FROM code_references
+            WHERE project_id = ?1 AND path = ?2
+            ",
+            params![LOCAL_PROJECT_ID, path.clone()],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        conn.execute(
+            "
+            DELETE FROM test_mappings
+            WHERE project_id = ?1 AND (source_path = ?2 OR test_path = ?2)
+            ",
+            params![LOCAL_PROJECT_ID, path.clone()],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        conn.execute(
+            "
+            DELETE FROM source_embeddings
             WHERE project_id = ?1 AND path = ?2
             ",
             params![LOCAL_PROJECT_ID, path],
@@ -8332,6 +8810,8 @@ async fn copy_sync_table(
         SyncTableKind::CodeSymbols => copy_code_symbols(local_conn, remote_conn).await,
         SyncTableKind::Edges => copy_edges(local_conn, remote_conn).await,
         SyncTableKind::CodeReferences => copy_code_references(local_conn, remote_conn).await,
+        SyncTableKind::TestMappings => copy_test_mappings(local_conn, remote_conn).await,
+        SyncTableKind::SourceEmbeddings => copy_source_embeddings(local_conn, remote_conn).await,
         SyncTableKind::Sessions => copy_sessions(local_conn, remote_conn).await,
         SyncTableKind::ContextPacks => copy_context_packs(local_conn, remote_conn).await,
         SyncTableKind::Diagnostics => copy_diagnostics(local_conn, remote_conn).await,
@@ -8353,6 +8833,8 @@ async fn copy_pull_table(
         SyncTableKind::CodeSymbols => pull_code_symbols(remote_conn, local_conn).await,
         SyncTableKind::Edges => pull_edges(remote_conn, local_conn).await,
         SyncTableKind::CodeReferences => pull_code_references(remote_conn, local_conn).await,
+        SyncTableKind::TestMappings => pull_test_mappings(remote_conn, local_conn).await,
+        SyncTableKind::SourceEmbeddings => pull_source_embeddings(remote_conn, local_conn).await,
         SyncTableKind::Sessions => pull_sessions(remote_conn, local_conn).await,
         SyncTableKind::ContextPacks => pull_context_packs(remote_conn, local_conn).await,
         SyncTableKind::Diagnostics => pull_diagnostics(remote_conn, local_conn).await,
@@ -8811,6 +9293,22 @@ async fn copy_code_references(
     }
 
     finish_sync_table_result(remote_conn, table, before_count, stats).await
+}
+
+async fn copy_test_mappings(
+    local_conn: &Connection,
+    remote_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let records = test_mapping_sync_records(local_conn).await?;
+    apply_api_push_test_mapping_records(remote_conn, &records).await
+}
+
+async fn copy_source_embeddings(
+    local_conn: &Connection,
+    remote_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let records = source_embedding_sync_records(local_conn).await?;
+    apply_api_push_source_embedding_records(remote_conn, &records).await
 }
 
 async fn copy_sessions(
@@ -9404,6 +9902,22 @@ async fn pull_code_references(
     }
 
     finish_sync_table_result(local_conn, table, before_count, stats).await
+}
+
+async fn pull_test_mappings(
+    remote_conn: &Connection,
+    local_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let records = test_mapping_sync_records(remote_conn).await?;
+    apply_api_pull_test_mapping_records(local_conn, &records).await
+}
+
+async fn pull_source_embeddings(
+    remote_conn: &Connection,
+    local_conn: &Connection,
+) -> Result<SyncTableResult, String> {
+    let records = source_embedding_sync_records(remote_conn).await?;
+    apply_api_pull_source_embedding_records(local_conn, &records).await
 }
 
 async fn pull_sessions(
@@ -10743,6 +11257,423 @@ async fn collect_stored_paths(
         paths.insert(path);
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct SourceEmbeddingInput {
+    path: String,
+    language: Option<String>,
+    size_bytes: Option<i64>,
+}
+
+async fn refresh_test_mappings_for_paths(
+    conn: &Connection,
+    paths: &HashSet<String>,
+    now: i64,
+) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let known_files = load_known_file_paths(conn).await?;
+    if known_files.is_empty() {
+        return Ok(());
+    }
+
+    let mut refresh_paths = paths.clone();
+    if paths.iter().any(|path| testmap::is_test_path(path)) {
+        refresh_paths.extend(
+            known_files
+                .iter()
+                .filter(|path| !testmap::is_test_path(path))
+                .cloned(),
+        );
+    }
+
+    let mut refresh_paths = refresh_paths.into_iter().collect::<Vec<_>>();
+    refresh_paths.sort();
+    for source_path in refresh_paths {
+        conn.execute(
+            "DELETE FROM test_mappings WHERE project_id = ?1 AND source_path = ?2",
+            params![LOCAL_PROJECT_ID, source_path.clone()],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let candidates =
+            testmap::likely_tests_for_files(std::slice::from_ref(&source_path), &known_files, 32);
+        for candidate in candidates {
+            let score = i64::try_from(candidate.score).map_err(|error| error.to_string())?;
+            conn.execute(
+                "
+                INSERT INTO test_mappings (
+                    project_id, source_path, test_path, reason, score, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ",
+                params![
+                    LOCAL_PROJECT_ID,
+                    source_path.clone(),
+                    candidate.path,
+                    candidate.reason,
+                    score,
+                    now
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn load_known_file_paths(conn: &Connection) -> Result<Vec<String>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT path
+            FROM discovered_files
+            WHERE project_id = ?1
+            ORDER BY path ASC
+            ",
+            params![LOCAL_PROJECT_ID],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut known_files = Vec::new();
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        known_files.push(row.get::<String>(0).map_err(|error| error.to_string())?);
+    }
+    Ok(known_files)
+}
+
+async fn stored_test_candidates_for_files(
+    conn: &Connection,
+    files: &[String],
+    limit: usize,
+) -> Result<Vec<TestCandidate>, String> {
+    if files.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut candidates = Vec::new();
+    let row_limit = i64::try_from(limit.max(32)).map_err(|error| error.to_string())?;
+    for file in files {
+        let mut rows = conn
+            .query(
+                "
+                SELECT test_path, reason, score
+                FROM test_mappings
+                WHERE project_id = ?1 AND source_path = ?2
+                ORDER BY score DESC, test_path ASC
+                LIMIT ?3
+                ",
+                params![LOCAL_PROJECT_ID, file.clone(), row_limit],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+            candidates.push(TestCandidate {
+                path: row.get::<String>(0).map_err(|error| error.to_string())?,
+                reason: row.get::<String>(1).map_err(|error| error.to_string())?,
+                score: usize::try_from(row.get::<i64>(2).map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())?,
+            });
+        }
+    }
+
+    Ok(finalize_test_candidates(candidates, limit))
+}
+
+fn test_candidates_from_mappings(
+    mappings: &[TestMappingSyncRecord],
+    files: &[String],
+    limit: usize,
+) -> Vec<TestCandidate> {
+    if files.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let file_set = files.iter().map(String::as_str).collect::<HashSet<_>>();
+    let candidates = mappings
+        .iter()
+        .filter(|mapping| file_set.contains(mapping.source_path.as_str()))
+        .filter_map(|mapping| {
+            Some(TestCandidate {
+                path: mapping.test_path.clone(),
+                reason: mapping.reason.clone(),
+                score: usize::try_from(mapping.score).ok()?,
+            })
+        })
+        .collect::<Vec<_>>();
+    finalize_test_candidates(candidates, limit)
+}
+
+fn merge_test_candidates(candidates: &mut Vec<TestCandidate>, additional: Vec<TestCandidate>) {
+    candidates.extend(additional);
+}
+
+fn finalize_test_candidates(candidates: Vec<TestCandidate>, limit: usize) -> Vec<TestCandidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut merged = HashMap::<String, TestCandidate>::new();
+    for candidate in candidates {
+        match merged.get_mut(&candidate.path) {
+            Some(existing)
+                if candidate.score > existing.score
+                    || (candidate.score == existing.score
+                        && candidate.reason < existing.reason) =>
+            {
+                *existing = candidate;
+            }
+            Some(_) => {}
+            None => {
+                merged.insert(candidate.path.clone(), candidate);
+            }
+        }
+    }
+    let mut ranked = merged.into_values().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    ranked.truncate(limit);
+    ranked
+}
+
+async fn refresh_source_embeddings_for_files(
+    conn: &Connection,
+    files: &[FileCandidate],
+    symbols: &[CodeSymbol],
+    now: i64,
+    embedding_provider: &SelectedEmbeddingProvider,
+) -> Result<(), String> {
+    let inputs = files
+        .iter()
+        .map(|file| {
+            let size_bytes = file
+                .size_bytes
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            Ok(SourceEmbeddingInput {
+                path: file.path.clone(),
+                language: file.language.clone(),
+                size_bytes,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    refresh_source_embeddings_for_inputs(conn, &inputs, symbols, now, embedding_provider).await
+}
+
+async fn refresh_source_embeddings_for_paths(
+    conn: &Connection,
+    paths: &HashSet<String>,
+    symbols: &[CodeSymbol],
+    now: i64,
+    embedding_provider: &SelectedEmbeddingProvider,
+) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let symbol_languages = symbols
+        .iter()
+        .filter_map(|symbol| {
+            symbol
+                .language
+                .as_ref()
+                .map(|language| (symbol.path.clone(), language.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut rows = conn
+        .query(
+            "
+            SELECT path, language, size_bytes
+            FROM discovered_files
+            WHERE project_id = ?1
+            ORDER BY path ASC
+            ",
+            params![LOCAL_PROJECT_ID],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut inputs = Vec::new();
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        let path = row.get::<String>(0).map_err(|error| error.to_string())?;
+        if !paths.contains(&path) {
+            continue;
+        }
+        let language = row
+            .get::<Option<String>>(1)
+            .map_err(|error| error.to_string())?
+            .or_else(|| symbol_languages.get(&path).cloned());
+        inputs.push(SourceEmbeddingInput {
+            path,
+            language,
+            size_bytes: row
+                .get::<Option<i64>>(2)
+                .map_err(|error| error.to_string())?,
+        });
+    }
+    for path in paths {
+        if !inputs.iter().any(|input| &input.path == path) {
+            inputs.push(SourceEmbeddingInput {
+                path: path.clone(),
+                language: symbol_languages.get(path).cloned(),
+                size_bytes: None,
+            });
+        }
+    }
+    refresh_source_embeddings_for_inputs(conn, &inputs, symbols, now, embedding_provider).await
+}
+
+async fn refresh_source_embeddings_for_inputs(
+    conn: &Connection,
+    inputs: &[SourceEmbeddingInput],
+    symbols: &[CodeSymbol],
+    now: i64,
+    embedding_provider: &SelectedEmbeddingProvider,
+) -> Result<(), String> {
+    if inputs.is_empty() {
+        return Ok(());
+    }
+
+    for input in inputs {
+        let summary = source_embedding_summary(input, symbols);
+        let content_key = source_embedding_content_key(&summary);
+        let dimensions =
+            i64::try_from(embedding_provider.dimensions()).map_err(|error| error.to_string())?;
+        if source_embedding_is_fresh(
+            conn,
+            &input.path,
+            embedding_provider.model(),
+            dimensions,
+            &content_key,
+        )
+        .await?
+        {
+            continue;
+        }
+        let embedding = embedding_provider.embed(&summary)?;
+        let embedding_dimensions =
+            i64::try_from(embedding.dimensions()).map_err(|error| error.to_string())?;
+        let embedding_vector = embedding.to_vector_literal();
+        conn.execute(
+            "
+            INSERT INTO source_embeddings (
+                project_id, path, model, dimensions, embedding, content_key, updated_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, vector(?5), ?6, ?7)
+            ON CONFLICT(project_id, path) DO UPDATE SET
+                model = excluded.model,
+                dimensions = excluded.dimensions,
+                embedding = excluded.embedding,
+                content_key = excluded.content_key,
+                updated_at_ms = excluded.updated_at_ms
+            ",
+            params![
+                LOCAL_PROJECT_ID,
+                input.path.clone(),
+                embedding.model,
+                embedding_dimensions,
+                embedding_vector,
+                content_key,
+                now
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+async fn source_embedding_is_fresh(
+    conn: &Connection,
+    path: &str,
+    model: &str,
+    dimensions: i64,
+    content_key: &str,
+) -> Result<bool, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT 1
+            FROM source_embeddings
+            WHERE project_id = ?1
+              AND path = ?2
+              AND model = ?3
+              AND dimensions = ?4
+              AND content_key = ?5
+            LIMIT 1
+            ",
+            params![
+                LOCAL_PROJECT_ID,
+                path.to_string(),
+                model.to_string(),
+                dimensions,
+                content_key.to_string()
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    rows.next()
+        .await
+        .map(|row| row.is_some())
+        .map_err(|error| error.to_string())
+}
+
+fn source_embedding_summary(input: &SourceEmbeddingInput, symbols: &[CodeSymbol]) -> String {
+    let mut summary = String::new();
+    summary.push_str("source ");
+    summary.push_str(&input.path);
+    summary.push('\n');
+    if let Some(language) = &input.language {
+        summary.push_str("language ");
+        summary.push_str(language);
+        summary.push('\n');
+    }
+    if let Some(size_bytes) = input.size_bytes {
+        summary.push_str("size ");
+        summary.push_str(&size_bytes.to_string());
+        summary.push('\n');
+    }
+
+    let mut path_symbols = symbols
+        .iter()
+        .filter(|symbol| symbol.path == input.path)
+        .collect::<Vec<_>>();
+    path_symbols.sort_by(|left, right| {
+        left.line_start
+            .cmp(&right.line_start)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    for symbol in path_symbols {
+        summary.push_str("symbol ");
+        summary.push_str(&symbol.kind);
+        summary.push(' ');
+        summary.push_str(&symbol.name);
+        summary.push_str(" line ");
+        summary.push_str(&symbol.line_start.to_string());
+        summary.push(' ');
+        summary.push_str(&symbol.signature);
+        summary.push('\n');
+    }
+    summary
+}
+
+fn source_embedding_content_key(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 #[cfg(test)]
@@ -12225,16 +13156,21 @@ mod tests {
         assert!(object_exists(&conn, "table", "diagnostics").await);
         assert!(object_exists(&conn, "table", "code_symbols").await);
         assert!(object_exists(&conn, "table", "code_references").await);
+        assert!(object_exists(&conn, "table", "test_mappings").await);
+        assert!(object_exists(&conn, "table", "source_embeddings").await);
         assert!(object_exists(&conn, "table", "sync_runs").await);
         assert!(object_exists(&conn, "table", "sync_table_runs").await);
         assert!(object_exists(&conn, "table", "sync_table_conflicts").await);
         assert!(object_exists(&conn, "index", "code_symbols_project_name_idx").await);
         assert!(object_exists(&conn, "index", "code_references_target_name_idx").await);
+        assert!(object_exists(&conn, "index", "test_mappings_source_idx").await);
+        assert!(object_exists(&conn, "index", "source_embeddings_project_idx").await);
         assert!(object_exists(&conn, "index", "sync_runs_started_idx").await);
         assert!(object_exists(&conn, "index", "context_packs_project_updated_idx").await);
         assert!(object_exists(&conn, "index", "diagnostics_project_created_idx").await);
         assert!(object_exists(&conn, "index", "diagnostics_project_path_idx").await);
         assert!(object_exists(&conn, "index", "memory_embeddings_vector_idx").await);
+        assert!(object_exists(&conn, "index", "source_embeddings_vector_idx").await);
 
         let mut rows = conn
             .query(
@@ -12260,7 +13196,9 @@ mod tests {
                 (7, "sync_history".to_string()),
                 (8, "session_promotions".to_string()),
                 (9, "context_packs".to_string()),
-                (10, "diagnostics".to_string())
+                (10, "diagnostics".to_string()),
+                (11, "test_mappings".to_string()),
+                (12, "source_embeddings".to_string())
             ]
         );
     }
@@ -12712,6 +13650,94 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn record_code_index_persists_test_mappings_and_source_embeddings() {
+        let test = TestStore::new("code_index_metadata");
+        let source_file = FileCandidate {
+            path: "src/plugin_hooks.rs".to_string(),
+            score: 0,
+            language: Some("rust".to_string()),
+            size_bytes: Some(120),
+        };
+        let test_file = FileCandidate {
+            path: "tests/plugin_hooks.rs".to_string(),
+            score: 0,
+            language: Some("rust".to_string()),
+            size_bytes: Some(90),
+        };
+        let symbol = CodeSymbol {
+            path: source_file.path.clone(),
+            language: source_file.language.clone(),
+            name: "PluginHooks".to_string(),
+            kind: "struct".to_string(),
+            line_start: 3,
+            line_end: None,
+            signature: "pub struct PluginHooks".to_string(),
+        };
+
+        test.store
+            .record_discovered_files(&[source_file.clone(), test_file])
+            .await
+            .unwrap();
+        test.store
+            .record_code_index(
+                std::slice::from_ref(&source_file),
+                std::slice::from_ref(&symbol),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let conn = test.store.connect().await.unwrap();
+        let mut mappings = conn
+            .query(
+                "
+                SELECT test_path, reason, score
+                FROM test_mappings
+                WHERE project_id = ?1 AND source_path = ?2
+                ",
+                params![LOCAL_PROJECT_ID, source_file.path.clone()],
+            )
+            .await
+            .unwrap();
+        let mapping = mappings.next().await.unwrap().unwrap();
+        assert_eq!(mapping.get::<String>(0).unwrap(), "tests/plugin_hooks.rs");
+        assert!(mapping.get::<String>(1).unwrap().contains("tests"));
+        assert!(mapping.get::<i64>(2).unwrap() > 0);
+        assert!(mappings.next().await.unwrap().is_none());
+
+        let mut embeddings = conn
+            .query(
+                "
+                SELECT model, dimensions, length(embedding), content_key
+                FROM source_embeddings
+                WHERE project_id = ?1 AND path = ?2
+                ",
+                params![LOCAL_PROJECT_ID, source_file.path.clone()],
+            )
+            .await
+            .unwrap();
+        let embedding = embeddings.next().await.unwrap().unwrap();
+        assert_eq!(embedding.get::<String>(0).unwrap(), DETERMINISTIC_MODEL);
+        assert_eq!(
+            embedding.get::<i64>(1).unwrap(),
+            DEFAULT_EMBEDDING_DIMENSIONS as i64
+        );
+        assert_eq!(
+            embedding.get::<i64>(2).unwrap(),
+            (DEFAULT_EMBEDDING_DIMENSIONS * 4) as i64
+        );
+        assert!(!embedding.get::<String>(3).unwrap().is_empty());
+        assert!(embeddings.next().await.unwrap().is_none());
+
+        let likely = test
+            .store
+            .likely_tests_for_files(&[source_file.path.clone()], 5)
+            .await
+            .unwrap();
+        assert_eq!(likely[0].path, "tests/plugin_hooks.rs");
     }
 
     #[tokio::test]
