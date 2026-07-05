@@ -114,6 +114,10 @@ Implemented:
 - `hugr context` and `hugr_context` merge persisted source-embedding vector matches into relevant-file selection and render source-embedding evidence ranks
 - `hugr index --paths <p1,p2,...>` and daemon file events perform incremental re-indexing of only changed paths plus their inbound-reference sources
 - code-reference edges distinguish imports, calls, member calls, implementations, inheritance, instantiations, type references, and generic references
+- linear-time reference extraction using per-line identifier tokenization and hashed declaration lookups instead of per-target scans
+- Rust `#[cfg(test)]` inline test modules map their own file as a test candidate in local, hosted, sync-record, and persisted mapping paths
+- symbol retrieval and context evidence rank identifier-word and bounded-stem name matches above signature and path hits, prefer callable kinds on ties, and report which field matched
+- graph neighborhoods collapse repeated reference sites per (kind, path, target) into one entry with a structured `site_count`, rank cross-file relationships above same-file ones, and name the defining file for cross-file targets in labels and citation ids
 - initial vision, storage, and technical blueprint docs
 
 Near-term parser and hosted API checklist is complete. Remaining broader product gaps are tracked below.
@@ -617,6 +621,10 @@ Recommended next commits:
 93. Done: `feat(edit): handle move source references`
 94. Done: `feat(context): rank source embeddings`
 95. Done: `feat(edit): resolve nested manifests`
+96. Done: `perf(code): index reference targets by name`
+97. Done: `feat(testmap): map rust inline test modules`
+98. Done: `feat(context): rank symbols by name relevance`
+99. Done: `feat(context): collapse graph reference sites`
 
 Each commit should leave the CLI usable.
 
@@ -632,6 +640,8 @@ Before ending each future session:
 - Update this plan if priorities change.
 
 ## Current Best Next Step
+
+A dogfooding review of `hugr context` on this repository fixed four output-quality gaps: reference extraction was accidentally quadratic (a full index of this repo never finished; it now takes seconds), Rust files with inline `#[cfg(test)]` modules produced false `missing_test_mapping` risks, symbol ranking listed top-of-file declarations because every symbol in a path-matched file scored identically, and graph neighborhoods spent most of their token budget on repeated same-file reference lines with ambiguous labels. Context packs on this repository now surface the task-relevant functions first, map inline tests, and compress the graph section into distinct cross-file relationships.
 
 The planned product systems are complete. Incremental freshness (deletion pruning, watcher-scoped partial refresh, persisted test-map/source-embedding refresh, semantic source-embedding file ranking, and `stale_context` invalidation), broader structural edits (Kotlin/Java import rewriting, manifest-resolved Go package moves, manifest-resolved Swift module moves, CommonJS `require` and export rewrites), safer source/destination-file reference handling during moves, and deeper deterministic risk signals (`long_parameter_list`, `high_fan_in`, `deep_nesting`, `cyclomatic_complexity`) all landed with unit and live coverage.
 
