@@ -10,6 +10,22 @@ pub(crate) struct FileCandidate {
     pub size_bytes: Option<u64>,
 }
 
+const SOURCE_EMBEDDING_SCORE_OFFSET: usize = 10_000;
+const SOURCE_EMBEDDING_RANK_WINDOW: usize = 1_000;
+
+pub(crate) fn source_embedding_score(rank: usize) -> usize {
+    let rank = rank.max(1).min(SOURCE_EMBEDDING_RANK_WINDOW);
+    SOURCE_EMBEDDING_SCORE_OFFSET + SOURCE_EMBEDDING_RANK_WINDOW - rank
+}
+
+pub(crate) fn source_embedding_rank(score: usize) -> Option<usize> {
+    if score < SOURCE_EMBEDDING_SCORE_OFFSET {
+        return None;
+    }
+    let rank_score = (score - SOURCE_EMBEDDING_SCORE_OFFSET).min(SOURCE_EMBEDDING_RANK_WINDOW - 1);
+    Some(SOURCE_EMBEDDING_RANK_WINDOW - rank_score)
+}
+
 pub(crate) trait FileFinder {
     fn find_files(&self, root: &Path) -> Result<Vec<PathBuf>, String>;
 }
@@ -86,6 +102,46 @@ pub(crate) fn discover_project_files(
     candidates.sort_by(|left, right| left.path.cmp(&right.path));
     candidates.truncate(limit);
     Ok(candidates)
+}
+
+pub(crate) fn merge_file_candidates(
+    mut candidates: Vec<FileCandidate>,
+    additional: Vec<FileCandidate>,
+    limit: usize,
+) -> Vec<FileCandidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    candidates.extend(additional);
+    let mut merged = Vec::<FileCandidate>::new();
+    for candidate in candidates {
+        match merged
+            .iter_mut()
+            .find(|existing| existing.path == candidate.path)
+        {
+            Some(existing) => {
+                if candidate.score > existing.score {
+                    existing.score = candidate.score;
+                }
+                if existing.language.is_none() {
+                    existing.language = candidate.language;
+                }
+                if existing.size_bytes.is_none() {
+                    existing.size_bytes = candidate.size_bytes;
+                }
+            }
+            None => merged.push(candidate),
+        }
+    }
+    merged.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    merged.truncate(limit);
+    merged
 }
 
 fn rank_files(root: &Path, task: &str, files: Vec<PathBuf>, limit: usize) -> Vec<FileCandidate> {
