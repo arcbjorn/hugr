@@ -125,7 +125,7 @@ The near-term plan is close to complete, but the broader vision and technical bl
 - Structured memory provenance: promoted session memories preserve structured payloads in JSON, and CLI/MCP memory writes support manual source attachments plus confidence, sensitivity, validity metadata, and project scope.
 - Automatic session observation: daemon captures file-change and git/worktree events for active sessions, `hugr run <command>` captures command/test outcomes, `hugr shell-hook <bash|zsh>` can observe ordinary shell command statuses, and daemon indexing captures classified discovery summaries.
 - Session summarization and memory promotion: manual `hugr session promote` summarizes latest session facts into long-term memory, and the daemon periodically promotes ended, unpromoted sessions.
-- Risk and health signals: context packs now include deterministic risks for stale memory conflicts, changed relevant files, missing tests/symbols, graph coupling, public/exported API surfaces, cross-file refactor surfaces, unreferenced private symbols, recent failure facts, index freshness, stale-after-edit context invalidation, recent diagnostic output, structured diagnostics with source locations, and large indexed symbols; deeper complexity and risky paths remain.
+- Risk and health signals: context packs now include deterministic risks for stale memory conflicts, changed relevant files, missing tests/symbols, graph coupling, public/exported API surfaces, cross-file refactor surfaces, unreferenced private symbols, recent failure facts, index freshness, stale-after-edit and stale-context invalidation, recent diagnostic output, structured diagnostics with source locations, large indexed symbols, long parameter lists, and high fan-in blast radius. Further complexity metrics (deep nesting, cyclomatic branching from symbol bodies) would require full-body parsing and remain optional.
 - Semantic operations: read-only CLI/MCP symbol lookup exists; safe local symbol replacement exists with parse and identity checks; the first reference-aware local rename exists for definitions plus indexed inbound references; reference-aware moves rewrite Rust, Python, TypeScript, and JavaScript ES-module imports, validate same-package Go/Java/Kotlin and same-module Swift moves, and rewrite Kotlin and Java imports across packages (insert/rewrite/drop qualified imports, refusing wildcard/aliased imports); cross-module Swift moves (module names are not resolvable from paths without build manifests) and CommonJS `require` moves (need source-side export rewriting and export-assignment symbol extraction) remain.
 - Incremental freshness: full and daemon indexing prune discovered-file, symbol, and code-reference rows (including dangling target edges) for files that no longer exist on disk; the daemon and `hugr index --paths` now re-index only changed paths plus their inbound-reference sources instead of the whole project, keeping cross-file references correct; and context packs surface a `stale_context` risk when a cited file's on-disk modification time is newer than the latest persisted pack, closing the direct-edit staleness gap (persisted packs are audit/sync artifacts and are always recompiled, never re-served). Broader watcher-driven refresh of tests and embeddings remains.
 
@@ -424,6 +424,8 @@ Implemented first slices:
 - Context packs derive `public_api_surface` risks from public/exported symbol signatures and incoming reference counts.
 - Context packs derive `unreferenced_private_symbol` risks when selected private functions or methods have no incoming indexed references.
 - Context packs derive `stale_after_edit` risks when selected files have Hugr edit session events newer than the latest persisted context pack, in both local and hosted API storage paths.
+- Context packs derive `long_parameter_list` code-health risks from indexed callable signatures whose top-level parameter count exceeds a deterministic threshold.
+- Context packs derive `high_fan_in` blast-radius risks when a symbol is referenced from many distinct files in the code graph, independent of visibility.
 
 Open questions:
 
@@ -606,6 +608,8 @@ Recommended next commits:
 87. Done: `feat(context): flag stale context packs`
 88. Done: `feat(edit): rewrite Kotlin cross-package moves`
 89. Done: `feat(edit): rewrite Java cross-package moves`
+90. Done: `feat(context): flag long parameter lists`
+91. Done: `feat(context): flag high fan-in symbols`
 
 Each commit should leave the CLI usable.
 
@@ -622,6 +626,13 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Extend incremental freshness from deletion pruning to watcher-scoped partial refresh: re-index only the specific paths a daemon file event reports, and invalidate persisted context packs whose cited files changed.
+The planned product systems are complete. Incremental freshness (deletion pruning, watcher-scoped partial refresh, and `stale_context` invalidation), broader cross-package structural edits (Kotlin and Java import rewriting on top of the existing same-package and ES-module support), and deeper deterministic risk signals (`long_parameter_list`, `high_fan_in`) all landed with unit and live coverage.
 
-That is the right next step because deletion pruning now closes the most dangerous freshness gap: `hugr index` and daemon background indexing remove discovered-file, symbol, and code-reference rows (including dangling target edges) for files that no longer exist, so recall, context, and impact stop citing deleted files. The remaining freshness work is efficiency and context-pack correctness rather than stale reads of missing files: today every change triggers a full ranked re-index of up to 5000 files, and persisted context packs are not invalidated when their cited files change after compilation. A watcher-scoped partial refresh keyed on the debounced `pending_paths` set, plus context-pack invalidation using existing edit-freshness timestamps, would make the daemon cheap on large repositories and keep compiled packs trustworthy. Narrower semantic follow-ups also remain: broader cross-package Go/Java/Kotlin moves, cross-module Swift moves, and broader non-ES-module JavaScript patterns.
+The remaining items are optional deep extensions, each opening a substantial new design space rather than closing a committed gap:
+
+- Cross-module Swift and cross-package Go moves require resolving module/package identity from build manifests (`Package.swift`, Go module paths), which the filesystem alone does not provide.
+- CommonJS `require` moves need source-side export rewriting (`module.exports = { ... }`) and symbol extraction for export-assignment expressions.
+- Deeper complexity metrics (deep nesting, cyclomatic branching) require parsing full symbol bodies rather than signatures and line ranges.
+- Watcher-driven refresh could extend from symbols and references to test mappings and embeddings.
+
+None of these is required for the core `hugr context` experience, which is complete: it compiles ranked memories, files, symbols, graph neighborhoods, tests, git state, structured diagnostics, and a broad deterministic risk surface with citations, in local and hosted API storage modes.
