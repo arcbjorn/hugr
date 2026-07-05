@@ -107,6 +107,8 @@ Implemented:
 - `hugr context` and `hugr_context` include public/exported API surface risks using indexed symbol signatures and incoming reference evidence
 - `hugr context` and `hugr_context` include low-severity unreferenced-private-symbol risks when selected private functions or methods have no incoming indexed references
 - `hugr context` and `hugr_context` include stale-after-edit risks when Hugr edit events for selected files are newer than the latest persisted context pack
+- `hugr context` and `hugr_context` include `stale_context` risks when a relevant file's on-disk modification time is newer than the latest persisted context pack, catching edits made outside Hugr edit commands
+- `hugr index --paths <p1,p2,...>` and daemon file events perform incremental re-indexing of only changed paths plus their inbound-reference sources
 - code-reference edges distinguish imports, calls, member calls, implementations, inheritance, instantiations, type references, and generic references
 - initial vision, storage, and technical blueprint docs
 
@@ -124,7 +126,7 @@ The near-term plan is close to complete, but the broader vision and technical bl
 - Session summarization and memory promotion: manual `hugr session promote` summarizes latest session facts into long-term memory, and the daemon periodically promotes ended, unpromoted sessions.
 - Risk and health signals: context packs now include deterministic risks for stale memory conflicts, changed relevant files, missing tests/symbols, graph coupling, public/exported API surfaces, cross-file refactor surfaces, unreferenced private symbols, recent failure facts, index freshness, stale-after-edit context invalidation, recent diagnostic output, structured diagnostics with source locations, and large indexed symbols; deeper complexity and risky paths remain.
 - Semantic operations: read-only CLI/MCP symbol lookup exists; safe local symbol replacement exists with parse and identity checks; the first reference-aware local rename exists for definitions plus indexed inbound references; broader multi-file structural edits remain.
-- Incremental freshness: full and daemon indexing now prune discovered-file, symbol, and code-reference rows (including dangling target edges) for files that no longer exist on disk, so recall, context, and impact stop surfacing deleted files; watcher-driven partial refresh and context-pack invalidation remain.
+- Incremental freshness: full and daemon indexing prune discovered-file, symbol, and code-reference rows (including dangling target edges) for files that no longer exist on disk; the daemon and `hugr index --paths` now re-index only changed paths plus their inbound-reference sources instead of the whole project, keeping cross-file references correct; and context packs surface a `stale_context` risk when a cited file's on-disk modification time is newer than the latest persisted pack, closing the direct-edit staleness gap (persisted packs are audit/sync artifacts and are always recompiled, never re-served). Broader watcher-driven refresh of tests and embeddings remains.
 
 ## Runtime Decision
 
@@ -599,6 +601,8 @@ Recommended next commits:
 83. Done: `feat(edit): allow same-package Java type moves`
 84. Done: `feat(edit): allow same-package Kotlin and Swift moves`
 85. Done: `feat(index): prune deleted file rows`
+86. Done: `feat(index): add incremental path refresh`
+87. Done: `feat(context): flag stale context packs`
 
 Each commit should leave the CLI usable.
 
