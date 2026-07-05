@@ -544,8 +544,27 @@ fn plan_reference_rewrites(
         );
     }
 
+    if source_language == Some("kotlin") && destination_language == Some("kotlin") {
+        return plan_kotlin_same_package_reference_awareness(
+            target,
+            source_contents,
+            destination_contents,
+            references_by_path,
+            reference_contents,
+        );
+    }
+
+    if source_language == Some("swift") && destination_language == Some("swift") {
+        return plan_swift_same_module_reference_awareness(
+            target,
+            destination_path,
+            references_by_path,
+            reference_contents,
+        );
+    }
+
     Err(
-        "move-symbol --rewrite-references currently supports Rust, Python, TypeScript, JavaScript, same-package Go, and same-package Java type source files only"
+        "move-symbol --rewrite-references currently supports Rust, Python, TypeScript, JavaScript, same-package Go, same-package Java type, same-package Kotlin, and same-module Swift source files only"
             .to_string(),
     )
 }
@@ -748,6 +767,166 @@ fn java_package_name(contents: &str) -> Option<String> {
         return Some(package.to_string());
     }
     None
+}
+
+fn plan_kotlin_same_package_reference_awareness(
+    target: &CodeSymbol,
+    source_contents: &str,
+    destination_contents: &str,
+    references_by_path: BTreeMap<String, Vec<CodeReference>>,
+    reference_contents: BTreeMap<String, String>,
+) -> Result<PlannedReferenceRewrite, String> {
+    if !kotlin_reference_safe_kind(&target.kind) {
+        return Err(format!(
+            "move-symbol --rewrite-references supports Kotlin moves only for top-level type declarations, not {} '{}'",
+            target.kind, target.name
+        ));
+    }
+
+    let source_package = kotlin_package_name(source_contents);
+    let destination_package = kotlin_package_name(destination_contents);
+    if source_package != destination_package {
+        return Err(format!(
+            "move-symbol --rewrite-references requires Kotlin source and destination files to share package '{}'",
+            source_package.as_deref().unwrap_or("<root>")
+        ));
+    }
+
+    for (path, references) in references_by_path {
+        let Some(contents) = reference_contents.get(&path) else {
+            return Err(format!(
+                "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
+            ));
+        };
+        if !code::parses_cleanly(&path, language_for_path(&path), contents)? {
+            return Err(format!(
+                "referencing file {path} is not valid Kotlin code; refusing to trust stale references"
+            ));
+        }
+        let reference_package = kotlin_package_name(contents);
+        if reference_package != source_package {
+            return Err(format!(
+                "move-symbol --rewrite-references requires Kotlin reference file {path} to share package '{}'",
+                source_package.as_deref().unwrap_or("<root>")
+            ));
+        }
+        for reference in references {
+            let line = line_at(contents, reference.line_start).ok_or_else(|| {
+                format!(
+                    "move-symbol reference line {} is past end of {path}",
+                    reference.line_start
+                )
+            })?;
+            let (_line, matches) = replace_identifier_in_line(line, &target.name, &target.name);
+            if matches == 0 {
+                return Err(format!(
+                    "move-symbol --rewrite-references could not verify Kotlin reference '{}' on {path}:{}; rerun hugr index",
+                    target.name, reference.line_start
+                ));
+            }
+        }
+    }
+
+    Ok(PlannedReferenceRewrite::default())
+}
+
+fn kotlin_reference_safe_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "annotation" | "class" | "enum" | "interface" | "object" | "type"
+    )
+}
+
+fn kotlin_package_name(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("package ") else {
+            // The first meaningful line is not a package declaration, so this
+            // file lives in the Kotlin root package.
+            return None;
+        };
+        let package = rest.trim_end_matches(';').trim();
+        if package.is_empty()
+            || !package
+                .split('.')
+                .all(|segment| valid_identifier(segment.trim()))
+        {
+            return None;
+        }
+        return Some(package.to_string());
+    }
+    None
+}
+
+fn plan_swift_same_module_reference_awareness(
+    target: &CodeSymbol,
+    destination_path: &str,
+    references_by_path: BTreeMap<String, Vec<CodeReference>>,
+    reference_contents: BTreeMap<String, String>,
+) -> Result<PlannedReferenceRewrite, String> {
+    if !swift_reference_safe_kind(&target.kind) {
+        return Err(format!(
+            "move-symbol --rewrite-references supports Swift moves only for type declarations, not {} '{}'",
+            target.kind, target.name
+        ));
+    }
+
+    // Swift has no per-file import for same-module symbols, so a move inside one
+    // module needs no textual rewrite. Swift also has no in-file module marker,
+    // so the enclosing directory stands in for the module boundary.
+    let source_parent = path_parent_segments(&target.path);
+    let destination_parent = path_parent_segments(destination_path);
+    if source_parent != destination_parent {
+        return Err(
+            "move-symbol --rewrite-references currently supports Swift moves only within the same module directory"
+                .to_string(),
+        );
+    }
+
+    for (path, references) in references_by_path {
+        if path_parent_segments(&path) != source_parent {
+            return Err(format!(
+                "move-symbol --rewrite-references cannot keep Swift reference {path} valid across module directories"
+            ));
+        }
+        let Some(contents) = reference_contents.get(&path) else {
+            return Err(format!(
+                "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
+            ));
+        };
+        if !code::parses_cleanly(&path, language_for_path(&path), contents)? {
+            return Err(format!(
+                "referencing file {path} is not valid Swift code; refusing to trust stale references"
+            ));
+        }
+        for reference in references {
+            let line = line_at(contents, reference.line_start).ok_or_else(|| {
+                format!(
+                    "move-symbol reference line {} is past end of {path}",
+                    reference.line_start
+                )
+            })?;
+            let (_line, matches) = replace_identifier_in_line(line, &target.name, &target.name);
+            if matches == 0 {
+                return Err(format!(
+                    "move-symbol --rewrite-references could not verify Swift reference '{}' on {path}:{}; rerun hugr index",
+                    target.name, reference.line_start
+                ));
+            }
+        }
+    }
+
+    Ok(PlannedReferenceRewrite::default())
+}
+
+fn swift_reference_safe_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "actor" | "class" | "enum" | "extension" | "protocol" | "struct" | "type"
+    )
 }
 
 fn path_file_stem(path: &str) -> Option<String> {
@@ -3667,6 +3846,240 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("only for type declarations"), "{error}");
+    }
+
+    #[test]
+    fn plans_kotlin_same_package_type_move_with_references_without_text_rewrites() {
+        let source = "package plugin\n\nclass Helper {\n    fun value(): Int = 1\n}\n\nclass Other\n";
+        let destination = "package plugin\n\nclass Existing\n";
+        let caller = "package plugin\n\nclass Caller {\n    val helper = Helper()\n}\n";
+        let target =
+            resolve_symbol_in_source("src/plugin/Hooks.kt", source, "Helper", None, "move")
+                .unwrap();
+        let references = vec![CodeReference {
+            path: "src/plugin/Caller.kt".to_string(),
+            language: Some("kotlin".to_string()),
+            target_path: "src/plugin/Hooks.kt".to_string(),
+            target_name: "Helper".to_string(),
+            target_kind: "class".to_string(),
+            kind: "instantiation".to_string(),
+            line_start: 4,
+            excerpt: "val helper = Helper()".to_string(),
+        }];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "src/plugin/Helper.kt",
+            destination,
+            vec![("src/plugin/Caller.kt".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(planned.summary.rewritten_reference_count, 0);
+        assert!(
+            planned
+                .files
+                .iter()
+                .all(|file| file.path != "src/plugin/Caller.kt")
+        );
+        assert!(
+            planned
+                .files
+                .iter()
+                .find(|file| file.path == "src/plugin/Helper.kt")
+                .unwrap()
+                .contents
+                .contains("class Helper")
+        );
+    }
+
+    #[test]
+    fn rejects_kotlin_reference_aware_move_across_packages() {
+        let source = "package plugin\n\nclass Helper\n";
+        let destination = "package other\n\nclass Existing\n";
+        let caller = "package plugin\n\nclass Caller {\n    val helper = Helper()\n}\n";
+        let target =
+            resolve_symbol_in_source("src/plugin/Hooks.kt", source, "Helper", None, "move")
+                .unwrap();
+        let references = vec![CodeReference {
+            path: "src/plugin/Caller.kt".to_string(),
+            language: Some("kotlin".to_string()),
+            target_path: "src/plugin/Hooks.kt".to_string(),
+            target_name: "Helper".to_string(),
+            target_kind: "class".to_string(),
+            kind: "instantiation".to_string(),
+            line_start: 4,
+            excerpt: "val helper = Helper()".to_string(),
+        }];
+
+        let error = plan_move(
+            &target,
+            &references,
+            source,
+            "src/other/Helper.kt",
+            destination,
+            vec![("src/plugin/Caller.kt".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("share package"), "{error}");
+    }
+
+    #[test]
+    fn rejects_kotlin_reference_aware_function_move() {
+        let source = "package plugin\n\nfun helper(): Int = 1\n";
+        let destination = "package plugin\n\nclass Existing\n";
+        let caller = "package plugin\n\nfun useHelper(): Int = helper()\n";
+        let target =
+            resolve_symbol_in_source("src/plugin/Hooks.kt", source, "helper", None, "move")
+                .unwrap();
+        let references = vec![CodeReference {
+            path: "src/plugin/Caller.kt".to_string(),
+            language: Some("kotlin".to_string()),
+            target_path: "src/plugin/Hooks.kt".to_string(),
+            target_name: "helper".to_string(),
+            target_kind: "function".to_string(),
+            kind: "call".to_string(),
+            line_start: 3,
+            excerpt: "fun useHelper(): Int = helper()".to_string(),
+        }];
+
+        let error = plan_move(
+            &target,
+            &references,
+            source,
+            "src/plugin/Helpers.kt",
+            destination,
+            vec![("src/plugin/Caller.kt".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("top-level type declarations"), "{error}");
+    }
+
+    #[test]
+    fn plans_swift_same_module_type_move_with_references_without_text_rewrites() {
+        let source = "struct Helper {\n    let value = 1\n}\n\nstruct Other {}\n";
+        let destination = "struct Existing {}\n";
+        let caller = "struct Caller {\n    let helper = Helper()\n}\n";
+        let target = resolve_symbol_in_source("Sources/App/Hooks.swift", source, "Helper", None, "move")
+            .unwrap();
+        let references = vec![CodeReference {
+            path: "Sources/App/Caller.swift".to_string(),
+            language: Some("swift".to_string()),
+            target_path: "Sources/App/Hooks.swift".to_string(),
+            target_name: "Helper".to_string(),
+            target_kind: "struct".to_string(),
+            kind: "instantiation".to_string(),
+            line_start: 2,
+            excerpt: "let helper = Helper()".to_string(),
+        }];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "Sources/App/Helper.swift",
+            destination,
+            vec![(
+                "Sources/App/Caller.swift".to_string(),
+                caller.to_string(),
+            )],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(planned.summary.rewritten_reference_count, 0);
+        assert!(
+            planned
+                .files
+                .iter()
+                .all(|file| file.path != "Sources/App/Caller.swift")
+        );
+        assert!(
+            planned
+                .files
+                .iter()
+                .find(|file| file.path == "Sources/App/Helper.swift")
+                .unwrap()
+                .contents
+                .contains("struct Helper")
+        );
+    }
+
+    #[test]
+    fn rejects_swift_reference_aware_move_across_module_directories() {
+        let source = "struct Helper {}\n";
+        let destination = "struct Existing {}\n";
+        let caller = "struct Caller {\n    let helper = Helper()\n}\n";
+        let target = resolve_symbol_in_source("Sources/App/Hooks.swift", source, "Helper", None, "move")
+            .unwrap();
+        let references = vec![CodeReference {
+            path: "Sources/App/Caller.swift".to_string(),
+            language: Some("swift".to_string()),
+            target_path: "Sources/App/Hooks.swift".to_string(),
+            target_name: "Helper".to_string(),
+            target_kind: "struct".to_string(),
+            kind: "instantiation".to_string(),
+            line_start: 2,
+            excerpt: "let helper = Helper()".to_string(),
+        }];
+
+        let error = plan_move(
+            &target,
+            &references,
+            source,
+            "Sources/Other/Helper.swift",
+            destination,
+            vec![(
+                "Sources/App/Caller.swift".to_string(),
+                caller.to_string(),
+            )],
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("same module directory"), "{error}");
+    }
+
+    #[test]
+    fn rejects_swift_reference_aware_function_move() {
+        let source = "func helper() -> Int {\n    return 1\n}\n";
+        let destination = "struct Existing {}\n";
+        let caller = "func useHelper() -> Int {\n    return helper()\n}\n";
+        let target = resolve_symbol_in_source("Sources/App/Hooks.swift", source, "helper", None, "move")
+            .unwrap();
+        let references = vec![CodeReference {
+            path: "Sources/App/Caller.swift".to_string(),
+            language: Some("swift".to_string()),
+            target_path: "Sources/App/Hooks.swift".to_string(),
+            target_name: "helper".to_string(),
+            target_kind: "function".to_string(),
+            kind: "call".to_string(),
+            line_start: 2,
+            excerpt: "return helper()".to_string(),
+        }];
+
+        let error = plan_move(
+            &target,
+            &references,
+            source,
+            "Sources/App/Helpers.swift",
+            destination,
+            vec![(
+                "Sources/App/Caller.swift".to_string(),
+                caller.to_string(),
+            )],
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("type declarations"), "{error}");
     }
 
     #[test]
