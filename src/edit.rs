@@ -320,54 +320,62 @@ pub(crate) fn plan_move(
 
     reject_destination_symbol_collision(destination_path, destination_contents, target)?;
 
+    let moved_body =
+        extract_line_range(source_contents, old_line_start, old_line_end, &target.path)?;
+    let source_after =
+        remove_line_range(source_contents, old_line_start, old_line_end, &target.path)?;
+    let destination_after = append_symbol_body(destination_contents, &moved_body);
+    let moved_line_count =
+        usize::try_from(old_line_end - old_line_start + 1).map_err(|error| error.to_string())?;
+    let adjusted_inbound_references = adjusted_references_after_move(
+        target,
+        &inbound_references,
+        old_line_start,
+        old_line_end,
+        moved_line_count,
+    );
+
     let reference_rewrite = if rewrite_references {
         plan_reference_rewrites(
             target,
             destination_path,
-            source_contents,
-            destination_contents,
+            &source_after,
+            &destination_after,
             source_language,
             destination_language,
-            &inbound_references,
+            &adjusted_inbound_references,
             reference_files,
         )?
     } else {
         PlannedReferenceRewrite::default()
     };
 
-    let moved_body =
-        extract_line_range(source_contents, old_line_start, old_line_end, &target.path)?;
-    let source_after =
-        remove_line_range(source_contents, old_line_start, old_line_end, &target.path)?;
-    let destination_after = append_symbol_body(destination_contents, &moved_body);
-
-    if !code::parses_cleanly(&target.path, source_language, &source_after)? {
-        return Err(format!(
-            "source file {} would not parse after moving '{}'",
-            target.path, target.name
-        ));
+    let mut files_by_path = BTreeMap::new();
+    files_by_path.insert(target.path.clone(), source_after);
+    files_by_path.insert(destination_path.to_string(), destination_after);
+    for file in reference_rewrite.files {
+        files_by_path.insert(file.path, file.contents);
     }
-    if !code::parses_cleanly(destination_path, destination_language, &destination_after)? {
-        return Err(format!(
-            "destination file {destination_path} would not parse after moving '{}'",
-            target.name
-        ));
+    let files = files_by_path
+        .into_iter()
+        .map(|(path, contents)| PlannedMoveFile { path, contents })
+        .collect::<Vec<_>>();
+
+    for file in &files {
+        if !code::parses_cleanly(&file.path, language_for_path(&file.path), &file.contents)? {
+            return Err(format!(
+                "file {} would not parse after moving '{}'",
+                file.path, target.name
+            ));
+        }
     }
-
-    validate_moved_symbol_in_destination(destination_path, &destination_after, target)?;
-
-    let mut files = vec![
-        PlannedMoveFile {
-            path: target.path.clone(),
-            contents: source_after,
-        },
-        PlannedMoveFile {
-            path: destination_path.to_string(),
-            contents: destination_after,
-        },
-    ];
-    files.extend(reference_rewrite.files);
-    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let destination_final = files
+        .iter()
+        .find(|file| file.path == destination_path)
+        .ok_or_else(|| {
+            format!("move-symbol did not produce destination file {destination_path}")
+        })?;
+    validate_moved_symbol_in_destination(destination_path, &destination_final.contents, target)?;
 
     let mut changed_files = vec![
         SymbolMoveFile {
@@ -380,7 +388,7 @@ pub(crate) fn plan_move(
         },
     ];
     changed_files.extend(reference_rewrite.changed_files);
-    changed_files.sort_by(|left, right| left.path.cmp(&right.path));
+    let changed_files = merge_move_changed_files(changed_files);
 
     Ok(PlannedMove {
         files,
@@ -392,7 +400,7 @@ pub(crate) fn plan_move(
             kind: target.kind.clone(),
             old_line_start,
             old_line_end,
-            moved_line_count: moved_body.lines().count(),
+            moved_line_count,
             rewritten_reference_count: reference_rewrite.rewritten_reference_count,
             changed_files,
         },
@@ -404,6 +412,49 @@ struct PlannedReferenceRewrite {
     files: Vec<PlannedMoveFile>,
     changed_files: Vec<SymbolMoveFile>,
     rewritten_reference_count: usize,
+}
+
+fn adjusted_references_after_move(
+    target: &CodeSymbol,
+    references: &[CodeReference],
+    old_line_start: i64,
+    old_line_end: i64,
+    moved_line_count: usize,
+) -> Vec<CodeReference> {
+    let moved_line_count = i64::try_from(moved_line_count).unwrap_or(i64::MAX);
+    references
+        .iter()
+        .filter_map(|reference| {
+            let mut adjusted = reference.clone();
+            if adjusted.path == target.path {
+                if (old_line_start..=old_line_end).contains(&adjusted.line_start) {
+                    return None;
+                }
+                if adjusted.line_start > old_line_end {
+                    adjusted.line_start = adjusted.line_start.saturating_sub(moved_line_count);
+                }
+            }
+            Some(adjusted)
+        })
+        .collect()
+}
+
+fn merge_move_changed_files(files: Vec<SymbolMoveFile>) -> Vec<SymbolMoveFile> {
+    let mut actions_by_path = BTreeMap::<String, Vec<String>>::new();
+    for file in files {
+        let actions = actions_by_path.entry(file.path).or_default();
+        if !actions.contains(&file.action) {
+            actions.push(file.action);
+        }
+    }
+
+    actions_by_path
+        .into_iter()
+        .map(|(path, actions)| SymbolMoveFile {
+            path,
+            action: actions.join(", "),
+        })
+        .collect()
 }
 
 fn plan_reference_rewrites(
@@ -419,17 +470,12 @@ fn plan_reference_rewrites(
     if inbound_references.is_empty() {
         return Ok(PlannedReferenceRewrite::default());
     }
-    if inbound_references
-        .iter()
-        .any(|reference| reference.path == target.path || reference.path == destination_path)
-    {
-        return Err(
-            "move-symbol --rewrite-references does not yet support references from the source or destination file"
-                .to_string(),
-        );
-    }
-
-    let reference_contents = reference_files.into_iter().collect::<BTreeMap<_, _>>();
+    let mut reference_contents = reference_files.into_iter().collect::<BTreeMap<_, _>>();
+    reference_contents.insert(target.path.clone(), source_contents.to_string());
+    reference_contents.insert(
+        destination_path.to_string(),
+        destination_contents.to_string(),
+    );
     let mut references_by_path = BTreeMap::<String, Vec<CodeReference>>::new();
     for reference in inbound_references {
         references_by_path
@@ -4103,6 +4149,63 @@ mod tests {
                 .contents
                 .contains("func helper() int")
         );
+    }
+
+    #[test]
+    fn plans_go_move_with_source_and_destination_references() {
+        let source = "package plugin\n\ntype Helper struct{}\n\nfunc makeHelper() Helper {\n    return Helper{}\n}\n";
+        let destination = "package plugin\n\nfunc existing() Helper {\n    return Helper{}\n}\n";
+        let target =
+            resolve_symbol_in_source("plugin/hooks.go", source, "Helper", None, "move").unwrap();
+        let references = vec![
+            CodeReference {
+                path: "plugin/hooks.go".to_string(),
+                language: Some("go".to_string()),
+                target_path: "plugin/hooks.go".to_string(),
+                target_name: "Helper".to_string(),
+                target_kind: "struct".to_string(),
+                kind: "type_reference".to_string(),
+                line_start: 5,
+                excerpt: "func makeHelper() Helper {".to_string(),
+            },
+            CodeReference {
+                path: "plugin/helpers.go".to_string(),
+                language: Some("go".to_string()),
+                target_path: "plugin/hooks.go".to_string(),
+                target_name: "Helper".to_string(),
+                target_kind: "struct".to_string(),
+                kind: "type_reference".to_string(),
+                line_start: 3,
+                excerpt: "func existing() Helper {".to_string(),
+            },
+        ];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "plugin/helpers.go",
+            destination,
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        let source_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "plugin/hooks.go")
+            .unwrap();
+        let destination_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "plugin/helpers.go")
+            .unwrap();
+
+        assert_eq!(planned.summary.rewritten_reference_count, 0);
+        assert!(!source_file.contents.contains("type Helper struct{}"));
+        assert!(source_file.contents.contains("func makeHelper() Helper"));
+        assert!(destination_file.contents.contains("func existing() Helper"));
+        assert!(destination_file.contents.contains("type Helper struct{}"));
     }
 
     #[test]
