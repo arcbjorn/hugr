@@ -81,7 +81,7 @@ pub(crate) async fn serve(config: DaemonConfig) -> Result<(), String> {
                 let observed_paths = pending_paths.iter().cloned().collect::<Vec<_>>();
                 pending_paths.clear();
                 tokio::spawn(async move {
-                    run_background_index(state.clone()).await;
+                    run_background_index(state.clone(), observed_paths.clone()).await;
                     run_session_observation(state, observed_paths).await;
                 });
             }
@@ -181,31 +181,26 @@ fn http_header_end(buffer: &[u8]) -> Option<(usize, usize)> {
         })
 }
 
-async fn run_background_index(state: Arc<DaemonState>) {
+async fn run_background_index(state: Arc<DaemonState>, changed_paths: Vec<String>) {
     if state.indexing.swap(true, Ordering::SeqCst) {
         state.set_last_index_status("already_running");
         return;
     }
 
     state.set_last_index_status("running");
-    let status = match indexer::index_project(5000).await {
+    let status = match indexer::refresh_paths(5000, &changed_paths).await {
         Ok(summary) => {
-            let base_status = if summary.pruned.is_empty() {
-                format!(
-                    "ok files={} symbols={}",
-                    summary.file_count, summary.symbol_count
-                )
-            } else {
-                format!(
-                    "ok files={} symbols={} pruned_files={} pruned_symbols={} pruned_references={}",
-                    summary.file_count,
-                    summary.symbol_count,
-                    summary.pruned.missing_paths,
-                    summary.pruned.symbols,
-                    summary.pruned.references
-                )
-            };
-            match record_discovery_capture(&summary).await {
+            let mut base_status = format!(
+                "ok reparsed={} reference_files={} symbols={}",
+                summary.reparsed_files, summary.reference_files, summary.symbol_count
+            );
+            if !summary.pruned.is_empty() {
+                base_status.push_str(&format!(
+                    " pruned_files={} pruned_symbols={} pruned_references={}",
+                    summary.pruned.missing_paths, summary.pruned.symbols, summary.pruned.references
+                ));
+            }
+            match record_refresh_capture(&summary).await {
                 Ok(Some(event_id)) => format!("{base_status} discovery_event={event_id}"),
                 Ok(None) => format!("{base_status} discovery=skipped"),
                 Err(error) => format!("{base_status} discovery_error={error}"),
@@ -217,38 +212,27 @@ async fn run_background_index(state: Arc<DaemonState>) {
     state.indexing.store(false, Ordering::SeqCst);
 }
 
-async fn record_discovery_capture(
-    summary: &indexer::IndexSummary,
+async fn record_refresh_capture(
+    summary: &indexer::RefreshSummary,
 ) -> Result<Option<String>, String> {
     Store::open_current()
-        .record_session_event_if_active("discovery", &render_discovery_capture_detail(summary))
+        .record_session_event_if_active("discovery", &render_refresh_capture_detail(summary))
         .await
         .map(|event| event.map(|event| event.id))
 }
 
-fn render_discovery_capture_detail(summary: &indexer::IndexSummary) -> String {
-    let sample_files = if summary.sample_files.is_empty() {
-        "none".to_string()
-    } else {
-        summary.sample_files.join(", ")
-    };
-    let extra_files = summary
-        .file_count
-        .saturating_sub(summary.sample_files.len());
-    let sample_files = if extra_files == 0 {
-        sample_files
-    } else {
-        format!("{sample_files}, +{extra_files} more")
-    };
-
-    format!(
-        "indexed files={} symbols={}; file_roles={}; languages={}; symbol_kinds={}; sample_files={sample_files}",
-        summary.file_count,
-        summary.symbol_count,
-        indexer::format_classifications(&summary.file_roles),
-        indexer::format_classifications(&summary.languages),
-        indexer::format_classifications(&summary.symbol_kinds)
-    )
+fn render_refresh_capture_detail(summary: &indexer::RefreshSummary) -> String {
+    let mut detail = format!(
+        "incremental index reparsed_files={} reference_files={} symbols={}",
+        summary.reparsed_files, summary.reference_files, summary.symbol_count
+    );
+    if !summary.pruned.is_empty() {
+        detail.push_str(&format!(
+            "; pruned_files={} pruned_symbols={} pruned_references={}",
+            summary.pruned.missing_paths, summary.pruned.symbols, summary.pruned.references
+        ));
+    }
+    detail
 }
 
 async fn run_memory_maintenance_job(state: Arc<DaemonState>) {
@@ -1252,10 +1236,11 @@ mod tests {
     use super::{
         DaemonState, HUGR_API_CONTRACT_VERSION, is_ignored_watch_path,
         parse_memory_api_apply_request, parse_storage_api_apply_request,
-        render_discovery_capture_detail, render_session_observation_detail, request_line_parts,
+        render_refresh_capture_detail, render_session_observation_detail, request_line_parts,
         response_for_request_with_api_token,
     };
-    use crate::indexer::{IndexClassification, IndexSummary};
+    use crate::indexer::RefreshSummary;
+    use crate::store::PruneSummary;
     use crate::worktree::{ChangedFile, WorktreeState};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::Path;
@@ -1539,31 +1524,31 @@ mod tests {
     }
 
     #[test]
-    fn discovery_capture_detail_includes_index_summary() {
-        let detail = render_discovery_capture_detail(&IndexSummary {
-            file_count: 14,
-            symbol_count: 7,
-            sample_files: vec!["src/lib.rs".to_string(), "src/store.rs".to_string()],
-            file_roles: vec![IndexClassification {
-                name: "source".to_string(),
-                count: 10,
-            }],
-            languages: vec![IndexClassification {
-                name: "rust".to_string(),
-                count: 9,
-            }],
-            symbol_kinds: vec![IndexClassification {
-                name: "function".to_string(),
-                count: 7,
-            }],
+    fn refresh_capture_detail_includes_incremental_counts() {
+        let detail = render_refresh_capture_detail(&RefreshSummary {
+            reparsed_files: 2,
+            reference_files: 3,
+            symbol_count: 5,
             pruned: Default::default(),
         });
+        assert!(detail.contains("incremental index reparsed_files=2 reference_files=3 symbols=5"));
+        assert!(!detail.contains("pruned_files"));
+    }
 
-        assert!(detail.contains("indexed files=14 symbols=7"));
-        assert!(detail.contains("file_roles=source=10"));
-        assert!(detail.contains("languages=rust=9"));
-        assert!(detail.contains("symbol_kinds=function=7"));
-        assert!(detail.contains("sample_files=src/lib.rs, src/store.rs, +12 more"));
+    #[test]
+    fn refresh_capture_detail_reports_pruned_rows() {
+        let detail = render_refresh_capture_detail(&RefreshSummary {
+            reparsed_files: 1,
+            reference_files: 1,
+            symbol_count: 1,
+            pruned: PruneSummary {
+                missing_paths: 2,
+                discovered_files: 2,
+                symbols: 3,
+                references: 4,
+            },
+        });
+        assert!(detail.contains("pruned_files=2 pruned_symbols=3 pruned_references=4"));
     }
 
     #[test]
