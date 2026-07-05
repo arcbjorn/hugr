@@ -681,6 +681,69 @@ fn move_symbol_rewrites_python_references_and_refreshes_index() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
+#[test]
+fn move_symbol_rewrites_javascript_references_and_refreshes_index() {
+    let hugr = env!("CARGO_BIN_EXE_hugr");
+    let workspace = temp_workspace("move_symbol_javascript_rewrite");
+    let source = workspace.join("pluginHooks.js");
+    let destination = workspace.join("helpers.js");
+    let main = workspace.join("main.js");
+    fs::write(
+        &source,
+        "export function helper() {\n    return 1;\n}\n\nexport function other() {\n    return 2;\n}\n",
+    )
+    .expect("source file should be written");
+    fs::write(
+        &destination,
+        "export function existing() {\n    return 0;\n}\n",
+    )
+    .expect("destination should be written");
+    fs::write(
+        &main,
+        "import { helper as runHelper, other } from \"./pluginHooks.js\";\nimport * as hooks from \"./pluginHooks.js\";\n\nconst value = runHelper() + hooks.helper();\n",
+    )
+    .expect("main source should be written");
+
+    let init = run_local_hugr(hugr, &workspace, &["init"]);
+    assert!(init.status.success(), "init failed: {init:?}");
+
+    let moved = run_local_hugr(
+        hugr,
+        &workspace,
+        &[
+            "move-symbol",
+            "--json",
+            "--rewrite-references",
+            "--kind",
+            "function",
+            "pluginHooks.js",
+            "helper",
+            "helpers.js",
+        ],
+    );
+    assert!(moved.status.success(), "move failed: {moved:?}");
+    let moved_json = String::from_utf8(moved.stdout).unwrap();
+    assert!(moved_json.contains("\"rewritten_reference_count\":2"));
+
+    let edited_source = fs::read_to_string(&source).unwrap();
+    let edited_destination = fs::read_to_string(&destination).unwrap();
+    let edited_main = fs::read_to_string(&main).unwrap();
+    assert!(!edited_source.contains("function helper"));
+    assert!(edited_source.contains("function other"));
+    assert!(edited_destination.contains("function helper()"));
+    assert!(edited_main.contains("import { other } from \"./pluginHooks.js\";"));
+    assert!(edited_main.contains("import { helper as runHelper } from \"./helpers.js\";"));
+    assert!(edited_main.contains("import * as hooks from \"./helpers.js\";"));
+    assert!(edited_main.contains("runHelper() + hooks.helper()"));
+
+    let symbols = run_local_hugr(hugr, &workspace, &["symbols", "--json", "helper"]);
+    assert!(symbols.status.success(), "symbols failed: {symbols:?}");
+    let symbols_json = String::from_utf8(symbols.stdout).unwrap();
+    assert!(symbols_json.contains("\"path\":\"helpers.js\""));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
 fn run_local_hugr(hugr: &str, dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(hugr)
         .args(args)
