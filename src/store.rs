@@ -1,4 +1,4 @@
-use crate::code::{CodeReference, CodeSymbol};
+use crate::code::{self, CodeReference, CodeSymbol};
 use crate::discovery::FileCandidate;
 use crate::embedding::{Embedding, EmbeddingProvider, SelectedEmbeddingProvider};
 use crate::migrations;
@@ -307,6 +307,10 @@ pub struct GraphNeighbor {
     pub target_path: Option<String>,
     pub target_name: Option<String>,
     pub line_start: Option<i64>,
+    /// Number of collapsed reference sites this neighbor represents; 1 for a
+    /// single line, larger when repeated same-relationship lines were folded
+    /// into one entry to save context budget.
+    pub site_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1417,9 +1421,10 @@ impl Store {
         migrations::migrate(&conn).await?;
         let mut candidates = stored_test_candidates_for_files(&conn, files, limit).await?;
         let known_files = load_known_file_paths(&conn).await?;
+        let inline_test_paths = load_inline_test_paths(&conn).await?;
         merge_test_candidates(
             &mut candidates,
-            testmap::likely_tests_for_files(files, &known_files, limit),
+            testmap::likely_tests_for_files(files, &known_files, &inline_test_paths, limit),
         );
         Ok(finalize_test_candidates(candidates, limit))
     }
@@ -3338,8 +3343,9 @@ fn record_code_index_via_hugr_api(
         .iter()
         .map(|file| file.path.clone())
         .collect::<Vec<_>>();
+    let inline_test_paths = testmap::inline_test_paths_from_symbols(symbols);
     let test_mapping_records =
-        build_test_mapping_sync_records(&indexed_paths, &indexed_paths, now)?;
+        build_test_mapping_sync_records(&indexed_paths, &indexed_paths, &inline_test_paths, now)?;
     let source_embedding_records =
         build_source_embedding_sync_records(files, symbols, now, embedding_provider)?;
     let replace_paths = files
@@ -3366,6 +3372,7 @@ fn record_code_index_via_hugr_api(
 fn build_test_mapping_sync_records(
     source_paths: &[String],
     known_files: &[String],
+    inline_test_paths: &HashSet<String>,
     now: i64,
 ) -> Result<Vec<serde_json::Value>, String> {
     let mut records = Vec::new();
@@ -3374,9 +3381,12 @@ fn build_test_mapping_sync_records(
     unique_sources.dedup();
 
     for source_path in unique_sources {
-        for candidate in
-            testmap::likely_tests_for_files(std::slice::from_ref(&source_path), known_files, 32)
-        {
+        for candidate in testmap::likely_tests_for_files(
+            std::slice::from_ref(&source_path),
+            known_files,
+            inline_test_paths,
+            32,
+        ) {
             records.push(test_mapping_sync_record_value(&TestMappingSyncRecord {
                 project_id: LOCAL_PROJECT_ID.to_string(),
                 source_path: source_path.clone(),
@@ -3787,7 +3797,16 @@ fn append_record_graph_neighbors(
 
 fn graph_neighbor_from_code_reference(kind: &str, reference: CodeReference) -> GraphNeighbor {
     let location = format!("{}:{}", reference.path, reference.line_start);
-    let target = format!("{} {}", reference.target_kind, reference.target_name);
+    // Name the defining file for cross-file targets so references to
+    // same-named symbols in different files stay distinguishable.
+    let target = if reference.target_path == reference.path {
+        format!("{} {}", reference.target_kind, reference.target_name)
+    } else {
+        format!(
+            "{} {} in {}",
+            reference.target_kind, reference.target_name, reference.target_path
+        )
+    };
     let label = match kind {
         "incoming_reference" => format!("{location} references {target}"),
         "outgoing_reference" => format!("{location} reaches {target}"),
@@ -3811,6 +3830,7 @@ fn graph_neighbor_from_code_reference(kind: &str, reference: CodeReference) -> G
         target_path: Some(reference.target_path),
         target_name: Some(reference.target_name),
         line_start: Some(reference.line_start),
+        site_count: 1,
     }
 }
 
@@ -3823,6 +3843,7 @@ fn graph_neighbor_from_source(source: &SourceSyncRecord) -> GraphNeighbor {
         target_path: None,
         target_name: None,
         line_start: None,
+        site_count: 1,
     }
 }
 
@@ -3838,6 +3859,7 @@ fn graph_neighbor_from_entity(entity: &EntitySyncRecord) -> GraphNeighbor {
         target_path: entity.locator.clone(),
         target_name: Some(entity.name.clone()),
         line_start: None,
+        site_count: 1,
     }
 }
 
@@ -3862,6 +3884,7 @@ fn graph_neighbor_from_edge(
         target_path: None,
         target_name: Some(to_label),
         line_start: None,
+        site_count: 1,
     }
 }
 
@@ -3911,12 +3934,13 @@ fn finalize_graph_neighbors(
 ) -> Vec<GraphNeighbor> {
     let terms = query_terms(query);
     let mut seen = HashSet::new();
-    let mut deduped = neighbors
+    let deduped = neighbors
         .into_iter()
         .filter(|neighbor| seen.insert(graph_neighbor_key(neighbor)))
         .collect::<Vec<_>>();
+    let mut collapsed = collapse_reference_neighbor_sites(deduped);
 
-    deduped.sort_by(|left, right| {
+    collapsed.sort_by(|left, right| {
         let left_score = graph_neighbor_sort_score(left, &terms);
         let right_score = graph_neighbor_sort_score(right, &terms);
         right_score
@@ -3924,8 +3948,53 @@ fn finalize_graph_neighbors(
             .then_with(|| left.kind.cmp(&right.kind))
             .then_with(|| left.label.cmp(&right.label))
     });
-    deduped.truncate(limit);
-    deduped
+    collapsed.truncate(limit);
+    collapsed
+}
+
+/// Folds repeated reference rows for one (kind, path, target) relationship
+/// into a single neighbor carrying a site count, so a type referenced from
+/// many lines of one file costs one context entry instead of many. The
+/// earliest line is kept as the representative site.
+fn collapse_reference_neighbor_sites(neighbors: Vec<GraphNeighbor>) -> Vec<GraphNeighbor> {
+    let mut collapsed: Vec<GraphNeighbor> = Vec::new();
+    let mut index_by_key = HashMap::<(String, String, String, String), usize>::new();
+
+    for neighbor in neighbors {
+        let collapsible = matches!(
+            neighbor.kind.as_str(),
+            "incoming_reference" | "outgoing_reference" | "path_reference"
+        );
+        if !collapsible {
+            collapsed.push(neighbor);
+            continue;
+        }
+
+        let key = (
+            neighbor.kind.clone(),
+            neighbor.path.clone().unwrap_or_default(),
+            neighbor.target_path.clone().unwrap_or_default(),
+            neighbor.target_name.clone().unwrap_or_default(),
+        );
+        match index_by_key.get(&key) {
+            Some(&existing_index) => {
+                let existing = &mut collapsed[existing_index];
+                let site_count = existing.site_count + neighbor.site_count;
+                let existing_line = existing.line_start.unwrap_or(i64::MAX);
+                let incoming_line = neighbor.line_start.unwrap_or(i64::MAX);
+                if incoming_line < existing_line {
+                    *existing = neighbor;
+                }
+                existing.site_count = site_count;
+            }
+            None => {
+                index_by_key.insert(key, collapsed.len());
+                collapsed.push(neighbor);
+            }
+        }
+    }
+
+    collapsed
 }
 
 fn graph_neighbor_sort_score(neighbor: &GraphNeighbor, terms: &[String]) -> usize {
@@ -3946,7 +4015,15 @@ fn graph_neighbor_sort_score(neighbor: &GraphNeighbor, terms: &[String]) -> usiz
         neighbor.path.as_deref().unwrap_or(""),
         neighbor.target_name.as_deref().unwrap_or("")
     );
-    base + graph_text_match_score(&searchable, terms) * 40
+    // Cross-file relationships tell an agent something it cannot see inside
+    // the file it is about to open, so same-file references rank below them.
+    let same_file_penalty = match (&neighbor.path, &neighbor.target_path) {
+        (Some(path), Some(target_path)) if path == target_path => 120,
+        _ => 0,
+    };
+    let site_bonus = neighbor.site_count.min(6) * 10;
+    (base + graph_text_match_score(&searchable, terms) * 40 + site_bonus)
+        .saturating_sub(same_file_penalty)
 }
 
 fn graph_neighbor_key(neighbor: &GraphNeighbor) -> String {
@@ -4706,9 +4783,11 @@ fn likely_tests_for_files_via_hugr_api(
         .into_iter()
         .map(|record| record.path)
         .collect::<Vec<_>>();
+    let inline_test_paths =
+        testmap::inline_test_paths_from_symbols(&storage_code_symbols(&snapshot)?);
     merge_test_candidates(
         &mut candidates,
-        testmap::likely_tests_for_files(files, &known_files, limit),
+        testmap::likely_tests_for_files(files, &known_files, &inline_test_paths, limit),
     );
     Ok(finalize_test_candidates(candidates, limit))
 }
@@ -11215,32 +11294,56 @@ fn code_symbol_score(symbol: &CodeSymbol, terms: &[String], query: &str) -> usiz
     let kind = symbol.kind.to_lowercase();
     let signature = symbol.signature.to_lowercase();
     let query = query.to_lowercase();
+    let name_words = code::identifier_word_tokens(&symbol.name);
     let exact_bonus = if name == query || signature.contains(&query) {
         12
     } else {
         0
     };
 
-    exact_bonus
-        + terms
-            .iter()
-            .map(|term| {
-                let mut score = 0;
-                if name.contains(term) {
-                    score += 5;
-                }
-                if kind == *term {
-                    score += 3;
-                }
-                if path.contains(term) {
-                    score += 2;
-                }
-                if signature.contains(term) {
-                    score += 1;
-                }
-                score
-            })
-            .sum::<usize>()
+    let term_score = terms
+        .iter()
+        .map(|term| {
+            let mut score = 0;
+            if name == *term {
+                score += 10;
+            } else if name_words.iter().any(|word| word == term) {
+                score += 7;
+            } else if name_words
+                .iter()
+                .any(|word| code::term_matches_identifier_word(word, term))
+            {
+                score += 6;
+            } else if name.contains(term.as_str()) {
+                score += 5;
+            }
+            if kind == *term {
+                score += 3;
+            }
+            if path.contains(term.as_str()) {
+                score += 2;
+            }
+            if signature.contains(term.as_str()) {
+                score += 1;
+            }
+            score
+        })
+        .sum::<usize>();
+
+    // Prefer actionable definitions over same-file declarations only when the
+    // symbol already matched the task, so unrelated symbols stay unmatched.
+    let kind_bonus = if term_score > 0 {
+        match kind.as_str() {
+            "function" | "method" => 2,
+            "struct" | "class" | "trait" | "interface" | "enum" | "impl" | "protocol"
+            | "object" | "record" | "actor" | "type" => 1,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+
+    exact_bonus + term_score + kind_bonus
 }
 
 struct RankedMemory {
@@ -11374,6 +11477,7 @@ async fn refresh_test_mappings_for_paths(
         return Ok(());
     }
 
+    let inline_test_paths = load_inline_test_paths(conn).await?;
     let mut refresh_paths = paths.clone();
     if paths.iter().any(|path| testmap::is_test_path(path)) {
         refresh_paths.extend(
@@ -11394,8 +11498,12 @@ async fn refresh_test_mappings_for_paths(
         .await
         .map_err(|error| error.to_string())?;
 
-        let candidates =
-            testmap::likely_tests_for_files(std::slice::from_ref(&source_path), &known_files, 32);
+        let candidates = testmap::likely_tests_for_files(
+            std::slice::from_ref(&source_path),
+            &known_files,
+            &inline_test_paths,
+            32,
+        );
         for candidate in candidates {
             let score = i64::try_from(candidate.score).map_err(|error| error.to_string())?;
             conn.execute(
@@ -11420,6 +11528,28 @@ async fn refresh_test_mappings_for_paths(
     }
 
     Ok(())
+}
+
+async fn load_inline_test_paths(conn: &Connection) -> Result<HashSet<String>, String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT DISTINCT path
+            FROM code_symbols
+            WHERE project_id = ?1
+              AND kind = 'module'
+              AND name IN ('tests', 'test')
+              AND language = 'rust'
+            ",
+            params![LOCAL_PROJECT_ID],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut paths = HashSet::new();
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        paths.insert(row.get::<String>(0).map_err(|error| error.to_string())?);
+    }
+    Ok(paths)
 }
 
 async fn load_known_file_paths(conn: &Connection) -> Result<Vec<String>, String> {
@@ -11864,13 +11994,13 @@ mod tests {
         MemorySource, MemorySyncRecord, MemoryWriteOptions, Project, Session,
         SessionEventSyncRecord, SessionPromotionSyncRecord, StorageConfig, StorageMode, Store,
         SyncApiTablePayload, SyncBackend, SyncClass, SyncConflictSummary, SyncTableKind,
-        SyncTableResult, apply_api_pull_payloads, fts_query, hugr_api_memory_apply_request,
-        hugr_api_remember_payloads, hugr_api_route_url, hugr_api_session_promotion_payloads,
-        hugr_api_storage_apply_request, hugr_api_sync_request, memory_record_promotes_session,
-        parse_hugr_api_history_response, parse_hugr_api_memory_apply_response,
-        parse_hugr_api_memory_records_response, parse_hugr_api_storage_apply_response,
-        parse_hugr_api_storage_snapshot_response, parse_hugr_api_sync_response,
-        planned_storage_table_result, planned_sync_table_result,
+        SyncTableResult, apply_api_pull_payloads, code_symbol_score, fts_query,
+        hugr_api_memory_apply_request, hugr_api_remember_payloads, hugr_api_route_url,
+        hugr_api_session_promotion_payloads, hugr_api_storage_apply_request, hugr_api_sync_request,
+        memory_record_promotes_session, parse_hugr_api_history_response,
+        parse_hugr_api_memory_apply_response, parse_hugr_api_memory_records_response,
+        parse_hugr_api_storage_apply_response, parse_hugr_api_storage_snapshot_response,
+        parse_hugr_api_sync_response, planned_storage_table_result, planned_sync_table_result,
         promoted_memory_for_session_records, query_terms, recall_score,
         session_promotion_facts_from_records, sync_api_table_payload_value,
         sync_table_result_value, table_row_count,
@@ -11918,6 +12048,65 @@ mod tests {
         }
     }
 
+    fn scored_symbol(name: &str, kind: &str, signature: &str, line_start: i64) -> CodeSymbol {
+        CodeSymbol {
+            path: "src/context.rs".to_string(),
+            language: Some("rust".to_string()),
+            name: name.to_string(),
+            kind: kind.to_string(),
+            line_start,
+            line_end: None,
+            signature: signature.to_string(),
+        }
+    }
+
+    #[test]
+    fn code_symbol_score_prefers_name_word_matches_over_path_matches() {
+        let query = "improve recall ranking quality in the context compiler";
+        let terms = query_terms(query);
+        let ranking_function = scored_symbol(
+            "rank_context_sections",
+            "function",
+            "fn rank_context_sections(&mut self)",
+            1029,
+        );
+        let top_of_file_struct =
+            scored_symbol("ContextBudget", "struct", "struct ContextBudget", 43);
+        let unrelated_constant = scored_symbol(
+            "MAX_SIGNATURE_CHARS",
+            "constant",
+            "const MAX_SIGNATURE_CHARS: usize = 180",
+            8,
+        );
+
+        let function_score = code_symbol_score(&ranking_function, &terms, query);
+        let struct_score = code_symbol_score(&top_of_file_struct, &terms, query);
+        let constant_score = code_symbol_score(&unrelated_constant, &terms, query);
+
+        assert!(
+            function_score > struct_score,
+            "stem-matched function {function_score} should outrank path-matched struct {struct_score}"
+        );
+        assert!(struct_score > constant_score);
+    }
+
+    #[test]
+    fn code_symbol_score_keeps_unmatched_symbols_at_zero() {
+        let query = "unrelated telemetry pipeline";
+        let terms = query_terms(query);
+        let symbol = CodeSymbol {
+            path: "src/worktree.rs".to_string(),
+            language: Some("rust".to_string()),
+            name: "inspect".to_string(),
+            kind: "function".to_string(),
+            line_start: 10,
+            line_end: None,
+            signature: "fn inspect(root: &Path) -> WorktreeState".to_string(),
+        };
+
+        assert_eq!(code_symbol_score(&symbol, &terms, query), 0);
+    }
+
     #[test]
     fn recall_scores_query_terms() {
         let memory = Memory {
@@ -11929,6 +12118,47 @@ mod tests {
         };
         let terms = query_terms("add plugin hooks");
         assert!(recall_score(&memory, &terms, "add plugin hooks") > 0);
+    }
+
+    fn reference_neighbor(path: &str, target_path: &str, line: i64) -> super::GraphNeighbor {
+        super::graph_neighbor_from_code_reference(
+            "incoming_reference",
+            CodeReference {
+                path: path.to_string(),
+                language: Some("rust".to_string()),
+                target_path: target_path.to_string(),
+                target_name: "ContextSymbol".to_string(),
+                target_kind: "struct".to_string(),
+                kind: "type_reference".to_string(),
+                line_start: line,
+                excerpt: format!("symbols: &[ContextSymbol], // line {line}"),
+            },
+        )
+    }
+
+    #[test]
+    fn finalize_graph_neighbors_collapses_repeated_reference_sites() {
+        let neighbors = vec![
+            reference_neighbor("src/context.rs", "src/context.rs", 1283),
+            reference_neighbor("src/context.rs", "src/context.rs", 1609),
+            reference_neighbor("src/context.rs", "src/context.rs", 1668),
+            reference_neighbor("src/mcp.rs", "src/context.rs", 44),
+        ];
+
+        let finalized = super::finalize_graph_neighbors("inspect context symbols", neighbors, 12);
+
+        assert_eq!(finalized.len(), 2, "same-file sites should collapse");
+        let cross_file = &finalized[0];
+        assert_eq!(cross_file.path.as_deref(), Some("src/mcp.rs"));
+        assert_eq!(cross_file.site_count, 1);
+        let same_file = &finalized[1];
+        assert_eq!(same_file.path.as_deref(), Some("src/context.rs"));
+        assert_eq!(same_file.site_count, 3);
+        assert_eq!(
+            same_file.line_start,
+            Some(1283),
+            "earliest site should represent the collapsed group"
+        );
     }
 
     #[test]
