@@ -4,6 +4,7 @@ use crate::context::{ContextPack, json_string};
 use crate::daemon;
 use crate::discovery;
 use crate::edit;
+use crate::eval;
 use crate::impact as impact_analysis;
 use crate::indexer;
 use crate::mcp;
@@ -85,6 +86,24 @@ pub async fn execute(command: Command) -> Result<(), String> {
             format,
         } => improve(execute, duplicates, stale, format).await,
         Command::Forget { query, format } => forget(&query, format).await,
+        Command::Eval {
+            from_git,
+            max_files,
+            min_hit_rate,
+            format,
+        } => {
+            let min_hit_rate = min_hit_rate
+                .as_deref()
+                .map(parse_min_hit_rate)
+                .transpose()?;
+            eval::run(eval::EvalOptions {
+                from_git,
+                max_files,
+                min_hit_rate,
+                format,
+            })
+            .await
+        }
         Command::Doctor => doctor().await,
         Command::Help => {
             print!("{}", help_text());
@@ -153,6 +172,14 @@ fn memory_write_options_from_args(args: &MemoryWriteArgs) -> Result<MemoryWriteO
     })
 }
 
+fn parse_min_hit_rate(value: &str) -> Result<f64, String> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|parsed| (0.0..=1.0).contains(parsed))
+        .ok_or_else(|| format!("--min-hit-rate must be a number between 0 and 1, got '{value}'"))
+}
+
 fn parse_memory_confidence(value: &str) -> Result<f64, String> {
     value
         .parse::<f64>()
@@ -192,6 +219,15 @@ async fn context(task: &str, format: OutputFormat) -> Result<(), String> {
 }
 
 pub(crate) async fn compile_context_pack(task: &str) -> Result<ContextPack, String> {
+    Ok(compile_context_pack_with_file_candidates(task).await?.0)
+}
+
+/// Compiles a context pack and also returns the pre-budget relevant-file
+/// candidate paths, so callers like `hugr eval` can attribute misses to
+/// retrieval versus budget trimming.
+pub(crate) async fn compile_context_pack_with_file_candidates(
+    task: &str,
+) -> Result<(ContextPack, Vec<String>), String> {
     let store = Store::open_current();
     let memories = store.recall(task, 5).await?;
     let relevant_memory_ids = memories
@@ -246,7 +282,7 @@ pub(crate) async fn compile_context_pack(task: &str) -> Result<ContextPack, Stri
     store
         .record_context_pack(&pack.task, &pack.render_json())
         .await?;
-    Ok(pack)
+    Ok((pack, files))
 }
 
 async fn index(paths: &[String]) -> Result<(), String> {

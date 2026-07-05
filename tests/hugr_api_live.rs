@@ -1572,6 +1572,101 @@ fn incremental_index_refreshes_only_changed_paths() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
+#[test]
+fn eval_scores_context_against_git_history() {
+    let hugr = env!("CARGO_BIN_EXE_hugr");
+    let workspace = temp_workspace("eval");
+    let src_dir = workspace.join("src");
+    fs::create_dir_all(&src_dir).expect("src dir should be created");
+
+    run_git(&workspace, &["init", "-q"]);
+    fs::write(
+        src_dir.join("hooks.rs"),
+        "pub fn plugin_hooks() -> u32 {\n    42\n}\n",
+    )
+    .expect("hooks written");
+    run_git(&workspace, &["add", "."]);
+    run_git(
+        &workspace,
+        &["commit", "-q", "-m", "add plugin hooks module"],
+    );
+
+    fs::write(
+        src_dir.join("hooks.rs"),
+        "pub fn plugin_hooks() -> u32 {\n    43\n}\n\npub fn hook_count() -> usize {\n    1\n}\n",
+    )
+    .expect("hooks rewritten");
+    run_git(&workspace, &["add", "."]);
+    run_git(
+        &workspace,
+        &["commit", "-q", "-m", "feat(hooks): count plugin hooks"],
+    );
+
+    let init = run_local_hugr(hugr, &workspace, &["init"]);
+    assert!(init.status.success(), "init failed: {init:?}");
+    let index = run_local_hugr(hugr, &workspace, &["index"]);
+    assert!(index.status.success(), "index failed: {index:?}");
+
+    let eval = run_local_hugr(hugr, &workspace, &["eval", "--json", "--from-git", "5"]);
+    assert!(eval.status.success(), "eval failed: {eval:?}");
+    let output = String::from_utf8(eval.stdout).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&output).expect("eval output should be JSON");
+
+    let evaluated = parsed["evaluated"].as_u64().expect("evaluated count");
+    assert!(
+        evaluated >= 1,
+        "expected at least one scored commit: {output}"
+    );
+    assert!(parsed["hit_rate"].is_number(), "hit_rate missing: {output}");
+    assert_eq!(
+        parsed["per_commit"][0]["expected"][0], "src/hooks.rs",
+        "expected files should list the touched source file: {output}"
+    );
+
+    // Both commits touch src/hooks.rs, which discovery should easily find in a
+    // two-file project, so the aggregate hit rate must be positive.
+    assert!(
+        parsed["hit_rate"].as_f64().unwrap() > 0.0,
+        "hit rate should be positive: {output}"
+    );
+
+    let gate_pass = run_local_hugr(
+        hugr,
+        &workspace,
+        &["eval", "--json", "--from-git", "5", "--min-hit-rate", "0.1"],
+    );
+    assert!(
+        gate_pass.status.success(),
+        "a reachable --min-hit-rate should pass: {gate_pass:?}"
+    );
+
+    let gate_invalid = run_local_hugr(hugr, &workspace, &["eval", "--min-hit-rate", "1.1"]);
+    assert!(
+        !gate_invalid.status.success(),
+        "--min-hit-rate outside 0..=1 must be rejected"
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+fn run_git(dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-c")
+        .arg("user.name=hugr-test")
+        .arg("-c")
+        .arg("user.email=hugr-test@example.com")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git command should run");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn run_local_hugr(hugr: &str, dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(hugr)
         .args(args)

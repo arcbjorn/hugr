@@ -6,6 +6,7 @@ mod daemon;
 mod discovery;
 mod edit;
 mod embedding;
+mod eval;
 mod impact;
 mod indexer;
 mod mcp;

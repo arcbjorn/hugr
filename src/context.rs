@@ -2320,7 +2320,7 @@ fn context_risk_signal(
     }
 }
 
-fn context_file_likely_source(path: &str) -> bool {
+pub(crate) fn context_file_likely_source(path: &str) -> bool {
     let lower = path.to_lowercase();
     if lower.starts_with("tests/") || lower.contains("/tests/") || lower.contains("__tests__") {
         return false;
@@ -2408,7 +2408,7 @@ fn summarize_values(values: &[String], max_items: usize) -> String {
     rendered
 }
 
-fn context_query_terms(query: &str) -> Vec<String> {
+pub(crate) fn context_query_terms(query: &str) -> Vec<String> {
     query
         .split(|char: char| !char.is_alphanumeric() && char != '_' && char != '-')
         .filter(|term| term.len() > 2)

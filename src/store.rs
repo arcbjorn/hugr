@@ -2573,6 +2573,12 @@ impl Store {
         self.storage_config.as_ref().map_err(|error| error.clone())
     }
 
+    /// True when this store routes all operations through a hosted Hugr API
+    /// endpoint instead of a local database.
+    pub fn is_remote_only(&self) -> Result<bool, String> {
+        Ok(uses_remote_only_hugr_api_transport(self.storage_config()?))
+    }
+
     fn ensure_sync_push_execution_allowed(&self, config: &StorageConfig) -> Result<(), String> {
         self.ensure_sync_execute_allowed(config, "push")
     }

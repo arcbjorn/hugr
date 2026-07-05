@@ -101,6 +101,12 @@ pub enum Command {
         query: String,
         format: OutputFormat,
     },
+    Eval {
+        from_git: usize,
+        max_files: usize,
+        min_hit_rate: Option<String>,
+        format: OutputFormat,
+    },
     Doctor,
     Help,
 }
@@ -192,6 +198,7 @@ impl Command {
                     format: text.format,
                 })
             }
+            "eval" => parse_eval_command(args),
             "doctor" => Ok(Self::Doctor),
             "help" | "--help" | "-h" => Ok(Self::Help),
             unknown => Err(format!("unknown command '{unknown}'")),
@@ -790,8 +797,57 @@ fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions,
     })
 }
 
+fn parse_eval_command(args: &[String]) -> Result<Command, String> {
+    let mut from_git = 30usize;
+    let mut max_files = 8usize;
+    let mut min_hit_rate = None;
+    let mut format = OutputFormat::Markdown;
+    let mut index = 2;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => format = OutputFormat::Json,
+            "--from-git" => {
+                index += 1;
+                from_git = parse_positive_usize(args.get(index), "--from-git")?;
+            }
+            "--max-files" => {
+                index += 1;
+                max_files = parse_positive_usize(args.get(index), "--max-files")?;
+            }
+            "--min-hit-rate" => {
+                index += 1;
+                min_hit_rate = Some(
+                    args.get(index)
+                        .ok_or("--min-hit-rate requires a value")?
+                        .clone(),
+                );
+            }
+            unknown => return Err(format!("unknown eval option '{unknown}'")),
+        }
+        index += 1;
+    }
+
+    Ok(Command::Eval {
+        from_git,
+        max_files,
+        min_hit_rate,
+        format,
+    })
+}
+
+fn parse_positive_usize(value: Option<&String>, flag: &str) -> Result<usize, String> {
+    let value = value.ok_or_else(|| format!("{flag} requires a value"))?;
+    let parsed = value
+        .parse::<usize>()
+        .ok()
+        .filter(|parsed| *parsed > 0)
+        .ok_or_else(|| format!("{flag} requires a positive integer, got '{value}'"))?;
+    Ok(parsed)
+}
+
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index [--paths <p1,p2,...>]\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr replace-symbol [--json] [--kind <kind>] <path> <symbol> (--body <source> | --body-file <path>)\n  hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>\n  hugr move-symbol [--json] [--kind <kind>] [--rewrite-references] <source-path> <symbol> <destination-path>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index [--paths <p1,p2,...>]\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr replace-symbol [--json] [--kind <kind>] <path> <symbol> (--body <source> | --body-file <path>)\n  hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>\n  hugr move-symbol [--json] [--kind <kind>] [--rewrite-references] <source-path> <symbol> <destination-path>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr eval [--json] [--from-git <n>] [--max-files <n>] [--min-hit-rate <0.0-1.0>]\n  hugr doctor\n"
 }
 
 #[cfg(test)]
