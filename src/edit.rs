@@ -3850,7 +3850,8 @@ mod tests {
 
     #[test]
     fn plans_kotlin_same_package_type_move_with_references_without_text_rewrites() {
-        let source = "package plugin\n\nclass Helper {\n    fun value(): Int = 1\n}\n\nclass Other\n";
+        let source =
+            "package plugin\n\nclass Helper {\n    fun value(): Int = 1\n}\n\nclass Other\n";
         let destination = "package plugin\n\nclass Existing\n";
         let caller = "package plugin\n\nclass Caller {\n    val helper = Helper()\n}\n";
         let target =
@@ -3967,8 +3968,9 @@ mod tests {
         let source = "struct Helper {\n    let value = 1\n}\n\nstruct Other {}\n";
         let destination = "struct Existing {}\n";
         let caller = "struct Caller {\n    let helper = Helper()\n}\n";
-        let target = resolve_symbol_in_source("Sources/App/Hooks.swift", source, "Helper", None, "move")
-            .unwrap();
+        let target =
+            resolve_symbol_in_source("Sources/App/Hooks.swift", source, "Helper", None, "move")
+                .unwrap();
         let references = vec![CodeReference {
             path: "Sources/App/Caller.swift".to_string(),
             language: Some("swift".to_string()),
@@ -3986,10 +3988,7 @@ mod tests {
             source,
             "Sources/App/Helper.swift",
             destination,
-            vec![(
-                "Sources/App/Caller.swift".to_string(),
-                caller.to_string(),
-            )],
+            vec![("Sources/App/Caller.swift".to_string(), caller.to_string())],
             true,
         )
         .unwrap();
@@ -4017,8 +4016,9 @@ mod tests {
         let source = "struct Helper {}\n";
         let destination = "struct Existing {}\n";
         let caller = "struct Caller {\n    let helper = Helper()\n}\n";
-        let target = resolve_symbol_in_source("Sources/App/Hooks.swift", source, "Helper", None, "move")
-            .unwrap();
+        let target =
+            resolve_symbol_in_source("Sources/App/Hooks.swift", source, "Helper", None, "move")
+                .unwrap();
         let references = vec![CodeReference {
             path: "Sources/App/Caller.swift".to_string(),
             language: Some("swift".to_string()),
@@ -4036,10 +4036,7 @@ mod tests {
             source,
             "Sources/Other/Helper.swift",
             destination,
-            vec![(
-                "Sources/App/Caller.swift".to_string(),
-                caller.to_string(),
-            )],
+            vec![("Sources/App/Caller.swift".to_string(), caller.to_string())],
             true,
         )
         .unwrap_err();
@@ -4052,8 +4049,9 @@ mod tests {
         let source = "func helper() -> Int {\n    return 1\n}\n";
         let destination = "struct Existing {}\n";
         let caller = "func useHelper() -> Int {\n    return helper()\n}\n";
-        let target = resolve_symbol_in_source("Sources/App/Hooks.swift", source, "helper", None, "move")
-            .unwrap();
+        let target =
+            resolve_symbol_in_source("Sources/App/Hooks.swift", source, "helper", None, "move")
+                .unwrap();
         let references = vec![CodeReference {
             path: "Sources/App/Caller.swift".to_string(),
             language: Some("swift".to_string()),
@@ -4071,10 +4069,7 @@ mod tests {
             source,
             "Sources/App/Helpers.swift",
             destination,
-            vec![(
-                "Sources/App/Caller.swift".to_string(),
-                caller.to_string(),
-            )],
+            vec![("Sources/App/Caller.swift".to_string(), caller.to_string())],
             true,
         )
         .unwrap_err();
