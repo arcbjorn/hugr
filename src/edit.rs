@@ -530,6 +530,7 @@ fn rewrite_rust_references_on_lines(
     let old_qualified = format!("{old_module}::{symbol_name}");
     let new_qualified = format!("{new_module}::{symbol_name}");
     let old_module_leaf = rust_module_leaf(old_module);
+    let old_module_aliases = rust_module_aliases(contents, old_module);
 
     for line_number in line_numbers.iter().rev() {
         if *line_number < 1 {
@@ -548,6 +549,7 @@ fn rewrite_rust_references_on_lines(
             old_module,
             new_module,
             &old_module_leaf,
+            &old_module_aliases,
             symbol_name,
             &old_qualified,
             &new_qualified,
@@ -578,6 +580,7 @@ fn rewrite_rust_reference_line(
     old_module: &str,
     new_module: &str,
     old_module_leaf: &str,
+    old_module_aliases: &BTreeSet<String>,
     symbol_name: &str,
     old_qualified: &str,
     new_qualified: &str,
@@ -597,7 +600,20 @@ fn rewrite_rust_reference_line(
     let old_leaf_qualified = format!("{old_module_leaf}::{symbol_name}");
     let (rewritten, leaf_replacements) =
         replace_rust_path_in_line(line, &old_leaf_qualified, new_qualified);
-    (vec![rewritten], leaf_replacements)
+    if leaf_replacements > 0 {
+        return (vec![rewritten], leaf_replacements);
+    }
+
+    for alias in old_module_aliases {
+        let old_alias_qualified = format!("{alias}::{symbol_name}");
+        let (rewritten, alias_replacements) =
+            replace_rust_path_in_line(line, &old_alias_qualified, new_qualified);
+        if alias_replacements > 0 {
+            return (vec![rewritten], alias_replacements);
+        }
+    }
+
+    (vec![line.to_string()], 0)
 }
 
 fn replace_rust_path_in_line(line: &str, old_path: &str, new_path: &str) -> (String, usize) {
@@ -644,69 +660,394 @@ fn rewrite_rust_braced_use_line(
         return None;
     }
 
-    let marker = format!("{old_module}::{{");
-    let marker_start = line.find(&marker)?;
-    let brace_start = marker_start + old_module.len() + "::".len();
-    let brace_end = line[brace_start..].find('}')? + brace_start;
-    if !line[brace_end + 1..].trim().eq(";") {
-        return None;
-    }
-
-    let item_text = &line[brace_start + 1..brace_end];
-    let items = split_simple_rust_use_items(item_text)?;
+    let (prefix, tree_text) = rust_use_tree_parts(line)?;
+    let mut tree = parse_rust_use_tree(tree_text)?;
+    let module_segments = rust_module_segments(old_module)?;
     let mut moved_items = Vec::new();
-    let mut kept_items = Vec::new();
-    for item in items {
-        if rust_use_item_imports_symbol(&item, symbol_name) {
-            moved_items.push(item);
-        } else {
-            kept_items.push(item);
-        }
-    }
+    let old_tree_empty =
+        remove_symbol_from_use_tree(&mut tree, &module_segments, symbol_name, &mut moved_items);
     if moved_items.is_empty() {
         return None;
     }
 
-    let before_module = &line[..marker_start];
     let mut rewritten = Vec::new();
-    if !kept_items.is_empty() {
-        rewritten.push(format!(
-            "{before_module}{old_module}::{{{}}};",
-            kept_items.join(", ")
-        ));
+    if !old_tree_empty {
+        rewritten.push(format!("{prefix}{};", render_rust_use_tree(&tree)));
     }
     rewritten.push(format!(
-        "{before_module}{new_module}::{{{}}};",
+        "{prefix}{new_module}::{{{}}};",
         moved_items.join(", ")
     ));
     Some((rewritten, moved_items.len()))
 }
 
-fn split_simple_rust_use_items(items: &str) -> Option<Vec<String>> {
-    let mut parsed = Vec::new();
-    for item in items.split(',') {
-        let item = item.trim();
-        if item.is_empty() {
-            continue;
-        }
-        if item.contains('{') || item.contains('}') || item.contains("::") {
-            return None;
-        }
-        parsed.push(item.to_string());
-    }
-    if parsed.is_empty() {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RustUseTree {
+    Name(String),
+    Path {
+        segment: String,
+        child: Box<RustUseTree>,
+    },
+    Group(Vec<RustUseTree>),
+}
+
+fn rust_module_segments(module_path: &str) -> Option<Vec<String>> {
+    let segments = module_path
+        .split("::")
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
         None
     } else {
-        Some(parsed)
+        Some(segments)
     }
 }
 
+fn rust_use_tree_parts(line: &str) -> Option<(&str, &str)> {
+    let use_start = find_rust_use_keyword(line)?;
+    let after_use = use_start + "use".len();
+    let whitespace_len = line[after_use..]
+        .chars()
+        .take_while(|char| char.is_whitespace())
+        .map(char::len_utf8)
+        .sum::<usize>();
+    if whitespace_len == 0 {
+        return None;
+    }
+
+    let tree_start = after_use + whitespace_len;
+    let semicolon = line.rfind(';')?;
+    if semicolon <= tree_start || !line[semicolon + 1..].trim().is_empty() {
+        return None;
+    }
+
+    let tree_text = line[tree_start..semicolon].trim();
+    if tree_text.is_empty() {
+        None
+    } else {
+        Some((&line[..tree_start], tree_text))
+    }
+}
+
+fn find_rust_use_keyword(line: &str) -> Option<usize> {
+    line.match_indices("use").find_map(|(index, _)| {
+        let before = line[..index].chars().next_back();
+        let after = line[index + "use".len()..].chars().next();
+        if before.is_none_or(|char| char.is_whitespace())
+            && after.is_some_and(|char| char.is_whitespace())
+        {
+            Some(index)
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_rust_use_tree(value: &str) -> Option<RustUseTree> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Some(inner) = strip_wrapping_braces(value) {
+        let items = split_top_level_commas(inner)?
+            .into_iter()
+            .map(parse_rust_use_tree)
+            .collect::<Option<Vec<_>>>()?;
+        if items.is_empty() {
+            return None;
+        }
+        return Some(RustUseTree::Group(items));
+    }
+
+    if let Some(index) = find_top_level_double_colon(value)? {
+        let segment = value[..index].trim();
+        let rest = value[index + "::".len()..].trim();
+        if segment.is_empty() || rest.is_empty() {
+            return None;
+        }
+        return Some(RustUseTree::Path {
+            segment: segment.to_string(),
+            child: Box::new(parse_rust_use_tree(rest)?),
+        });
+    }
+
+    Some(RustUseTree::Name(value.to_string()))
+}
+
+fn strip_wrapping_braces(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if !value.starts_with('{') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    let mut closing_index = None;
+    for (index, char) in value.char_indices() {
+        match char {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    closing_index = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let closing_index = closing_index?;
+    if !value[closing_index + 1..].trim().is_empty() {
+        return None;
+    }
+    Some(&value[1..closing_index])
+}
+
+fn split_top_level_commas(value: &str) -> Option<Vec<&str>> {
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+
+    for (index, char) in value.char_indices() {
+        match char {
+            '{' => depth += 1,
+            '}' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                let item = value[start..index].trim();
+                if !item.is_empty() {
+                    items.push(item);
+                }
+                start = index + char.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    if depth != 0 {
+        return None;
+    }
+    let item = value[start..].trim();
+    if !item.is_empty() {
+        items.push(item);
+    }
+    Some(items)
+}
+
+fn find_top_level_double_colon(value: &str) -> Option<Option<usize>> {
+    let mut depth = 0usize;
+    let mut chars = value.char_indices().peekable();
+    while let Some((index, char)) = chars.next() {
+        match char {
+            '{' => depth += 1,
+            '}' => depth = depth.checked_sub(1)?,
+            ':' if depth == 0 => {
+                if chars.peek().is_some_and(|(_, next_char)| *next_char == ':') {
+                    return Some(Some(index));
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth == 0 { Some(None) } else { None }
+}
+
+fn render_rust_use_tree(tree: &RustUseTree) -> String {
+    match tree {
+        RustUseTree::Name(name) => name.clone(),
+        RustUseTree::Path { segment, child } => {
+            format!("{segment}::{}", render_rust_use_tree(child))
+        }
+        RustUseTree::Group(items) => {
+            let rendered_items = items
+                .iter()
+                .map(render_rust_use_tree)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{rendered_items}}}")
+        }
+    }
+}
+
+fn remove_symbol_from_use_tree(
+    tree: &mut RustUseTree,
+    module_segments: &[String],
+    symbol_name: &str,
+    moved_items: &mut Vec<String>,
+) -> bool {
+    if module_segments.is_empty() {
+        return false;
+    }
+
+    match tree {
+        RustUseTree::Name(_) => false,
+        RustUseTree::Path { segment, child } => {
+            if segment != &module_segments[0] {
+                return false;
+            }
+            if module_segments.len() == 1 {
+                return remove_symbol_from_module_child(child, symbol_name, moved_items);
+            }
+            remove_symbol_from_use_tree(child, &module_segments[1..], symbol_name, moved_items)
+                && rust_use_tree_is_empty(child)
+        }
+        RustUseTree::Group(items) => {
+            let mut retained = Vec::with_capacity(items.len());
+            for mut item in std::mem::take(items) {
+                if !remove_symbol_from_use_tree(
+                    &mut item,
+                    module_segments,
+                    symbol_name,
+                    moved_items,
+                ) {
+                    retained.push(item);
+                }
+            }
+            *items = retained;
+            items.is_empty()
+        }
+    }
+}
+
+fn remove_symbol_from_module_child(
+    child: &mut RustUseTree,
+    symbol_name: &str,
+    moved_items: &mut Vec<String>,
+) -> bool {
+    match child {
+        RustUseTree::Name(item) => {
+            if rust_use_item_imports_symbol(item, symbol_name) {
+                moved_items.push(item.clone());
+                true
+            } else {
+                false
+            }
+        }
+        RustUseTree::Path { .. } => false,
+        RustUseTree::Group(items) => {
+            let mut retained = Vec::with_capacity(items.len());
+            for item in std::mem::take(items) {
+                if matches_direct_rust_use_item(&item, symbol_name) {
+                    moved_items.push(render_rust_use_tree(&item));
+                } else {
+                    retained.push(item);
+                }
+            }
+            *items = retained;
+            items.is_empty()
+        }
+    }
+}
+
+fn matches_direct_rust_use_item(item: &RustUseTree, symbol_name: &str) -> bool {
+    match item {
+        RustUseTree::Name(item) => rust_use_item_imports_symbol(item, symbol_name),
+        RustUseTree::Path { .. } | RustUseTree::Group(_) => false,
+    }
+}
+
+fn rust_use_tree_is_empty(tree: &RustUseTree) -> bool {
+    matches!(tree, RustUseTree::Group(items) if items.is_empty())
+}
+
 fn rust_use_item_imports_symbol(item: &str, symbol_name: &str) -> bool {
-    let imported = item
-        .split_once(" as ")
+    rust_use_item_name(item) == symbol_name
+}
+
+fn rust_use_item_name(item: &str) -> String {
+    item.split_once(" as ")
         .map(|(name, _alias)| name.trim())
-        .unwrap_or_else(|| item.trim());
-    imported == symbol_name
+        .unwrap_or_else(|| item.trim())
+        .to_string()
+}
+
+fn rust_use_item_alias(item: &str) -> Option<String> {
+    item.split_once(" as ")
+        .map(|(_name, alias)| alias.trim())
+        .filter(|alias| valid_identifier(alias))
+        .map(str::to_string)
+}
+
+fn rust_module_aliases(contents: &str, old_module: &str) -> BTreeSet<String> {
+    let Some(module_segments) = rust_module_segments(old_module) else {
+        return BTreeSet::new();
+    };
+    let mut aliases = BTreeSet::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("//") || !trimmed.ends_with(';') {
+            continue;
+        }
+        let Some((_prefix, tree_text)) = rust_use_tree_parts(line) else {
+            continue;
+        };
+        let Some(tree) = parse_rust_use_tree(tree_text) else {
+            continue;
+        };
+        collect_rust_module_aliases(&tree, &module_segments, &mut aliases);
+    }
+    aliases
+}
+
+fn collect_rust_module_aliases(
+    tree: &RustUseTree,
+    module_segments: &[String],
+    aliases: &mut BTreeSet<String>,
+) {
+    if module_segments.is_empty() {
+        return;
+    }
+
+    match tree {
+        RustUseTree::Name(item) => {
+            if module_segments.len() == 1
+                && rust_use_item_name(item) == module_segments[0]
+                && let Some(alias) = rust_use_item_alias(item)
+            {
+                aliases.insert(alias);
+            }
+        }
+        RustUseTree::Path { segment, child } => {
+            if segment != &module_segments[0] {
+                return;
+            }
+            if module_segments.len() == 1 {
+                collect_rust_module_aliases_from_child(child, aliases);
+            } else {
+                collect_rust_module_aliases(child, &module_segments[1..], aliases);
+            }
+        }
+        RustUseTree::Group(items) => {
+            for item in items {
+                collect_rust_module_aliases(item, module_segments, aliases);
+            }
+        }
+    }
+}
+
+fn collect_rust_module_aliases_from_child(tree: &RustUseTree, aliases: &mut BTreeSet<String>) {
+    match tree {
+        RustUseTree::Name(item) => {
+            if rust_use_item_name(item) == "self"
+                && let Some(alias) = rust_use_item_alias(item)
+            {
+                aliases.insert(alias);
+            }
+        }
+        RustUseTree::Path { .. } => {}
+        RustUseTree::Group(items) => {
+            for item in items {
+                if let RustUseTree::Name(item) = item
+                    && rust_use_item_name(item) == "self"
+                    && let Some(alias) = rust_use_item_alias(item)
+                {
+                    aliases.insert(alias);
+                }
+            }
+        }
+    }
 }
 
 fn language_for_path(path: &str) -> Option<&'static str> {
@@ -1919,5 +2260,66 @@ mod tests {
         assert!(caller_file.contents.contains("crate::helpers::helper();"));
         assert!(!caller_file.contents.contains("plugin_hooks::helper"));
         assert_eq!(planned.summary.rewritten_reference_count, 1);
+    }
+
+    #[test]
+    fn plans_move_with_nested_and_aliased_rust_import_rewrites() {
+        let source = "pub fn helper() -> u8 {\n    1\n}\n\npub fn other() {}\n";
+        let destination = "pub fn existing() {}\n";
+        let caller = "use crate::{config::Settings, plugin_hooks::{helper as run_helper, other}, plugin_hooks as hooks};\n\nfn main() {\n    let _ = run_helper();\n    let _ = hooks::helper();\n}\n";
+        let target =
+            resolve_symbol_in_source("src/plugin_hooks.rs", source, "helper", None, "move")
+                .unwrap();
+        let references = vec![
+            CodeReference {
+                path: "src/main.rs".to_string(),
+                language: Some("rust".to_string()),
+                target_path: "src/plugin_hooks.rs".to_string(),
+                target_name: "helper".to_string(),
+                target_kind: "function".to_string(),
+                kind: "import".to_string(),
+                line_start: 1,
+                excerpt: "use crate::{config::Settings, plugin_hooks::{helper as run_helper, other}, plugin_hooks as hooks};".to_string(),
+            },
+            CodeReference {
+                path: "src/main.rs".to_string(),
+                language: Some("rust".to_string()),
+                target_path: "src/plugin_hooks.rs".to_string(),
+                target_name: "helper".to_string(),
+                target_kind: "function".to_string(),
+                kind: "call".to_string(),
+                line_start: 5,
+                excerpt: "let _ = hooks::helper();".to_string(),
+            },
+        ];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "src/helpers.rs",
+            destination,
+            vec![("src/main.rs".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+        let caller_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/main.rs")
+            .unwrap();
+
+        assert!(caller_file.contents.contains(
+            "use crate::{config::Settings, plugin_hooks::{other}, plugin_hooks as hooks};"
+        ));
+        assert!(
+            caller_file
+                .contents
+                .contains("use crate::helpers::{helper as run_helper};")
+        );
+        assert!(caller_file.contents.contains("run_helper();"));
+        assert!(caller_file.contents.contains("crate::helpers::helper();"));
+        assert!(!caller_file.contents.contains("hooks::helper"));
+        assert_eq!(planned.summary.rewritten_reference_count, 2);
     }
 }
