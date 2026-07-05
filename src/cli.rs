@@ -16,7 +16,9 @@ pub enum Command {
         task: String,
         format: OutputFormat,
     },
-    Index,
+    Index {
+        paths: Vec<String>,
+    },
     Symbols {
         query: String,
         format: OutputFormat,
@@ -148,7 +150,7 @@ impl Command {
                     format: text.format,
                 })
             }
-            "index" => Ok(Self::Index),
+            "index" => parse_index_command(args),
             "symbols" => {
                 let text = required_text_output(args, "symbols")?;
                 Ok(Self::Symbols {
@@ -414,6 +416,36 @@ fn parse_run_command(args: &[String]) -> Result<Command, String> {
     } else {
         Ok(Command::Run { command })
     }
+}
+
+fn parse_index_command(args: &[String]) -> Result<Command, String> {
+    let mut paths = Vec::new();
+    let mut index = 2;
+
+    while index < args.len() {
+        let arg = &args[index];
+        let raw = if arg == "--paths" {
+            index += 1;
+            required_option_value(args.get(index).map(String::as_str), "hugr index --paths")?
+        } else if let Some(value) = arg.strip_prefix("--paths=") {
+            required_option_value(Some(value), "hugr index --paths")?
+        } else if arg.starts_with("--") {
+            return Err(format!("unknown option '{arg}'"));
+        } else {
+            return Err(format!(
+                "hugr index does not take positional argument '{arg}'"
+            ));
+        };
+        for path in raw.split(',') {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                paths.push(trimmed.to_string());
+            }
+        }
+        index += 1;
+    }
+
+    Ok(Command::Index { paths })
 }
 
 fn parse_move_symbol_command(args: &[String]) -> Result<Command, String> {
@@ -759,7 +791,7 @@ fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions,
 }
 
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr replace-symbol [--json] [--kind <kind>] <path> <symbol> (--body <source> | --body-file <path>)\n  hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>\n  hugr move-symbol [--json] [--kind <kind>] [--rewrite-references] <source-path> <symbol> <destination-path>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index [--paths <p1,p2,...>]\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr replace-symbol [--json] [--kind <kind>] <path> <symbol> (--body <source> | --body-file <path>)\n  hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>\n  hugr move-symbol [--json] [--kind <kind>] [--rewrite-references] <source-path> <symbol> <destination-path>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr doctor\n"
 }
 
 #[cfg(test)]
@@ -810,7 +842,32 @@ mod tests {
     #[test]
     fn parses_index_command() {
         let args = vec!["hugr".into(), "index".into()];
-        assert_eq!(Command::parse(&args), Ok(Command::Index));
+        assert_eq!(
+            Command::parse(&args),
+            Ok(Command::Index { paths: Vec::new() })
+        );
+    }
+
+    #[test]
+    fn parses_index_command_with_paths() {
+        let args = vec![
+            "hugr".into(),
+            "index".into(),
+            "--paths".into(),
+            "src/a.rs, src/b.rs".into(),
+        ];
+        assert_eq!(
+            Command::parse(&args),
+            Ok(Command::Index {
+                paths: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_index_command_positional() {
+        let args = vec!["hugr".into(), "index".into(), "src/a.rs".into()];
+        assert!(Command::parse(&args).is_err());
     }
 
     #[test]
