@@ -98,6 +98,8 @@ Implemented:
 - `hugr move-symbol --rewrite-references` supports conservative TypeScript and JavaScript ES-module rewrites for indexed inbound references using relative named imports/exports, symbol aliases, namespace imports, and extension-preserving module specifiers
 - `hugr move-symbol --rewrite-references` supports same-package Go moves between files in one package directory by validating indexed references remain in the same directory and require no textual rewrite
 - `hugr move-symbol --rewrite-references` supports same-package Java type moves by validating package declarations and indexed references for class, interface, enum, annotation, and record declarations that require no textual rewrite
+- `hugr move-symbol --rewrite-references` supports same-package Kotlin type moves by validating package declarations and indexed references for class, interface, enum, annotation, object, and type-alias declarations that require no textual rewrite
+- `hugr move-symbol --rewrite-references` supports same-module Swift type moves by validating module directories and indexed references for class, struct, enum, actor, protocol, extension, and type-alias declarations that require no textual rewrite
 - `hugr move-symbol` refreshes the index immediately after a successful move and records a session edit event when a session is active
 - `hugr context` and `hugr_context` include a first code-health risk signal for large indexed symbols using deterministic symbol line ranges
 - `hugr context` and `hugr_context` include cross-file refactor-surface risks when code graph references span multiple files
@@ -379,7 +381,7 @@ Implemented first slice:
 - Rust, Python, TypeScript, JavaScript/JSX, Go, Java, Kotlin, and Swift symbol extraction use tree-sitter when parsing succeeds, with line-scanner fallback.
 - `hugr replace-symbol` and `hugr_replace_symbol` use indexed symbols plus parser validation to perform the first safe local structural edit.
 - `hugr rename-symbol` and `hugr_rename_symbol` use indexed symbols and code references to safely rename a local definition plus inbound reference lines, then re-index.
-- `hugr move-symbol` and `hugr_move_symbol` safely move an unreferenced local symbol between files with parser validation and destination collision checks, and can opt into Rust module-path, nested import, symbol-alias, and module-alias rewrites, Python import/call rewrites, TypeScript/JavaScript ES-module rewrites, same-package Go reference validation, and same-package Java type reference validation for supported inbound references.
+- `hugr move-symbol` and `hugr_move_symbol` safely move an unreferenced local symbol between files with parser validation and destination collision checks, and can opt into Rust module-path, nested import, symbol-alias, and module-alias rewrites, Python import/call rewrites, TypeScript/JavaScript ES-module rewrites, same-package Go reference validation, same-package Java type reference validation, same-package Kotlin type reference validation, and same-module Swift type reference validation for supported inbound references.
 
 Open questions:
 
@@ -594,6 +596,7 @@ Recommended next commits:
 81. Done: `feat(edit): rewrite TS and JS move references`
 82. Done: `feat(edit): allow same-package Go moves`
 83. Done: `feat(edit): allow same-package Java type moves`
+84. Done: `feat(edit): allow same-package Kotlin and Swift moves`
 
 Each commit should leave the CLI usable.
 
