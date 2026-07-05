@@ -7,6 +7,7 @@ use crate::testmap::TestCandidate;
 use crate::worktree::WorktreeState;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::fs;
 
 const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 4000;
 const LARGE_SYMBOL_LINE_THRESHOLD: i64 = 80;
@@ -15,6 +16,10 @@ const REFACTOR_SURFACE_FILE_THRESHOLD: usize = 3;
 const LONG_PARAMETER_LIST_THRESHOLD: usize = 5;
 const VERY_LONG_PARAMETER_LIST_THRESHOLD: usize = 8;
 const HIGH_FAN_IN_FILE_THRESHOLD: usize = 3;
+const DEEP_NESTING_THRESHOLD: usize = 4;
+const VERY_DEEP_NESTING_THRESHOLD: usize = 6;
+const CYCLOMATIC_COMPLEXITY_THRESHOLD: usize = 10;
+const HIGH_CYCLOMATIC_COMPLEXITY_THRESHOLD: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextPack {
@@ -1395,6 +1400,8 @@ fn build_risk_signals(
         signals.push(signal);
     }
 
+    signals.extend(symbol_body_complexity_signals(symbols));
+
     let edit_after_context = freshness_signals
         .iter()
         .filter(|signal| signal.kind == "edit_after_context")
@@ -1925,6 +1932,280 @@ fn long_parameter_list_signal(symbols: &[ContextSymbol]) -> Option<ContextRiskSi
         650 + highest_count * 10 + wide_symbols.len() * 10,
         "indexed signature declares parameter count above deterministic threshold",
     ))
+}
+
+#[derive(Debug, Clone)]
+struct SymbolBodyMetric {
+    path: String,
+    name: String,
+    kind: String,
+    line_start: i64,
+    max_nesting: usize,
+    cyclomatic_complexity: usize,
+}
+
+fn symbol_body_complexity_signals(symbols: &[ContextSymbol]) -> Vec<ContextRiskSignal> {
+    let mut metrics = symbols
+        .iter()
+        .filter(|symbol| symbol_kind_has_body_complexity(symbol))
+        .filter_map(symbol_body_metric)
+        .collect::<Vec<_>>();
+    if metrics.is_empty() {
+        return Vec::new();
+    }
+
+    metrics.sort_by(|left, right| {
+        right
+            .max_nesting
+            .cmp(&left.max_nesting)
+            .then_with(|| right.cyclomatic_complexity.cmp(&left.cyclomatic_complexity))
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    let mut signals = Vec::new();
+    let deeply_nested = metrics
+        .iter()
+        .filter(|metric| metric.max_nesting >= DEEP_NESTING_THRESHOLD)
+        .collect::<Vec<_>>();
+    if let Some(max_nesting) = deeply_nested.iter().map(|metric| metric.max_nesting).max() {
+        let summaries = deeply_nested
+            .iter()
+            .map(|metric| {
+                format!(
+                    "{} {} reaches nesting depth {} at {}:{}",
+                    metric.kind, metric.name, metric.max_nesting, metric.path, metric.line_start
+                )
+            })
+            .collect::<Vec<_>>();
+        let severity = if max_nesting >= VERY_DEEP_NESTING_THRESHOLD {
+            "high"
+        } else {
+            "medium"
+        };
+        signals.push(context_risk_signal(
+            severity,
+            "deep_nesting",
+            format!(
+                "symbol bodies have deeply nested control flow: {}",
+                summarize_values(&summaries, 3)
+            ),
+            640 + max_nesting * 30 + deeply_nested.len() * 15,
+            "indexed symbol body nesting exceeds deterministic threshold",
+        ));
+    }
+
+    metrics.sort_by(|left, right| {
+        right
+            .cyclomatic_complexity
+            .cmp(&left.cyclomatic_complexity)
+            .then_with(|| right.max_nesting.cmp(&left.max_nesting))
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let complex_symbols = metrics
+        .iter()
+        .filter(|metric| metric.cyclomatic_complexity >= CYCLOMATIC_COMPLEXITY_THRESHOLD)
+        .collect::<Vec<_>>();
+    if let Some(max_complexity) = complex_symbols
+        .iter()
+        .map(|metric| metric.cyclomatic_complexity)
+        .max()
+    {
+        let summaries = complex_symbols
+            .iter()
+            .map(|metric| {
+                format!(
+                    "{} {} has cyclomatic complexity {} at {}:{}",
+                    metric.kind,
+                    metric.name,
+                    metric.cyclomatic_complexity,
+                    metric.path,
+                    metric.line_start
+                )
+            })
+            .collect::<Vec<_>>();
+        let severity = if max_complexity >= HIGH_CYCLOMATIC_COMPLEXITY_THRESHOLD {
+            "high"
+        } else {
+            "medium"
+        };
+        signals.push(context_risk_signal(
+            severity,
+            "cyclomatic_complexity",
+            format!(
+                "symbol bodies contain many branching paths: {}",
+                summarize_values(&summaries, 3)
+            ),
+            630 + max_complexity * 20 + complex_symbols.len() * 15,
+            "indexed symbol body branch count exceeds deterministic threshold",
+        ));
+    }
+
+    signals
+}
+
+fn symbol_kind_has_body_complexity(symbol: &ContextSymbol) -> bool {
+    matches!(symbol.kind.as_str(), "function" | "method")
+}
+
+fn symbol_body_metric(symbol: &ContextSymbol) -> Option<SymbolBodyMetric> {
+    let body = symbol_body_lines(symbol)?;
+    Some(SymbolBodyMetric {
+        path: symbol.path.clone(),
+        name: symbol.name.clone(),
+        kind: symbol.kind.clone(),
+        line_start: symbol.line_start,
+        max_nesting: max_symbol_body_nesting(symbol.language.as_deref(), &body),
+        cyclomatic_complexity: cyclomatic_complexity(&body),
+    })
+}
+
+fn symbol_body_lines(symbol: &ContextSymbol) -> Option<Vec<String>> {
+    let line_end = symbol.line_end?;
+    if symbol.line_start < 1 || line_end < symbol.line_start {
+        return None;
+    }
+
+    let contents = fs::read_to_string(&symbol.path).ok()?;
+    let start = usize::try_from(symbol.line_start - 1).ok()?;
+    let end_exclusive = usize::try_from(line_end).ok()?;
+    let lines = contents
+        .lines()
+        .skip(start)
+        .take(end_exclusive.saturating_sub(start))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if lines.is_empty() { None } else { Some(lines) }
+}
+
+fn max_symbol_body_nesting(language: Option<&str>, lines: &[String]) -> usize {
+    if language == Some("python") {
+        return max_python_indentation_nesting(lines);
+    }
+    max_brace_nesting(lines)
+}
+
+fn max_python_indentation_nesting(lines: &[String]) -> usize {
+    let significant = lines
+        .iter()
+        .map(|line| line.as_str())
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        })
+        .collect::<Vec<_>>();
+    let Some(base_indent) = significant.iter().map(|line| indent_columns(line)).min() else {
+        return 0;
+    };
+
+    significant
+        .iter()
+        .map(|line| indent_columns(line).saturating_sub(base_indent) / 4)
+        .max()
+        .unwrap_or(0)
+}
+
+fn indent_columns(line: &str) -> usize {
+    line.chars()
+        .take_while(|char| char.is_whitespace())
+        .map(|char| if char == '\t' { 4 } else { 1 })
+        .sum()
+}
+
+fn max_brace_nesting(lines: &[String]) -> usize {
+    let mut depth = 0usize;
+    let mut max_depth = 0usize;
+    for line in lines {
+        for char in strip_line_for_complexity(line).chars() {
+            match char {
+                '{' => {
+                    depth += 1;
+                    max_depth = max_depth.max(depth);
+                }
+                '}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    max_depth.saturating_sub(1)
+}
+
+fn cyclomatic_complexity(lines: &[String]) -> usize {
+    1 + lines
+        .iter()
+        .map(|line| branch_weight(&strip_line_for_complexity(line)))
+        .sum::<usize>()
+}
+
+fn branch_weight(line: &str) -> usize {
+    let lower = line.to_lowercase();
+    let words = complexity_words(&lower);
+    let word_count = words
+        .iter()
+        .filter(|word| {
+            matches!(
+                word.as_str(),
+                "if" | "elif"
+                    | "for"
+                    | "while"
+                    | "match"
+                    | "case"
+                    | "catch"
+                    | "except"
+                    | "switch"
+                    | "when"
+                    | "guard"
+            )
+        })
+        .count();
+    word_count
+        + lower.matches("&&").count()
+        + lower.matches("||").count()
+        + lower.matches('?').count()
+}
+
+fn complexity_words(value: &str) -> Vec<String> {
+    value
+        .split(|char: char| !char.is_alphanumeric() && char != '_')
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn strip_line_for_complexity(line: &str) -> String {
+    let comment_trimmed = trim_complexity_comment(line);
+    let mut rendered = String::with_capacity(comment_trimmed.len());
+    let mut chars = comment_trimmed.chars().peekable();
+    let mut quote = None;
+    while let Some(char) = chars.next() {
+        match quote {
+            Some(active_quote) => {
+                if char == '\\' {
+                    let _ = chars.next();
+                } else if char == active_quote {
+                    quote = None;
+                }
+                rendered.push(' ');
+            }
+            None if char == '"' || char == '\'' || char == '`' => {
+                quote = Some(char);
+                rendered.push(' ');
+            }
+            None => rendered.push(char),
+        }
+    }
+    rendered
+}
+
+fn trim_complexity_comment(line: &str) -> &str {
+    let mut end = line.len();
+    for marker in ["//", "#"] {
+        if let Some(index) = line.find(marker) {
+            end = end.min(index);
+        }
+    }
+    &line[..end]
 }
 
 /// Counts the top-level parameters in a callable signature by scanning the text
@@ -2585,6 +2866,8 @@ mod tests {
     };
     use crate::testmap::TestCandidate;
     use crate::worktree::{ChangedFile, WorktreeState};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn markdown_includes_citations_for_files_and_memories() {
@@ -3211,6 +3494,108 @@ mod tests {
     }
 
     #[test]
+    fn deep_symbol_bodies_render_as_complexity_risks() {
+        let source = "\
+pub fn tangled(input: i32) -> i32 {
+    if input > 0 {
+        for value in 0..input {
+            while value > 1 {
+                if value % 2 == 0 && value > 3 {
+                    match value {
+                        1 => input,
+                        2 => input + 1,
+                        3 => input + 2,
+                        4 => input + 3,
+                        _ => input + 4,
+                    }
+                } else if value == 1 || value == 2 {
+                    input
+                } else {
+                    input + 1
+                }
+            }
+        }
+    }
+    if input == 99 { input } else { 0 };
+    input
+}
+";
+        let path = write_temp_source("context_complex_tangled.rs", source);
+        let pack = ContextPack::with_sessions_symbols_tests_and_branch(
+            "refactor tangled",
+            vec![path.clone()],
+            Vec::new(),
+            Vec::new(),
+            vec![CodeSymbol {
+                path,
+                language: Some("rust".to_string()),
+                name: "tangled".to_string(),
+                kind: "function".to_string(),
+                line_start: 1,
+                line_end: Some(source.lines().count() as i64),
+                signature: "pub fn tangled(input: i32) -> i32".to_string(),
+            }],
+            Vec::new(),
+            None,
+        );
+
+        let markdown = pack.render_markdown();
+        let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
+        let risk_kinds = parsed["risk_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|risk| risk["kind"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(risk_kinds.contains(&"deep_nesting"));
+        assert!(risk_kinds.contains(&"cyclomatic_complexity"));
+        assert!(markdown.contains("risk:deep_nesting [risk]"));
+        assert!(markdown.contains("risk:cyclomatic_complexity [risk]"));
+        assert!(markdown.contains("function tangled reaches nesting depth"));
+        assert!(markdown.contains("function tangled has cyclomatic complexity"));
+    }
+
+    #[test]
+    fn flat_symbol_bodies_do_not_flag_complexity_risks() {
+        let source = "\
+pub fn small(input: i32) -> i32 {
+    let doubled = input * 2;
+    doubled + 1
+}
+";
+        let path = write_temp_source("context_complex_small.rs", source);
+        let pack = ContextPack::with_sessions_symbols_tests_and_branch(
+            "edit small",
+            vec![path.clone()],
+            Vec::new(),
+            Vec::new(),
+            vec![CodeSymbol {
+                path,
+                language: Some("rust".to_string()),
+                name: "small".to_string(),
+                kind: "function".to_string(),
+                line_start: 1,
+                line_end: Some(source.lines().count() as i64),
+                signature: "pub fn small(input: i32) -> i32".to_string(),
+            }],
+            Vec::new(),
+            None,
+        );
+
+        let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
+        let risk_kinds = parsed["risk_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|risk| risk["kind"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(!risk_kinds.contains(&"deep_nesting"));
+        assert!(!risk_kinds.contains(&"cyclomatic_complexity"));
+    }
+
+    #[test]
     fn structured_diagnostics_render_with_citations_and_risks() {
         let pack =
             ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
@@ -3259,6 +3644,16 @@ mod tests {
         assert_eq!(parsed["diagnostics"][0]["citation_id"], "diagnostic:diag_1");
         assert!(risk_kinds.contains(&"structured_diagnostics"));
         assert!(markdown.contains("diagnostic:diag_1 [diagnostic]"));
+    }
+
+    fn write_temp_source(name: &str, contents: &str) -> String {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("hugr_{unique}_{name}"));
+        fs::write(&path, contents).unwrap();
+        path.display().to_string()
     }
 
     #[test]
