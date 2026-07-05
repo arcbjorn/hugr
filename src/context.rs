@@ -1,5 +1,5 @@
 use crate::code::CodeSymbol;
-use crate::discovery::FileCandidate;
+use crate::discovery::{self, FileCandidate};
 use crate::store::{
     Diagnostic, FreshnessSignal, GraphNeighbor, Memory, SessionFact, StaleMemoryCandidate,
 };
@@ -1162,6 +1162,13 @@ fn file_evidence(candidate: &FileCandidate, terms: &[String]) -> (usize, String)
         .size_bytes
         .map(|bytes| if bytes <= 128_000 { 10 } else { 0 })
         .unwrap_or(0);
+    if let Some(rank) = discovery::source_embedding_rank(candidate.score) {
+        let rank_bonus = 25usize.saturating_sub(rank.min(25)) * 8;
+        return (
+            640 + rank_bonus + language_bonus + size_bonus,
+            format!("source embedding rank {rank}"),
+        );
+    }
     let score = 400 + candidate.score * 20 + language_bonus + size_bonus;
     let reason = if candidate.score > 0 {
         format!("file discovery score {}", candidate.score)
@@ -2860,7 +2867,7 @@ fn change_label(file: &ContextChangedFile) -> String {
 mod tests {
     use super::{ContextPack, count_signature_parameters, json_string};
     use crate::code::CodeSymbol;
-    use crate::discovery::FileCandidate;
+    use crate::discovery::{FileCandidate, source_embedding_score};
     use crate::store::{
         Diagnostic, FreshnessSignal, GraphNeighbor, Memory, SessionFact, StaleMemoryCandidate,
     };
@@ -3691,6 +3698,32 @@ pub fn small(input: i32) -> i32 {
         assert!(markdown.contains("score"));
         assert!(json.contains("\"evidence_score\""));
         assert!(json.contains("\"evidence_reason\":\"file discovery score 8\""));
+    }
+
+    #[test]
+    fn semantic_file_candidates_render_source_embedding_evidence() {
+        let pack = ContextPack::with_file_candidates_sessions_symbols_tests_branch_and_stale_risks(
+            "invoice ledger",
+            vec![FileCandidate {
+                path: "src/payments.rs".to_string(),
+                score: source_embedding_score(2),
+                language: Some("rust".to_string()),
+                size_bytes: Some(64),
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(pack.relevant_files[0].path, "src/payments.rs");
+        assert_eq!(
+            pack.relevant_files[0].evidence_reason,
+            "source embedding rank 2"
+        );
+        assert!(pack.render_json().contains("source embedding rank 2"));
     }
 
     #[test]
