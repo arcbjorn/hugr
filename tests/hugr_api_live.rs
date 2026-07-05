@@ -979,6 +979,71 @@ fn move_symbol_allows_swift_same_module_type_references_and_refreshes_index() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
+#[test]
+fn index_prunes_symbols_for_deleted_files() {
+    let hugr = env!("CARGO_BIN_EXE_hugr");
+    let workspace = temp_workspace("index_prune_deleted");
+    let src_dir = workspace.join("src");
+    fs::create_dir_all(&src_dir).expect("src dir should be created");
+    let kept = src_dir.join("kept.rs");
+    let doomed = src_dir.join("doomed.rs");
+    fs::write(&kept, "pub fn kept_symbol() -> i32 {\n    1\n}\n").expect("kept should be written");
+    fs::write(
+        &doomed,
+        "pub fn doomed_symbol() -> i32 {\n    kept_symbol()\n}\n",
+    )
+    .expect("doomed should be written");
+
+    let init = run_local_hugr(hugr, &workspace, &["init"]);
+    assert!(init.status.success(), "init failed: {init:?}");
+
+    let first_index = run_local_hugr(hugr, &workspace, &["index"]);
+    assert!(
+        first_index.status.success(),
+        "first index failed: {first_index:?}"
+    );
+
+    let symbols_before = run_local_hugr(hugr, &workspace, &["symbols", "--json", "doomed_symbol"]);
+    assert!(symbols_before.status.success());
+    let symbols_before_json = String::from_utf8(symbols_before.stdout).unwrap();
+    assert!(
+        symbols_before_json.contains("doomed_symbol"),
+        "expected doomed_symbol indexed: {symbols_before_json}"
+    );
+
+    fs::remove_file(&doomed).expect("doomed file should be removed");
+
+    let second_index = run_local_hugr(hugr, &workspace, &["index"]);
+    assert!(
+        second_index.status.success(),
+        "second index failed: {second_index:?}"
+    );
+    let second_index_text = String::from_utf8(second_index.stdout).unwrap();
+    assert!(
+        second_index_text.contains("pruned:"),
+        "expected prune report after deletion: {second_index_text}"
+    );
+
+    let symbols_after = run_local_hugr(hugr, &workspace, &["symbols", "--json", "doomed_symbol"]);
+    assert!(symbols_after.status.success());
+    let symbols_after_json = String::from_utf8(symbols_after.stdout).unwrap();
+    assert!(
+        !symbols_after_json.contains("src/doomed.rs"),
+        "deleted file symbols should be pruned: {symbols_after_json}"
+    );
+
+    // The surviving file's symbol is still indexed.
+    let kept_symbols = run_local_hugr(hugr, &workspace, &["symbols", "--json", "kept_symbol"]);
+    assert!(kept_symbols.status.success());
+    let kept_symbols_json = String::from_utf8(kept_symbols.stdout).unwrap();
+    assert!(
+        kept_symbols_json.contains("src/kept.rs"),
+        "surviving symbol should remain: {kept_symbols_json}"
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
 fn run_local_hugr(hugr: &str, dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(hugr)
         .args(args)
