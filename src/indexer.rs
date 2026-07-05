@@ -1,7 +1,7 @@
 use crate::code::{self, CodeSymbol};
 use crate::discovery::{self, FileCandidate};
 use crate::store::{PruneSummary, Store};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +55,111 @@ pub(crate) async fn index_candidates(
         .record_code_index(files, &symbols, &references)
         .await?;
     Ok(symbols)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct RefreshSummary {
+    pub reparsed_files: usize,
+    pub reference_files: usize,
+    pub symbol_count: usize,
+    pub pruned: PruneSummary,
+}
+
+/// Incrementally re-indexes only `changed_paths` plus the files whose stored
+/// references point at them, instead of re-parsing the whole project. Falls back
+/// to a full [`index_project`] when the store is cold (no symbols yet) or no
+/// changed path maps to a discovered source file, so first-run and broad-change
+/// cases stay correct.
+///
+/// Correctness: symbols are re-parsed only for changed files, but references are
+/// re-extracted against the full stored+refreshed symbol set for the union of
+/// changed files (outbound edges) and files that previously referenced a changed
+/// file (inbound edges). Deleted files are pruned as in a full index.
+pub(crate) async fn refresh_paths(
+    limit: usize,
+    changed_paths: &[String],
+) -> Result<RefreshSummary, String> {
+    let store = Store::open_current();
+    let root = Path::new(".");
+
+    let stored_symbols = store.stored_code_symbols().await?;
+    if stored_symbols.is_empty() {
+        // Cold store: nothing to be incremental about, do a normal full index.
+        let summary = index_project(limit).await?;
+        return Ok(RefreshSummary {
+            reparsed_files: summary.file_count,
+            reference_files: summary.file_count,
+            symbol_count: summary.symbol_count,
+            pruned: summary.pruned,
+        });
+    }
+
+    let all_files = discovery::discover_project_files(root, limit)?;
+    let changed_set = changed_paths.iter().cloned().collect::<HashSet<_>>();
+    let changed_files = all_files
+        .iter()
+        .filter(|file| changed_set.contains(&file.path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if changed_files.is_empty() {
+        // No changed path resolves to a tracked source file (e.g. only deletes or
+        // ignored paths). Prune any now-missing rows and stop.
+        let pruned = store.prune_missing_index_rows(root).await?;
+        return Ok(RefreshSummary {
+            pruned,
+            ..RefreshSummary::default()
+        });
+    }
+
+    store.record_discovered_files(&changed_files).await?;
+    let refreshed_symbols = code::index_files(root, &changed_files)?;
+
+    // Full symbol set = refreshed symbols for changed files + stored symbols for
+    // every other file, so cross-file references still resolve to real targets.
+    let changed_paths_only = changed_files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<HashSet<_>>();
+    let mut full_symbols = stored_symbols
+        .into_iter()
+        .filter(|symbol| !changed_paths_only.contains(&symbol.path))
+        .collect::<Vec<_>>();
+    full_symbols.extend(refreshed_symbols.iter().cloned());
+
+    // Reference files = changed files (outbound) + files that previously pointed
+    // at a changed file (inbound). Re-scan just those against the full symbol set.
+    let inbound_sources = store
+        .reference_sources_targeting(&changed_paths_only.iter().cloned().collect::<Vec<_>>())
+        .await?;
+    let mut reference_paths = changed_paths_only.clone();
+    reference_paths.extend(inbound_sources);
+    let reference_files = all_files
+        .iter()
+        .filter(|file| reference_paths.contains(&file.path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let references = code::extract_references(root, &reference_files, &full_symbols)?;
+
+    let reference_scope = reference_files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<HashSet<_>>();
+    store
+        .record_code_index_scoped(
+            &changed_paths_only,
+            &reference_scope,
+            &refreshed_symbols,
+            &references,
+        )
+        .await?;
+    let pruned = store.prune_missing_index_rows(root).await?;
+
+    Ok(RefreshSummary {
+        reparsed_files: changed_files.len(),
+        reference_files: reference_files.len(),
+        symbol_count: refreshed_symbols.len(),
+        pruned,
+    })
 }
 
 pub(crate) fn format_classifications(classifications: &[IndexClassification]) -> String {
