@@ -866,6 +866,59 @@ fn move_symbol_allows_java_same_package_type_references_and_refreshes_index() {
 }
 
 #[test]
+fn move_symbol_rewrites_java_cross_package_imports() {
+    let hugr = env!("CARGO_BIN_EXE_hugr");
+    let workspace = temp_workspace("move_symbol_java_cross_package");
+    fs::create_dir_all(workspace.join("src/plugin")).expect("plugin dir");
+    fs::create_dir_all(workspace.join("src/other")).expect("other dir");
+    fs::create_dir_all(workspace.join("src/app")).expect("app dir");
+    let source = workspace.join("src/plugin/Helper.java");
+    let destination = workspace.join("src/other/Helper.java");
+    let caller = workspace.join("src/app/Caller.java");
+    fs::write(&source, "package plugin;\n\npublic class Helper {}\n").expect("source written");
+    // Destination pre-declares its package, matching the same-package contract.
+    fs::write(&destination, "package other;\n").expect("destination written");
+    fs::write(
+        &caller,
+        "package app;\n\nimport plugin.Helper;\n\nclass Caller {\n    Helper helper = new Helper();\n}\n",
+    )
+    .expect("caller written");
+
+    let init = run_local_hugr(hugr, &workspace, &["init"]);
+    assert!(init.status.success(), "init failed: {init:?}");
+
+    let moved = run_local_hugr(
+        hugr,
+        &workspace,
+        &[
+            "move-symbol",
+            "--rewrite-references",
+            "--kind",
+            "class",
+            "src/plugin/Helper.java",
+            "Helper",
+            "src/other/Helper.java",
+        ],
+    );
+    assert!(moved.status.success(), "move failed: {moved:?}");
+
+    let edited_caller = fs::read_to_string(&caller).unwrap();
+    assert!(
+        edited_caller.contains("import other.Helper;"),
+        "caller import should be rewritten: {edited_caller}"
+    );
+    assert!(
+        !edited_caller.contains("import plugin.Helper;"),
+        "old import should be gone: {edited_caller}"
+    );
+
+    let edited_destination = fs::read_to_string(&destination).unwrap();
+    assert!(edited_destination.contains("public class Helper"));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
 fn move_symbol_allows_kotlin_same_package_type_references_and_refreshes_index() {
     let hugr = env!("CARGO_BIN_EXE_hugr");
     let workspace = temp_workspace("move_symbol_kotlin_same_package");
