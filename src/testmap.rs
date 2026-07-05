@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use crate::code::CodeSymbol;
+use std::collections::{HashMap, HashSet};
+
+const INLINE_TEST_MODULE_SCORE: usize = 70;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TestCandidate {
@@ -10,9 +13,10 @@ pub(crate) struct TestCandidate {
 pub(crate) fn likely_tests_for_files(
     files: &[String],
     known_files: &[String],
+    inline_test_paths: &HashSet<String>,
     limit: usize,
 ) -> Vec<TestCandidate> {
-    if limit == 0 || files.is_empty() || known_files.is_empty() {
+    if limit == 0 || files.is_empty() || (known_files.is_empty() && inline_test_paths.is_empty()) {
         return Vec::new();
     }
 
@@ -25,6 +29,13 @@ pub(crate) fn likely_tests_for_files(
     for file in files {
         if is_test_path(file) {
             upsert_candidate(&mut candidates, file, 100, "target is already a test file");
+        } else if inline_test_paths.contains(file) {
+            upsert_candidate(
+                &mut candidates,
+                file,
+                INLINE_TEST_MODULE_SCORE,
+                "file contains an inline test module",
+            );
         }
 
         let source_stem = normalized_source_stem(file);
@@ -114,6 +125,20 @@ fn upsert_candidate(
     }
 }
 
+pub(crate) fn inline_test_paths_from_symbols(symbols: &[CodeSymbol]) -> HashSet<String> {
+    symbols
+        .iter()
+        .filter(|symbol| is_inline_test_module_symbol(symbol))
+        .map(|symbol| symbol.path.clone())
+        .collect()
+}
+
+fn is_inline_test_module_symbol(symbol: &CodeSymbol) -> bool {
+    symbol.kind == "module"
+        && matches!(symbol.name.as_str(), "tests" | "test")
+        && symbol.language.as_deref() == Some("rust")
+}
+
 pub(crate) fn is_test_path(path: &str) -> bool {
     let lower = path.to_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
@@ -153,7 +178,9 @@ fn directory(path: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::likely_tests_for_files;
+    use super::{inline_test_paths_from_symbols, likely_tests_for_files};
+    use crate::code::CodeSymbol;
+    use std::collections::HashSet;
 
     #[test]
     fn maps_sources_to_likely_tests() {
@@ -163,7 +190,12 @@ mod tests {
             "src/storage.rs".to_string(),
         ];
 
-        let tests = likely_tests_for_files(&["src/plugin_hooks.rs".to_string()], &known, 5);
+        let tests = likely_tests_for_files(
+            &["src/plugin_hooks.rs".to_string()],
+            &known,
+            &HashSet::new(),
+            5,
+        );
 
         assert_eq!(tests.len(), 1);
         assert_eq!(tests[0].path, "tests/plugin_hooks.rs");
@@ -173,10 +205,78 @@ mod tests {
     fn keeps_test_targets() {
         let known = vec!["src/plugin_hooks_test.rs".to_string()];
 
-        let tests = likely_tests_for_files(&known, &known, 5);
+        let tests = likely_tests_for_files(&known, &known, &HashSet::new(), 5);
 
         assert_eq!(tests[0].path, "src/plugin_hooks_test.rs");
         assert_eq!(tests[0].reason, "target is already a test file");
         assert_eq!(tests[0].score, 100);
+    }
+
+    #[test]
+    fn maps_inline_test_modules_to_their_own_file() {
+        let files = vec!["src/context.rs".to_string()];
+        let inline = HashSet::from(["src/context.rs".to_string()]);
+
+        let tests = likely_tests_for_files(&files, &[], &inline, 5);
+
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].path, "src/context.rs");
+        assert_eq!(tests[0].reason, "file contains an inline test module");
+        assert_eq!(tests[0].score, 70);
+    }
+
+    #[test]
+    fn inline_candidates_rank_above_filename_matches() {
+        let known = vec![
+            "src/context.rs".to_string(),
+            "tests/context_helpers.rs".to_string(),
+        ];
+        let inline = HashSet::from(["src/context.rs".to_string()]);
+
+        let tests = likely_tests_for_files(&["src/context.rs".to_string()], &known, &inline, 5);
+
+        assert_eq!(tests[0].path, "src/context.rs");
+        assert!(
+            tests
+                .iter()
+                .any(|test| test.path == "tests/context_helpers.rs")
+        );
+    }
+
+    #[test]
+    fn collects_inline_test_paths_from_rust_module_symbols() {
+        let symbols = vec![
+            CodeSymbol {
+                path: "src/context.rs".to_string(),
+                language: Some("rust".to_string()),
+                name: "tests".to_string(),
+                kind: "module".to_string(),
+                line_start: 100,
+                line_end: None,
+                signature: "mod tests".to_string(),
+            },
+            CodeSymbol {
+                path: "src/other.rs".to_string(),
+                language: Some("rust".to_string()),
+                name: "helpers".to_string(),
+                kind: "module".to_string(),
+                line_start: 5,
+                line_end: None,
+                signature: "mod helpers".to_string(),
+            },
+            CodeSymbol {
+                path: "src/app.py".to_string(),
+                language: Some("python".to_string()),
+                name: "tests".to_string(),
+                kind: "class".to_string(),
+                line_start: 1,
+                line_end: None,
+                signature: "class tests".to_string(),
+            },
+        ];
+
+        let inline = inline_test_paths_from_symbols(&symbols);
+
+        assert_eq!(inline, HashSet::from(["src/context.rs".to_string()]));
     }
 }
