@@ -786,10 +786,13 @@ fn plan_kotlin_same_package_reference_awareness(
     let source_package = kotlin_package_name(source_contents);
     let destination_package = kotlin_package_name(destination_contents);
     if source_package != destination_package {
-        return Err(format!(
-            "move-symbol --rewrite-references requires Kotlin source and destination files to share package '{}'",
-            source_package.as_deref().unwrap_or("<root>")
-        ));
+        return plan_kotlin_cross_package_reference_rewrites(
+            target,
+            source_package.as_deref(),
+            destination_package.as_deref(),
+            references_by_path,
+            reference_contents,
+        );
     }
 
     for (path, references) in references_by_path {
@@ -828,6 +831,210 @@ fn plan_kotlin_same_package_reference_awareness(
     }
 
     Ok(PlannedReferenceRewrite::default())
+}
+
+/// Rewrites Kotlin `import` statements when a top-level declaration moves to a
+/// different package. Each referencing file needs its qualified import updated:
+/// a file in the source package gains a fresh `import <new_pkg>.<Symbol>`, a
+/// file in another package that imported `<old_pkg>.<Symbol>` has that line
+/// rewritten, and a file already in the destination package drops the now-
+/// redundant import. Conservatively refuses cases it cannot rewrite safely
+/// (wildcard imports, aliased imports, or a symbol referenced without a
+/// resolvable import in a foreign package).
+fn plan_kotlin_cross_package_reference_rewrites(
+    target: &CodeSymbol,
+    source_package: Option<&str>,
+    destination_package: Option<&str>,
+    references_by_path: BTreeMap<String, Vec<CodeReference>>,
+    reference_contents: BTreeMap<String, String>,
+) -> Result<PlannedReferenceRewrite, String> {
+    let Some(destination_package) = destination_package else {
+        return Err(
+            "move-symbol --rewrite-references cannot move a Kotlin type into the root package with inbound references"
+                .to_string(),
+        );
+    };
+    let old_import = source_package.map(|pkg| format!("{pkg}.{}", target.name));
+    let new_import = format!("{destination_package}.{}", target.name);
+
+    let mut files = Vec::new();
+    let mut changed_files = Vec::new();
+    let mut rewritten_reference_count = 0;
+
+    for (path, references) in references_by_path {
+        let Some(contents) = reference_contents.get(&path) else {
+            return Err(format!(
+                "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
+            ));
+        };
+        if !code::parses_cleanly(&path, language_for_path(&path), contents)? {
+            return Err(format!(
+                "referencing file {path} is not valid Kotlin code; refusing to trust stale references"
+            ));
+        }
+        if kotlin_has_wildcard_or_aliased_import(contents, &target.name) {
+            return Err(format!(
+                "move-symbol --rewrite-references cannot safely rewrite wildcard or aliased Kotlin import for '{}' in {path}",
+                target.name
+            ));
+        }
+
+        // Verify each indexed reference line still names the symbol.
+        for reference in &references {
+            let line = line_at(contents, reference.line_start).ok_or_else(|| {
+                format!(
+                    "move-symbol reference line {} is past end of {path}",
+                    reference.line_start
+                )
+            })?;
+            let (_line, matches) = replace_identifier_in_line(line, &target.name, &target.name);
+            if matches == 0 {
+                return Err(format!(
+                    "move-symbol --rewrite-references could not verify Kotlin reference '{}' on {path}:{}; rerun hugr index",
+                    target.name, reference.line_start
+                ));
+            }
+        }
+
+        let reference_package = kotlin_package_name(contents);
+        let (rewritten, changes) = kotlin_rewrite_import_for_move(
+            contents,
+            old_import.as_deref(),
+            &new_import,
+            reference_package.as_deref() == Some(destination_package),
+        )
+        .ok_or_else(|| {
+            format!(
+                "move-symbol --rewrite-references could not update the Kotlin import for '{}' in {path}",
+                target.name
+            )
+        })?;
+        if changes == 0 {
+            return Err(format!(
+                "move-symbol --rewrite-references made no Kotlin import change in {path}"
+            ));
+        }
+        if !code::parses_cleanly(&path, language_for_path(&path), &rewritten)? {
+            return Err(format!(
+                "referencing file {path} would not parse after moving '{}'",
+                target.name
+            ));
+        }
+        rewritten_reference_count += references.len();
+        files.push(PlannedMoveFile {
+            path: path.clone(),
+            contents: rewritten,
+        });
+        changed_files.push(SymbolMoveFile {
+            path,
+            action: "rewrote imports".to_string(),
+        });
+    }
+
+    Ok(PlannedReferenceRewrite {
+        files,
+        changed_files,
+        rewritten_reference_count,
+    })
+}
+
+/// Returns true if the file imports `symbol` via a wildcard (`import pkg.*`) or
+/// an alias (`import pkg.Symbol as Other`), which the conservative rewriter
+/// declines to touch.
+fn kotlin_has_wildcard_or_aliased_import(contents: &str, symbol: &str) -> bool {
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("import ") else {
+            continue;
+        };
+        let rest = rest.trim_end_matches(';').trim();
+        if rest.ends_with(".*") {
+            return true;
+        }
+        if let Some((path, _alias)) = rest.split_once(" as ") {
+            if path.trim().rsplit('.').next() == Some(symbol) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Produces the rewritten file contents and the number of import changes for a
+/// cross-package Kotlin move. When the file previously imported the old path it
+/// is replaced; when the file now shares the destination package the redundant
+/// import is dropped; otherwise a fresh import is inserted after the package
+/// declaration (or existing imports). Returns None if it cannot place the import.
+fn kotlin_rewrite_import_for_move(
+    contents: &str,
+    old_import: Option<&str>,
+    new_import: &str,
+    reference_in_destination_package: bool,
+) -> Option<(String, usize)> {
+    let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
+
+    // Locate an existing `import <old_import>` line, if any.
+    let existing = old_import.and_then(|old| {
+        lines.iter().position(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix("import ")
+                .map(|rest| rest.trim_end_matches(';').trim() == old)
+                .unwrap_or(false)
+        })
+    });
+
+    if reference_in_destination_package {
+        // Same package as the destination now: drop the old import if present.
+        if let Some(index) = existing {
+            lines.remove(index);
+            return Some((join_lines(&lines, contents), 1));
+        }
+        // No import to remove and none needed; nothing to change here means the
+        // reference already resolves, so report zero (caller treats as error).
+        return Some((contents.to_string(), 0));
+    }
+
+    if let Some(index) = existing {
+        // Rewrite the existing import path to the new package.
+        lines[index] = format!("import {new_import}");
+        return Some((join_lines(&lines, contents), 1));
+    }
+
+    // Insert a fresh import after the last existing import, else after the
+    // package declaration, else at the top.
+    let insert_at = kotlin_import_insertion_index(&lines);
+    lines.insert(insert_at, format!("import {new_import}"));
+    Some((join_lines(&lines, contents), 1))
+}
+
+fn kotlin_import_insertion_index(lines: &[String]) -> usize {
+    let mut last_import = None;
+    let mut package_line = None;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("import ") {
+            last_import = Some(index);
+        } else if trimmed.starts_with("package ") {
+            package_line = Some(index);
+        }
+    }
+    if let Some(index) = last_import {
+        index + 1
+    } else if let Some(index) = package_line {
+        index + 1
+    } else {
+        0
+    }
+}
+
+fn join_lines(lines: &[String], original: &str) -> String {
+    let joined = lines.join("\n");
+    if original.ends_with('\n') {
+        format!("{joined}\n")
+    } else {
+        joined
+    }
 }
 
 fn kotlin_reference_safe_kind(kind: &str) -> bool {
@@ -3898,7 +4105,52 @@ mod tests {
     }
 
     #[test]
-    fn rejects_kotlin_reference_aware_move_across_packages() {
+    fn rewrites_foreign_package_import_on_kotlin_cross_package_move() {
+        // Caller lives in a third package and imports plugin.Helper; the move to
+        // package `other` should rewrite that import.
+        let source = "package plugin\n\nclass Helper\n";
+        let destination = "package other\n\nclass Existing\n";
+        let caller =
+            "package app\n\nimport plugin.Helper\n\nclass Caller {\n    val helper = Helper()\n}\n";
+        let target =
+            resolve_symbol_in_source("src/plugin/Hooks.kt", source, "Helper", None, "move")
+                .unwrap();
+        let references = vec![CodeReference {
+            path: "src/app/Caller.kt".to_string(),
+            language: Some("kotlin".to_string()),
+            target_path: "src/plugin/Hooks.kt".to_string(),
+            target_name: "Helper".to_string(),
+            target_kind: "class".to_string(),
+            kind: "instantiation".to_string(),
+            line_start: 6,
+            excerpt: "val helper = Helper()".to_string(),
+        }];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "src/other/Helper.kt",
+            destination,
+            vec![("src/app/Caller.kt".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(planned.summary.rewritten_reference_count, 1);
+        let rewritten = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/app/Caller.kt")
+            .unwrap();
+        assert!(rewritten.contents.contains("import other.Helper"));
+        assert!(!rewritten.contents.contains("import plugin.Helper"));
+    }
+
+    #[test]
+    fn inserts_import_for_source_package_referencer_on_kotlin_cross_package_move() {
+        // Caller is in the source package (no import today); after moving Helper
+        // to package `other`, it must gain `import other.Helper`.
         let source = "package plugin\n\nclass Helper\n";
         let destination = "package other\n\nclass Existing\n";
         let caller = "package plugin\n\nclass Caller {\n    val helper = Helper()\n}\n";
@@ -3916,7 +4168,7 @@ mod tests {
             excerpt: "val helper = Helper()".to_string(),
         }];
 
-        let error = plan_move(
+        let planned = plan_move(
             &target,
             &references,
             source,
@@ -3925,9 +4177,100 @@ mod tests {
             vec![("src/plugin/Caller.kt".to_string(), caller.to_string())],
             true,
         )
+        .unwrap();
+
+        let rewritten = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/plugin/Caller.kt")
+            .unwrap();
+        assert!(rewritten.contents.contains("import other.Helper"));
+        // Import goes after the package line.
+        let package_index = rewritten
+            .contents
+            .lines()
+            .position(|line| line.trim().starts_with("package "))
+            .unwrap();
+        let import_index = rewritten
+            .contents
+            .lines()
+            .position(|line| line.trim() == "import other.Helper")
+            .unwrap();
+        assert!(import_index > package_index);
+    }
+
+    #[test]
+    fn drops_import_for_destination_package_referencer_on_kotlin_cross_package_move() {
+        // Caller is already in the destination package but imports plugin.Helper;
+        // after the move that import is redundant and should be removed.
+        let source = "package plugin\n\nclass Helper\n";
+        let destination = "package other\n\nclass Existing\n";
+        let caller = "package other\n\nimport plugin.Helper\n\nclass Caller {\n    val helper = Helper()\n}\n";
+        let target =
+            resolve_symbol_in_source("src/plugin/Hooks.kt", source, "Helper", None, "move")
+                .unwrap();
+        let references = vec![CodeReference {
+            path: "src/other/Caller.kt".to_string(),
+            language: Some("kotlin".to_string()),
+            target_path: "src/plugin/Hooks.kt".to_string(),
+            target_name: "Helper".to_string(),
+            target_kind: "class".to_string(),
+            kind: "instantiation".to_string(),
+            line_start: 6,
+            excerpt: "val helper = Helper()".to_string(),
+        }];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "src/other/Helper.kt",
+            destination,
+            vec![("src/other/Caller.kt".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+
+        let rewritten = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/other/Caller.kt")
+            .unwrap();
+        assert!(!rewritten.contents.contains("import plugin.Helper"));
+    }
+
+    #[test]
+    fn rejects_wildcard_import_on_kotlin_cross_package_move() {
+        let source = "package plugin\n\nclass Helper\n";
+        let destination = "package other\n\nclass Existing\n";
+        let caller =
+            "package app\n\nimport plugin.*\n\nclass Caller {\n    val helper = Helper()\n}\n";
+        let target =
+            resolve_symbol_in_source("src/plugin/Hooks.kt", source, "Helper", None, "move")
+                .unwrap();
+        let references = vec![CodeReference {
+            path: "src/app/Caller.kt".to_string(),
+            language: Some("kotlin".to_string()),
+            target_path: "src/plugin/Hooks.kt".to_string(),
+            target_name: "Helper".to_string(),
+            target_kind: "class".to_string(),
+            kind: "instantiation".to_string(),
+            line_start: 6,
+            excerpt: "val helper = Helper()".to_string(),
+        }];
+
+        let error = plan_move(
+            &target,
+            &references,
+            source,
+            "src/other/Helper.kt",
+            destination,
+            vec![("src/app/Caller.kt".to_string(), caller.to_string())],
+            true,
+        )
         .unwrap_err();
 
-        assert!(error.contains("share package"), "{error}");
+        assert!(error.contains("wildcard or aliased"), "{error}");
     }
 
     #[test]
