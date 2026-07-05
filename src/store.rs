@@ -1301,6 +1301,11 @@ impl Store {
             &edit_events,
             freshness_scan_limit(limit),
         ));
+        signals.extend(freshness_signals_from_context_pack_age(
+            &paths,
+            latest_context_pack_updated_at_ms,
+            freshness_scan_limit(limit),
+        ));
 
         Ok(finalize_freshness_signals(signals, limit))
     }
@@ -3808,6 +3813,11 @@ fn context_freshness_signals_via_hugr_api(
         &edit_events,
         freshness_scan_limit(limit),
     ));
+    signals.extend(freshness_signals_from_context_pack_age(
+        &paths,
+        latest_context_pack_updated_at_ms,
+        freshness_scan_limit(limit),
+    ));
 
     Ok(finalize_freshness_signals(signals, limit))
 }
@@ -4075,6 +4085,43 @@ fn freshness_signals_from_index_timestamps(
     signals
 }
 
+/// Flags cited files whose on-disk modification time is newer than the latest
+/// persisted context pack. Unlike `edit_after_context` (which only sees edits
+/// recorded as Hugr session events) and `stale_index` (which compares to the
+/// index timestamp), this catches files edited directly in an editor after a
+/// pack was compiled, so agents are warned the persisted pack is out of date.
+fn freshness_signals_from_context_pack_age(
+    paths: &[String],
+    latest_context_pack_updated_at_ms: Option<i64>,
+    limit: usize,
+) -> Vec<FreshnessSignal> {
+    let Some(latest_context_pack_updated_at_ms) = latest_context_pack_updated_at_ms else {
+        return Vec::new();
+    };
+
+    let mut signals = Vec::new();
+    for path in paths {
+        if signals.len() >= limit {
+            break;
+        }
+        let Some(modified) = file_modified_at_ms(path) else {
+            continue;
+        };
+        if modified > latest_context_pack_updated_at_ms + 1_000 {
+            signals.push(FreshnessSignal {
+                detail: format!(
+                    "{path} changed on disk after the latest persisted context pack ({modified} > {latest_context_pack_updated_at_ms})"
+                ),
+                path: path.clone(),
+                kind: "stale_context".to_string(),
+                indexed_at_ms: Some(latest_context_pack_updated_at_ms),
+                modified_at_ms: Some(modified),
+            });
+        }
+    }
+    signals
+}
+
 fn freshness_signals_from_edit_events(
     paths: &[String],
     latest_context_pack_updated_at_ms: Option<i64>,
@@ -4137,7 +4184,8 @@ fn finalize_freshness_signals(
 
 fn freshness_kind_rank(kind: &str) -> usize {
     match kind {
-        "edit_after_context" => 3,
+        "edit_after_context" => 4,
+        "stale_context" => 3,
         "stale_index" => 2,
         "missing_index" => 1,
         _ => 0,

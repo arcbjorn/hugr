@@ -1402,6 +1402,24 @@ fn build_risk_signals(
         ));
     }
 
+    let stale_context_paths = freshness_signals
+        .iter()
+        .filter(|signal| signal.kind == "stale_context")
+        .map(|signal| signal.path.clone())
+        .collect::<Vec<_>>();
+    if !stale_context_paths.is_empty() {
+        signals.push(context_risk_signal(
+            "medium",
+            "stale_context",
+            format!(
+                "Relevant files changed on disk after the latest persisted context pack: {}",
+                summarize_values(&stale_context_paths, 4)
+            ),
+            750 + stale_context_paths.len() * 20,
+            "file modification time is newer than the latest persisted context pack",
+        ));
+    }
+
     let stale_index_paths = freshness_signals
         .iter()
         .filter(|signal| signal.kind == "stale_index")
@@ -2746,6 +2764,47 @@ mod tests {
 
         assert!(risk_kinds.contains(&"stale_after_edit"));
         assert!(markdown.contains("risk:stale_after_edit [risk]"));
+    }
+
+    #[test]
+    fn stale_context_freshness_signals_render_as_risks() {
+        let pack =
+            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
+                "refresh plugin hooks",
+                vec![FileCandidate {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    score: 5,
+                    language: Some("rust".to_string()),
+                    size_bytes: Some(100),
+                }],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+                vec![FreshnessSignal {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    kind: "stale_context".to_string(),
+                    detail: "src/plugin_hooks.rs changed on disk after the latest persisted context pack".to_string(),
+                    indexed_at_ms: Some(10),
+                    modified_at_ms: Some(30),
+                }],
+                Vec::new(),
+            );
+
+        let markdown = pack.render_markdown();
+        let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
+        let risk_kinds = parsed["risk_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|risk| risk["kind"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(risk_kinds.contains(&"stale_context"));
+        assert!(markdown.contains("risk:stale_context [risk]"));
     }
 
     #[test]
