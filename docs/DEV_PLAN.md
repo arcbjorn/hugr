@@ -101,6 +101,7 @@ Implemented:
 - `hugr move-symbol --rewrite-references` supports same-package Java type moves by validating package declarations and indexed references for class, interface, enum, annotation, and record declarations that require no textual rewrite
 - `hugr move-symbol --rewrite-references` supports same-package Kotlin type moves by validating package declarations and indexed references for class, interface, enum, annotation, object, and type-alias declarations that require no textual rewrite
 - `hugr move-symbol --rewrite-references` supports same-module Swift type moves by validating module directories and indexed references for class, struct, enum, actor, protocol, extension, and type-alias declarations that require no textual rewrite
+- `hugr move-symbol --rewrite-references` supports cross-package Kotlin and Java type moves by rewriting qualified imports in referencing files (inserting a fresh import in source-package files, rewriting the path in foreign-package files, and dropping the now-redundant import in destination-package files), refusing wildcard and aliased imports it cannot safely rewrite
 - `hugr move-symbol` refreshes the index immediately after a successful move and records a session edit event when a session is active
 - `hugr context` and `hugr_context` include a first code-health risk signal for large indexed symbols using deterministic symbol line ranges
 - `hugr context` and `hugr_context` include cross-file refactor-surface risks when code graph references span multiple files
@@ -125,7 +126,7 @@ The near-term plan is close to complete, but the broader vision and technical bl
 - Automatic session observation: daemon captures file-change and git/worktree events for active sessions, `hugr run <command>` captures command/test outcomes, `hugr shell-hook <bash|zsh>` can observe ordinary shell command statuses, and daemon indexing captures classified discovery summaries.
 - Session summarization and memory promotion: manual `hugr session promote` summarizes latest session facts into long-term memory, and the daemon periodically promotes ended, unpromoted sessions.
 - Risk and health signals: context packs now include deterministic risks for stale memory conflicts, changed relevant files, missing tests/symbols, graph coupling, public/exported API surfaces, cross-file refactor surfaces, unreferenced private symbols, recent failure facts, index freshness, stale-after-edit context invalidation, recent diagnostic output, structured diagnostics with source locations, and large indexed symbols; deeper complexity and risky paths remain.
-- Semantic operations: read-only CLI/MCP symbol lookup exists; safe local symbol replacement exists with parse and identity checks; the first reference-aware local rename exists for definitions plus indexed inbound references; broader multi-file structural edits remain.
+- Semantic operations: read-only CLI/MCP symbol lookup exists; safe local symbol replacement exists with parse and identity checks; the first reference-aware local rename exists for definitions plus indexed inbound references; reference-aware moves rewrite Rust, Python, TypeScript, and JavaScript ES-module imports, validate same-package Go/Java/Kotlin and same-module Swift moves, and rewrite Kotlin and Java imports across packages (insert/rewrite/drop qualified imports, refusing wildcard/aliased imports); cross-module Swift moves (module names are not resolvable from paths without build manifests) and CommonJS `require` moves (need source-side export rewriting and export-assignment symbol extraction) remain.
 - Incremental freshness: full and daemon indexing prune discovered-file, symbol, and code-reference rows (including dangling target edges) for files that no longer exist on disk; the daemon and `hugr index --paths` now re-index only changed paths plus their inbound-reference sources instead of the whole project, keeping cross-file references correct; and context packs surface a `stale_context` risk when a cited file's on-disk modification time is newer than the latest persisted pack, closing the direct-edit staleness gap (persisted packs are audit/sync artifacts and are always recompiled, never re-served). Broader watcher-driven refresh of tests and embeddings remains.
 
 ## Runtime Decision
@@ -603,6 +604,8 @@ Recommended next commits:
 85. Done: `feat(index): prune deleted file rows`
 86. Done: `feat(index): add incremental path refresh`
 87. Done: `feat(context): flag stale context packs`
+88. Done: `feat(edit): rewrite Kotlin cross-package moves`
+89. Done: `feat(edit): rewrite Java cross-package moves`
 
 Each commit should leave the CLI usable.
 
