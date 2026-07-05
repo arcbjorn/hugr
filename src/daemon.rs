@@ -1546,6 +1546,8 @@ mod tests {
                 discovered_files: 2,
                 symbols: 3,
                 references: 4,
+                test_mappings: 0,
+                source_embeddings: 0,
             },
         });
         assert!(detail.contains("pruned_files=2 pruned_symbols=3 pruned_references=4"));
