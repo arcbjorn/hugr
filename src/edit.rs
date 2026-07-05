@@ -324,6 +324,8 @@ pub(crate) fn plan_move(
         plan_reference_rewrites(
             target,
             destination_path,
+            source_contents,
+            destination_contents,
             source_language,
             destination_language,
             &inbound_references,
@@ -407,6 +409,8 @@ struct PlannedReferenceRewrite {
 fn plan_reference_rewrites(
     target: &CodeSymbol,
     destination_path: &str,
+    source_contents: &str,
+    destination_contents: &str,
     source_language: Option<&str>,
     destination_language: Option<&str>,
     inbound_references: &[CodeReference],
@@ -518,10 +522,242 @@ fn plan_reference_rewrites(
         );
     }
 
+    if source_language == Some("go") && destination_language == Some("go") {
+        return plan_go_same_package_reference_awareness(
+            target,
+            destination_path,
+            source_contents,
+            destination_contents,
+            references_by_path,
+            reference_contents,
+        );
+    }
+
+    if source_language == Some("java") && destination_language == Some("java") {
+        return plan_java_same_package_type_reference_awareness(
+            target,
+            destination_path,
+            source_contents,
+            destination_contents,
+            references_by_path,
+            reference_contents,
+        );
+    }
+
     Err(
-        "move-symbol --rewrite-references currently supports Rust, Python, TypeScript, and JavaScript source files only"
+        "move-symbol --rewrite-references currently supports Rust, Python, TypeScript, JavaScript, same-package Go, and same-package Java type source files only"
             .to_string(),
     )
+}
+
+fn plan_go_same_package_reference_awareness(
+    target: &CodeSymbol,
+    destination_path: &str,
+    source_contents: &str,
+    destination_contents: &str,
+    references_by_path: BTreeMap<String, Vec<CodeReference>>,
+    reference_contents: BTreeMap<String, String>,
+) -> Result<PlannedReferenceRewrite, String> {
+    let source_parent = path_parent_segments(&target.path);
+    let destination_parent = path_parent_segments(destination_path);
+    if source_parent != destination_parent {
+        return Err(
+            "move-symbol --rewrite-references currently supports Go moves only within the same package directory"
+                .to_string(),
+        );
+    }
+    let source_package = go_package_name(source_contents).ok_or_else(|| {
+        format!(
+            "move-symbol --rewrite-references cannot determine Go package for {}",
+            target.path
+        )
+    })?;
+    let destination_package = go_package_name(destination_contents).ok_or_else(|| {
+        format!(
+            "move-symbol --rewrite-references cannot determine Go package for {destination_path}"
+        )
+    })?;
+    if source_package != destination_package {
+        return Err(format!(
+            "move-symbol --rewrite-references requires Go source and destination files to share package '{source_package}'"
+        ));
+    }
+
+    for (path, references) in references_by_path {
+        if path_parent_segments(&path) != source_parent {
+            return Err(format!(
+                "move-symbol --rewrite-references cannot keep Go reference {path} valid across package directories"
+            ));
+        }
+        let Some(contents) = reference_contents.get(&path) else {
+            return Err(format!(
+                "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
+            ));
+        };
+        if !code::parses_cleanly(&path, language_for_path(&path), contents)? {
+            return Err(format!(
+                "referencing file {path} is not valid Go code; refusing to trust stale references"
+            ));
+        }
+        let reference_package = go_package_name(contents).ok_or_else(|| {
+            format!("move-symbol --rewrite-references cannot determine Go package for {path}")
+        })?;
+        if reference_package != source_package {
+            return Err(format!(
+                "move-symbol --rewrite-references requires Go reference file {path} to share package '{source_package}'"
+            ));
+        }
+        for reference in references {
+            let line = line_at(contents, reference.line_start).ok_or_else(|| {
+                format!(
+                    "move-symbol reference line {} is past end of {path}",
+                    reference.line_start
+                )
+            })?;
+            let (_line, matches) = replace_identifier_in_line(line, &target.name, &target.name);
+            if matches == 0 {
+                return Err(format!(
+                    "move-symbol --rewrite-references could not verify Go reference '{}' on {path}:{}; rerun hugr index",
+                    target.name, reference.line_start
+                ));
+            }
+        }
+    }
+
+    Ok(PlannedReferenceRewrite::default())
+}
+
+fn go_package_name(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        let rest = trimmed.strip_prefix("package ")?;
+        let name = rest.split_whitespace().next()?;
+        return valid_identifier(name).then(|| name.to_string());
+    }
+    None
+}
+
+fn plan_java_same_package_type_reference_awareness(
+    target: &CodeSymbol,
+    destination_path: &str,
+    source_contents: &str,
+    destination_contents: &str,
+    references_by_path: BTreeMap<String, Vec<CodeReference>>,
+    reference_contents: BTreeMap<String, String>,
+) -> Result<PlannedReferenceRewrite, String> {
+    if !java_reference_safe_kind(&target.kind) {
+        return Err(format!(
+            "move-symbol --rewrite-references supports Java moves only for type declarations, not {} '{}'",
+            target.kind, target.name
+        ));
+    }
+    if java_signature_is_public(&target.signature)
+        && path_file_stem(destination_path).as_deref() != Some(target.name.as_str())
+    {
+        return Err(format!(
+            "move-symbol --rewrite-references requires public Java type '{}' to move into {}.java",
+            target.name, target.name
+        ));
+    }
+
+    let source_package = java_package_name(source_contents).ok_or_else(|| {
+        format!(
+            "move-symbol --rewrite-references cannot determine Java package for {}",
+            target.path
+        )
+    })?;
+    let destination_package = java_package_name(destination_contents).ok_or_else(|| {
+        format!(
+            "move-symbol --rewrite-references cannot determine Java package for {destination_path}"
+        )
+    })?;
+    if source_package != destination_package {
+        return Err(format!(
+            "move-symbol --rewrite-references requires Java source and destination files to share package '{source_package}'"
+        ));
+    }
+
+    for (path, references) in references_by_path {
+        let Some(contents) = reference_contents.get(&path) else {
+            return Err(format!(
+                "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
+            ));
+        };
+        if !code::parses_cleanly(&path, language_for_path(&path), contents)? {
+            return Err(format!(
+                "referencing file {path} is not valid Java code; refusing to trust stale references"
+            ));
+        }
+        let reference_package = java_package_name(contents).ok_or_else(|| {
+            format!("move-symbol --rewrite-references cannot determine Java package for {path}")
+        })?;
+        if reference_package != source_package {
+            return Err(format!(
+                "move-symbol --rewrite-references requires Java reference file {path} to share package '{source_package}'"
+            ));
+        }
+        for reference in references {
+            let line = line_at(contents, reference.line_start).ok_or_else(|| {
+                format!(
+                    "move-symbol reference line {} is past end of {path}",
+                    reference.line_start
+                )
+            })?;
+            let (_line, matches) = replace_identifier_in_line(line, &target.name, &target.name);
+            if matches == 0 {
+                return Err(format!(
+                    "move-symbol --rewrite-references could not verify Java reference '{}' on {path}:{}; rerun hugr index",
+                    target.name, reference.line_start
+                ));
+            }
+        }
+    }
+
+    Ok(PlannedReferenceRewrite::default())
+}
+
+fn java_reference_safe_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "annotation" | "class" | "enum" | "interface" | "record"
+    )
+}
+
+fn java_signature_is_public(signature: &str) -> bool {
+    signature.trim_start().starts_with("public ")
+}
+
+fn java_package_name(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        let rest = trimmed.strip_prefix("package ")?;
+        let package = rest.trim_end_matches(';').trim();
+        if package.is_empty()
+            || !package
+                .split('.')
+                .all(|segment| valid_identifier(segment.trim()))
+        {
+            return None;
+        }
+        return Some(package.to_string());
+    }
+    None
+}
+
+fn path_file_stem(path: &str) -> Option<String> {
+    let filename = normalize_path_string(path).rsplit('/').next()?.to_string();
+    let stem = filename.rsplit_once('.').map(|(stem, _extension)| stem)?;
+    if stem.is_empty() {
+        None
+    } else {
+        Some(stem.to_string())
+    }
 }
 
 fn rewrite_reference_files<F>(
@@ -2302,6 +2538,14 @@ fn splice_lines(
     Ok((rendered, new_line_end))
 }
 
+fn line_at(contents: &str, line_number: i64) -> Option<&str> {
+    if line_number < 1 {
+        return None;
+    }
+    let index = usize::try_from(line_number - 1).ok()?;
+    contents.lines().nth(index)
+}
+
 fn extract_line_range(
     contents: &str,
     line_start: i64,
@@ -3257,6 +3501,172 @@ mod tests {
         assert!(caller_file.contents.contains("hooks.helper();"));
         assert!(!caller_file.contents.contains("./pluginHooks"));
         assert_eq!(planned.summary.rewritten_reference_count, 1);
+    }
+
+    #[test]
+    fn plans_go_same_package_move_with_references_without_text_rewrites() {
+        let source = "package plugin\n\nfunc helper() int {\n    return 1\n}\n\nfunc other() int {\n    return 2\n}\n";
+        let destination = "package plugin\n\nfunc existing() int {\n    return 0\n}\n";
+        let caller = "package plugin\n\nfunc useHelper() int {\n    return helper()\n}\n";
+        let target =
+            resolve_symbol_in_source("plugin/hooks.go", source, "helper", None, "move").unwrap();
+        let references = vec![CodeReference {
+            path: "plugin/caller.go".to_string(),
+            language: Some("go".to_string()),
+            target_path: "plugin/hooks.go".to_string(),
+            target_name: "helper".to_string(),
+            target_kind: "function".to_string(),
+            kind: "call".to_string(),
+            line_start: 4,
+            excerpt: "return helper()".to_string(),
+        }];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "plugin/helpers.go",
+            destination,
+            vec![("plugin/caller.go".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(planned.summary.rewritten_reference_count, 0);
+        assert!(
+            planned
+                .files
+                .iter()
+                .all(|file| file.path != "plugin/caller.go")
+        );
+        assert!(
+            planned
+                .files
+                .iter()
+                .find(|file| file.path == "plugin/helpers.go")
+                .unwrap()
+                .contents
+                .contains("func helper() int")
+        );
+    }
+
+    #[test]
+    fn rejects_go_reference_aware_move_across_package_directories() {
+        let source = "package plugin\n\nfunc helper() int {\n    return 1\n}\n";
+        let destination = "package other\n\nfunc existing() int {\n    return 0\n}\n";
+        let caller = "package plugin\n\nfunc useHelper() int {\n    return helper()\n}\n";
+        let target =
+            resolve_symbol_in_source("plugin/hooks.go", source, "helper", None, "move").unwrap();
+        let references = vec![CodeReference {
+            path: "plugin/caller.go".to_string(),
+            language: Some("go".to_string()),
+            target_path: "plugin/hooks.go".to_string(),
+            target_name: "helper".to_string(),
+            target_kind: "function".to_string(),
+            kind: "call".to_string(),
+            line_start: 4,
+            excerpt: "return helper()".to_string(),
+        }];
+
+        let error = plan_move(
+            &target,
+            &references,
+            source,
+            "other/helpers.go",
+            destination,
+            vec![("plugin/caller.go".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("same package directory"), "{error}");
+    }
+
+    #[test]
+    fn plans_java_same_package_type_move_with_references_without_text_rewrites() {
+        let source = "package plugin;\n\nclass Helper {\n    int value() { return 1; }\n}\n\nclass Other {}\n";
+        let destination = "package plugin;\n\nclass Existing {}\n";
+        let caller = "package plugin;\n\nclass Caller {\n    Helper helper = new Helper();\n}\n";
+        let target = resolve_symbol_in_source(
+            "src/plugin/PluginHooks.java",
+            source,
+            "Helper",
+            None,
+            "move",
+        )
+        .unwrap();
+        let references = vec![CodeReference {
+            path: "src/plugin/Caller.java".to_string(),
+            language: Some("java".to_string()),
+            target_path: "src/plugin/PluginHooks.java".to_string(),
+            target_name: "Helper".to_string(),
+            target_kind: "class".to_string(),
+            kind: "instantiation".to_string(),
+            line_start: 4,
+            excerpt: "Helper helper = new Helper();".to_string(),
+        }];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "src/plugin/Helper.java",
+            destination,
+            vec![("src/plugin/Caller.java".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(planned.summary.rewritten_reference_count, 0);
+        assert!(
+            planned
+                .files
+                .iter()
+                .all(|file| file.path != "src/plugin/Caller.java")
+        );
+        assert!(
+            planned
+                .files
+                .iter()
+                .find(|file| file.path == "src/plugin/Helper.java")
+                .unwrap()
+                .contents
+                .contains("class Helper")
+        );
+    }
+
+    #[test]
+    fn rejects_java_reference_aware_method_move() {
+        let source = "package plugin;\n\nclass Helper {\n    int value() { return 1; }\n}\n";
+        let destination = "package plugin;\n\nclass Existing {}\n";
+        let caller =
+            "package plugin;\n\nclass Caller {\n    int value = new Helper().value();\n}\n";
+        let target =
+            resolve_symbol_in_source("src/plugin/Helper.java", source, "value", None, "move")
+                .unwrap();
+        let references = vec![CodeReference {
+            path: "src/plugin/Caller.java".to_string(),
+            language: Some("java".to_string()),
+            target_path: "src/plugin/Helper.java".to_string(),
+            target_name: "value".to_string(),
+            target_kind: "function".to_string(),
+            kind: "call".to_string(),
+            line_start: 4,
+            excerpt: "int value = new Helper().value();".to_string(),
+        }];
+
+        let error = plan_move(
+            &target,
+            &references,
+            source,
+            "src/plugin/Existing.java",
+            destination,
+            vec![("src/plugin/Caller.java".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("only for type declarations"), "{error}");
     }
 
     #[test]
