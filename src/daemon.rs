@@ -190,10 +190,21 @@ async fn run_background_index(state: Arc<DaemonState>) {
     state.set_last_index_status("running");
     let status = match indexer::index_project(5000).await {
         Ok(summary) => {
-            let base_status = format!(
-                "ok files={} symbols={}",
-                summary.file_count, summary.symbol_count
-            );
+            let base_status = if summary.pruned.is_empty() {
+                format!(
+                    "ok files={} symbols={}",
+                    summary.file_count, summary.symbol_count
+                )
+            } else {
+                format!(
+                    "ok files={} symbols={} pruned_files={} pruned_symbols={} pruned_references={}",
+                    summary.file_count,
+                    summary.symbol_count,
+                    summary.pruned.missing_paths,
+                    summary.pruned.symbols,
+                    summary.pruned.references
+                )
+            };
             match record_discovery_capture(&summary).await {
                 Ok(Some(event_id)) => format!("{base_status} discovery_event={event_id}"),
                 Ok(None) => format!("{base_status} discovery=skipped"),
@@ -1545,6 +1556,7 @@ mod tests {
                 name: "function".to_string(),
                 count: 7,
             }],
+            pruned: Default::default(),
         });
 
         assert!(detail.contains("indexed files=14 symbols=7"));

@@ -1,6 +1,6 @@
 use crate::code::{self, CodeSymbol};
 use crate::discovery::{self, FileCandidate};
-use crate::store::Store;
+use crate::store::{PruneSummary, Store};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -12,6 +12,7 @@ pub(crate) struct IndexSummary {
     pub file_roles: Vec<IndexClassification>,
     pub languages: Vec<IndexClassification>,
     pub symbol_kinds: Vec<IndexClassification>,
+    pub pruned: PruneSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,7 @@ pub(crate) async fn index_project(limit: usize) -> Result<IndexSummary, String> 
     let root = Path::new(".");
     let files = discovery::discover_project_files(root, limit)?;
     let symbols = index_candidates(&store, root, &files).await?;
+    let pruned = store.prune_missing_index_rows(root).await?;
 
     Ok(IndexSummary {
         file_count: files.len(),
@@ -37,6 +39,7 @@ pub(crate) async fn index_project(limit: usize) -> Result<IndexSummary, String> 
         file_roles: classify_file_roles(&files),
         languages: classify_languages(&files),
         symbol_kinds: classify_symbol_kinds(&symbols),
+        pruned,
     })
 }
 

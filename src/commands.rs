@@ -262,6 +262,12 @@ async fn index() -> Result<(), String> {
         "symbol_kinds: {}",
         indexer::format_classifications(&summary.symbol_kinds)
     );
+    if !summary.pruned.is_empty() {
+        println!(
+            "pruned: {} missing files, {} symbols, {} references",
+            summary.pruned.missing_paths, summary.pruned.symbols, summary.pruned.references
+        );
+    }
     Ok(())
 }
 

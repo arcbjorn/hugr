@@ -157,6 +157,20 @@ pub(crate) struct SyncApiTablePayload {
     pub records: Vec<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneSummary {
+    pub missing_paths: usize,
+    pub discovered_files: u64,
+    pub symbols: u64,
+    pub references: u64,
+}
+
+impl PruneSummary {
+    pub fn is_empty(&self) -> bool {
+        self.missing_paths == 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Memory {
     pub id: String,
@@ -845,6 +859,61 @@ impl Store {
         }
 
         Ok(())
+    }
+
+    /// Removes indexed rows for files that no longer exist on disk so recall,
+    /// context, and impact never surface stale symbols or dangling references
+    /// after a file is deleted or renamed. Paths are resolved against `root`;
+    /// a row is pruned only when its file is genuinely missing, so files merely
+    /// truncated out of a ranked discovery pass are left untouched.
+    pub async fn prune_missing_index_rows(&self, root: &Path) -> Result<PruneSummary, String> {
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) || !self.exists() {
+            return Ok(PruneSummary::default());
+        }
+
+        let conn = self.connect().await?;
+        let mut stored_paths = HashSet::new();
+        for table in ["discovered_files", "code_symbols", "code_references"] {
+            collect_stored_paths(&conn, table, "path", &mut stored_paths).await?;
+        }
+        collect_stored_paths(&conn, "code_references", "target_path", &mut stored_paths).await?;
+
+        let missing_paths = stored_paths
+            .into_iter()
+            .filter(|path| !root.join(path).exists())
+            .collect::<Vec<_>>();
+        if missing_paths.is_empty() {
+            return Ok(PruneSummary::default());
+        }
+
+        let mut summary = PruneSummary::default();
+        for path in &missing_paths {
+            summary.discovered_files += conn
+                .execute(
+                    "DELETE FROM discovered_files WHERE project_id = ?1 AND path = ?2",
+                    params![LOCAL_PROJECT_ID, path.clone()],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            summary.symbols += conn
+                .execute(
+                    "DELETE FROM code_symbols WHERE project_id = ?1 AND path = ?2",
+                    params![LOCAL_PROJECT_ID, path.clone()],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            summary.references += conn
+                .execute(
+                    "DELETE FROM code_references WHERE project_id = ?1 AND (path = ?2 OR target_path = ?2)",
+                    params![LOCAL_PROJECT_ID, path.clone()],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+
+        summary.missing_paths = missing_paths.len();
+        Ok(summary)
     }
 
     pub async fn symbols_for_target(
@@ -10487,6 +10556,25 @@ fn now_ms() -> Result<i64, String> {
     i64::try_from(millis).map_err(|error| error.to_string())
 }
 
+async fn collect_stored_paths(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    paths: &mut HashSet<String>,
+) -> Result<(), String> {
+    // `table` and `column` are fixed internal literals, never user input.
+    let sql = format!("SELECT DISTINCT {column} FROM {table} WHERE project_id = ?1");
+    let mut rows = conn
+        .query(&sql, params![LOCAL_PROJECT_ID])
+        .await
+        .map_err(|error| error.to_string())?;
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        let path = row.get::<String>(0).map_err(|error| error.to_string())?;
+        paths.insert(path);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -12524,6 +12612,109 @@ mod tests {
         assert!(outbound.is_empty());
         assert_eq!(file_outbound.len(), 1);
         assert_eq!(file_outbound[0].target_name, "run_after_config");
+    }
+
+    #[tokio::test]
+    async fn prune_missing_index_rows_removes_deleted_files_and_dangling_references() {
+        let test = TestStore::new("prune_missing");
+        // The kept file exists on disk; the moved-away file does not.
+        let kept_dir = test.workspace.join("src");
+        fs::create_dir_all(&kept_dir).unwrap();
+        fs::write(kept_dir.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let kept = FileCandidate {
+            path: "src/main.rs".to_string(),
+            score: 0,
+            language: Some("rust".to_string()),
+            size_bytes: Some(80),
+        };
+        let deleted = FileCandidate {
+            path: "src/deleted.rs".to_string(),
+            score: 0,
+            language: Some("rust".to_string()),
+            size_bytes: Some(120),
+        };
+        let kept_symbol = CodeSymbol {
+            path: kept.path.clone(),
+            language: kept.language.clone(),
+            name: "main".to_string(),
+            kind: "function".to_string(),
+            line_start: 1,
+            line_end: Some(1),
+            signature: "fn main()".to_string(),
+        };
+        let deleted_symbol = CodeSymbol {
+            path: deleted.path.clone(),
+            language: deleted.language.clone(),
+            name: "gone_helper".to_string(),
+            kind: "function".to_string(),
+            line_start: 1,
+            line_end: Some(3),
+            signature: "fn gone_helper()".to_string(),
+        };
+        // A dangling edge: the kept file references a symbol in the deleted file.
+        let dangling_reference = CodeReference {
+            path: kept.path.clone(),
+            language: kept.language.clone(),
+            target_path: deleted.path.clone(),
+            target_name: "gone_helper".to_string(),
+            target_kind: "function".to_string(),
+            kind: "call".to_string(),
+            line_start: 1,
+            excerpt: "gone_helper();".to_string(),
+        };
+
+        test.store
+            .record_discovered_files(&[kept.clone(), deleted.clone()])
+            .await
+            .unwrap();
+        test.store
+            .record_code_index(
+                &[kept, deleted],
+                &[kept_symbol.clone(), deleted_symbol],
+                &[dangling_reference],
+            )
+            .await
+            .unwrap();
+
+        let summary = test
+            .store
+            .prune_missing_index_rows(&test.workspace)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.missing_paths, 1);
+        assert_eq!(summary.symbols, 1);
+        assert_eq!(summary.discovered_files, 1);
+        // Removes both the deleted file's own row (none here) and the dangling edge.
+        assert_eq!(summary.references, 1);
+
+        // The kept file's symbol survives; the deleted file's symbol is gone.
+        let kept_matches = test.store.symbols_for_target("main", 5).await.unwrap();
+        assert_eq!(kept_matches, vec![kept_symbol]);
+        assert!(
+            test.store
+                .symbols_for_target("gone_helper", 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // The dangling reference from the kept file is gone.
+        assert!(
+            test.store
+                .references_from_path("src/main.rs", 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A second prune with nothing missing is a no-op.
+        let second = test
+            .store
+            .prune_missing_index_rows(&test.workspace)
+            .await
+            .unwrap();
+        assert!(second.is_empty());
     }
 
     #[tokio::test]
