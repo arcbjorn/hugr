@@ -925,6 +925,64 @@ fn move_symbol_allows_kotlin_same_package_type_references_and_refreshes_index() 
 }
 
 #[test]
+fn move_symbol_rewrites_kotlin_cross_package_imports() {
+    let hugr = env!("CARGO_BIN_EXE_hugr");
+    let workspace = temp_workspace("move_symbol_kotlin_cross_package");
+    fs::create_dir_all(workspace.join("src/plugin")).expect("plugin dir");
+    fs::create_dir_all(workspace.join("src/other")).expect("other dir");
+    fs::create_dir_all(workspace.join("src/app")).expect("app dir");
+    let source = workspace.join("src/plugin/Hooks.kt");
+    let destination = workspace.join("src/other/Helper.kt");
+    let caller = workspace.join("src/app/Caller.kt");
+    fs::write(&source, "package plugin\n\nclass Helper\n").expect("source written");
+    fs::write(&destination, "package other\n\nclass Existing\n").expect("destination written");
+    fs::write(
+        &caller,
+        "package app\n\nimport plugin.Helper\n\nclass Caller {\n    val helper = Helper()\n}\n",
+    )
+    .expect("caller written");
+
+    let init = run_local_hugr(hugr, &workspace, &["init"]);
+    assert!(init.status.success(), "init failed: {init:?}");
+
+    let moved = run_local_hugr(
+        hugr,
+        &workspace,
+        &[
+            "move-symbol",
+            "--json",
+            "--rewrite-references",
+            "--kind",
+            "class",
+            "src/plugin/Hooks.kt",
+            "Helper",
+            "src/other/Helper.kt",
+        ],
+    );
+    assert!(moved.status.success(), "move failed: {moved:?}");
+
+    let edited_caller = fs::read_to_string(&caller).unwrap();
+    assert!(
+        edited_caller.contains("import other.Helper"),
+        "caller import should be rewritten: {edited_caller}"
+    );
+    assert!(
+        !edited_caller.contains("import plugin.Helper"),
+        "old caller import should be gone: {edited_caller}"
+    );
+
+    let edited_destination = fs::read_to_string(&destination).unwrap();
+    assert!(edited_destination.contains("class Helper"));
+
+    let symbols = run_local_hugr(hugr, &workspace, &["symbols", "--json", "Helper"]);
+    assert!(symbols.status.success());
+    let symbols_json = String::from_utf8(symbols.stdout).unwrap();
+    assert!(symbols_json.contains("\"path\":\"src/other/Helper.kt\""));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
 fn move_symbol_allows_swift_same_module_type_references_and_refreshes_index() {
     let hugr = env!("CARGO_BIN_EXE_hugr");
     let workspace = temp_workspace("move_symbol_swift_same_module");
