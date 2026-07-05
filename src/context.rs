@@ -14,6 +14,7 @@ const VERY_LARGE_SYMBOL_LINE_THRESHOLD: i64 = 200;
 const REFACTOR_SURFACE_FILE_THRESHOLD: usize = 3;
 const LONG_PARAMETER_LIST_THRESHOLD: usize = 5;
 const VERY_LONG_PARAMETER_LIST_THRESHOLD: usize = 8;
+const HIGH_FAN_IN_FILE_THRESHOLD: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextPack {
@@ -1390,6 +1391,10 @@ fn build_risk_signals(
         signals.push(signal);
     }
 
+    if let Some(signal) = high_fan_in_signal(symbols, graph_neighbors) {
+        signals.push(signal);
+    }
+
     let edit_after_context = freshness_signals
         .iter()
         .filter(|signal| signal.kind == "edit_after_context")
@@ -1741,6 +1746,83 @@ fn incoming_reference_count(
                 && neighbor.target_name.as_deref() == Some(symbol.name.as_str())
         })
         .count()
+}
+
+/// Counts the distinct files that reference `symbol`. Fan-in by file is a better
+/// blast-radius measure than raw edge count, since many calls from one file are
+/// lower risk than the same symbol reached from many files.
+fn incoming_reference_file_count(
+    symbol: &ContextSymbol,
+    graph_neighbors: &[ContextGraphNeighbor],
+) -> usize {
+    graph_neighbors
+        .iter()
+        .filter(|neighbor| neighbor.kind == "incoming_reference")
+        .filter(|neighbor| {
+            neighbor.target_path.as_deref() == Some(symbol.path.as_str())
+                && neighbor.target_name.as_deref() == Some(symbol.name.as_str())
+        })
+        .filter_map(|neighbor| neighbor.path.as_deref())
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// Flags symbols reached from many distinct files, warning that a change has a
+/// wide blast radius. Distinct from `public_api_surface` (which fires on public
+/// symbols regardless of caller count) because it fires on any heavily-referenced
+/// symbol, including private ones.
+fn high_fan_in_signal(
+    symbols: &[ContextSymbol],
+    graph_neighbors: &[ContextGraphNeighbor],
+) -> Option<ContextRiskSignal> {
+    let mut hot_symbols = symbols
+        .iter()
+        .map(|symbol| {
+            (
+                incoming_reference_file_count(symbol, graph_neighbors),
+                symbol,
+            )
+        })
+        .filter(|(file_count, _)| *file_count >= HIGH_FAN_IN_FILE_THRESHOLD)
+        .collect::<Vec<_>>();
+    if hot_symbols.is_empty() {
+        return None;
+    }
+
+    hot_symbols.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.path.cmp(&right.1.path))
+            .then_with(|| left.1.name.cmp(&right.1.name))
+    });
+
+    let highest = hot_symbols.first().map(|(count, _)| *count)?;
+    let summaries = hot_symbols
+        .iter()
+        .map(|(file_count, symbol)| {
+            format!(
+                "{} {} is referenced from {file_count} files at {}:{}",
+                symbol.kind, symbol.name, symbol.path, symbol.line_start
+            )
+        })
+        .collect::<Vec<_>>();
+    let severity = if highest >= HIGH_FAN_IN_FILE_THRESHOLD * 2 {
+        "high"
+    } else {
+        "medium"
+    };
+
+    Some(context_risk_signal(
+        severity,
+        "high_fan_in",
+        format!(
+            "widely-referenced symbols have a large change blast radius: {}",
+            summarize_values(&summaries, 3)
+        ),
+        700 + highest * 20 + hot_symbols.len() * 10,
+        "symbol is referenced from many distinct files in the code graph",
+    ))
 }
 
 fn large_symbol_health_signal(symbols: &[ContextSymbol]) -> Option<ContextRiskSignal> {
@@ -2665,6 +2747,104 @@ mod tests {
         assert!(risk_kinds.contains(&"refactor_surface"));
         assert!(markdown.contains("risk:refactor_surface [risk]"));
         assert!(markdown.contains("code graph references span 3 files"));
+    }
+
+    #[test]
+    fn widely_referenced_symbols_render_as_high_fan_in_risks() {
+        let neighbor = |path: &str, line: i64| GraphNeighbor {
+            kind: "incoming_reference".to_string(),
+            label: format!("{path}:{line} references function hot_symbol"),
+            detail: "call reference to function hot_symbol".to_string(),
+            path: Some(path.to_string()),
+            target_path: Some("src/core.rs".to_string()),
+            target_name: Some("hot_symbol".to_string()),
+            line_start: Some(line),
+        };
+        let pack =
+            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
+                "change hot symbol",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![CodeSymbol {
+                    path: "src/core.rs".to_string(),
+                    language: Some("rust".to_string()),
+                    name: "hot_symbol".to_string(),
+                    kind: "function".to_string(),
+                    line_start: 10,
+                    line_end: Some(14),
+                    signature: "fn hot_symbol()".to_string(),
+                }],
+                Vec::new(),
+                None,
+                Vec::new(),
+                vec![
+                    neighbor("src/a.rs", 4),
+                    neighbor("src/b.rs", 9),
+                    neighbor("src/c.rs", 2),
+                ],
+                Vec::new(),
+                Vec::new(),
+            );
+
+        let markdown = pack.render_markdown();
+        let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
+        let risk_kinds = parsed["risk_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|risk| risk["kind"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(risk_kinds.contains(&"high_fan_in"));
+        assert!(markdown.contains("risk:high_fan_in [risk]"));
+        assert!(markdown.contains("hot_symbol is referenced from 3 files"));
+    }
+
+    #[test]
+    fn narrowly_referenced_symbols_do_not_flag_high_fan_in() {
+        // Three references but all from the same file: low blast radius.
+        let neighbor = |line: i64| GraphNeighbor {
+            kind: "incoming_reference".to_string(),
+            label: format!("src/only.rs:{line} references function warm_symbol"),
+            detail: "call reference to function warm_symbol".to_string(),
+            path: Some("src/only.rs".to_string()),
+            target_path: Some("src/core.rs".to_string()),
+            target_name: Some("warm_symbol".to_string()),
+            line_start: Some(line),
+        };
+        let pack =
+            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
+                "change warm symbol",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![CodeSymbol {
+                    path: "src/core.rs".to_string(),
+                    language: Some("rust".to_string()),
+                    name: "warm_symbol".to_string(),
+                    kind: "function".to_string(),
+                    line_start: 10,
+                    line_end: Some(14),
+                    signature: "fn warm_symbol()".to_string(),
+                }],
+                Vec::new(),
+                None,
+                Vec::new(),
+                vec![neighbor(3), neighbor(4), neighbor(5)],
+                Vec::new(),
+                Vec::new(),
+            );
+
+        let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
+        let risk_kinds = parsed["risk_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|risk| risk["kind"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(!risk_kinds.contains(&"high_fan_in"));
     }
 
     #[test]
