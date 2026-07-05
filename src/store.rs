@@ -1424,6 +1424,35 @@ impl Store {
         Ok(finalize_test_candidates(candidates, limit))
     }
 
+    pub async fn source_embedding_file_candidates(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<FileCandidate>, String> {
+        if limit == 0 || query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let storage_config = self.storage_config()?.clone();
+        if uses_remote_only_hugr_api_transport(&storage_config) {
+            return source_embedding_file_candidates_via_hugr_api(
+                &storage_config,
+                self.embedding_provider()?,
+                query,
+                limit,
+            );
+        }
+
+        if !self.exists() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.connect().await?;
+        migrations::migrate(&conn).await?;
+        local_source_embedding_file_candidates(&conn, self.embedding_provider()?, query, limit)
+            .await
+    }
+
     pub async fn recall_symbols(
         &self,
         query: &str,
@@ -4682,6 +4711,71 @@ fn likely_tests_for_files_via_hugr_api(
         testmap::likely_tests_for_files(files, &known_files, limit),
     );
     Ok(finalize_test_candidates(candidates, limit))
+}
+
+fn source_embedding_file_candidates_via_hugr_api(
+    config: &StorageConfig,
+    embedding_provider: &SelectedEmbeddingProvider,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<FileCandidate>, String> {
+    if limit == 0 || query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let snapshot = fetch_hugr_api_storage_snapshot(config)?;
+    let embedding = embedding_provider.embed(query)?;
+    let dimensions = i64::try_from(embedding.dimensions()).map_err(|error| error.to_string())?;
+    let discovered_files = storage_discovered_files(&snapshot)?
+        .into_iter()
+        .map(|file| (file.path.clone(), file))
+        .collect::<HashMap<_, _>>();
+    let mut ranked = Vec::<(f32, String, Option<String>, Option<u64>)>::new();
+
+    for value in storage_payload_records(&snapshot, SyncTableKind::SourceEmbeddings) {
+        let record = source_embedding_sync_record_from_value(&value)?;
+        if record.model != embedding.model || record.dimensions != dimensions {
+            continue;
+        }
+        let vector = f32_blob_to_vector(&record.embedding)?;
+        if vector.len() != embedding.vector.len() {
+            continue;
+        }
+        let score = cosine_like_score(&embedding.vector, &vector);
+        if !score.is_finite() {
+            continue;
+        }
+        let discovered = discovered_files.get(&record.path);
+        let size_bytes = discovered
+            .and_then(|file| file.size_bytes)
+            .and_then(|bytes| u64::try_from(bytes).ok());
+        ranked.push((
+            score,
+            record.path,
+            discovered.and_then(|file| file.language.clone()),
+            size_bytes,
+        ));
+    }
+
+    ranked.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    ranked.truncate(limit);
+    Ok(ranked
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, (_score, path, language, size_bytes))| FileCandidate {
+                path,
+                score: crate::discovery::source_embedding_score(index + 1),
+                language,
+                size_bytes,
+            },
+        )
+        .collect())
 }
 
 fn recall_symbols_via_hugr_api(
@@ -11445,6 +11539,93 @@ fn finalize_test_candidates(candidates: Vec<TestCandidate>, limit: usize) -> Vec
     ranked
 }
 
+async fn local_source_embedding_file_candidates(
+    conn: &Connection,
+    embedding_provider: &SelectedEmbeddingProvider,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<FileCandidate>, String> {
+    if limit == 0 || query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let embedding = embedding_provider.embed(query)?;
+    let query_vector = embedding.to_vector_literal();
+    let dimensions = i64::try_from(embedding.dimensions()).map_err(|error| error.to_string())?;
+    let candidate_limit = i64::try_from(limit.max(50)).map_err(|error| error.to_string())?;
+    let mut rows = conn
+        .query(
+            "
+            WITH vector_matches AS (
+                SELECT id, row_number() OVER () AS vector_rank
+                FROM vector_top_k('source_embeddings_vector_idx', ?1, ?2)
+            )
+            SELECT
+                e.path,
+                d.language,
+                d.size_bytes,
+                vector_matches.vector_rank
+            FROM vector_matches
+            JOIN source_embeddings AS e ON e.rowid = vector_matches.id
+            LEFT JOIN discovered_files AS d
+              ON d.project_id = e.project_id AND d.path = e.path
+            WHERE e.project_id = ?3
+              AND e.model = ?4
+              AND e.dimensions = ?5
+            ORDER BY vector_matches.vector_rank
+            LIMIT ?6
+            ",
+            params![
+                query_vector,
+                candidate_limit,
+                LOCAL_PROJECT_ID,
+                embedding.model,
+                dimensions,
+                i64::try_from(limit).map_err(|error| error.to_string())?
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let mut candidates = Vec::new();
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        let rank = usize::try_from(row.get::<i64>(3).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        let size_bytes = row
+            .get::<Option<i64>>(2)
+            .map_err(|error| error.to_string())?
+            .and_then(|bytes| u64::try_from(bytes).ok());
+        candidates.push(FileCandidate {
+            path: row.get::<String>(0).map_err(|error| error.to_string())?,
+            language: row
+                .get::<Option<String>>(1)
+                .map_err(|error| error.to_string())?,
+            size_bytes,
+            score: crate::discovery::source_embedding_score(rank),
+        });
+    }
+
+    Ok(candidates)
+}
+
+fn f32_blob_to_vector(blob: &[u8]) -> Result<Vec<f32>, String> {
+    if !blob.len().is_multiple_of(4) {
+        return Err("source embedding blob length is not divisible by 4".to_string());
+    }
+
+    Ok(blob
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+fn cosine_like_score(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| left * right)
+        .sum()
+}
+
 async fn refresh_source_embeddings_for_files(
     conn: &Connection,
     files: &[FileCandidate],
@@ -11695,7 +11876,7 @@ mod tests {
         sync_table_result_value, table_row_count,
     };
     use crate::code::{CodeReference, CodeSymbol};
-    use crate::discovery::FileCandidate;
+    use crate::discovery::{self, FileCandidate};
     use crate::embedding::{
         DEFAULT_EMBEDDING_DIMENSIONS, DETERMINISTIC_MODEL, SelectedEmbeddingProvider,
     };
@@ -13738,6 +13919,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(likely[0].path, "tests/plugin_hooks.rs");
+    }
+
+    #[tokio::test]
+    async fn source_embedding_file_candidates_match_symbol_summaries() {
+        let test = TestStore::new("source_embedding_candidates");
+        let file = FileCandidate {
+            path: "src/payments.rs".to_string(),
+            score: 0,
+            language: Some("rust".to_string()),
+            size_bytes: Some(160),
+        };
+        let symbol = CodeSymbol {
+            path: file.path.clone(),
+            language: file.language.clone(),
+            name: "InvoiceLedger".to_string(),
+            kind: "struct".to_string(),
+            line_start: 4,
+            line_end: Some(6),
+            signature: "pub struct InvoiceLedger".to_string(),
+        };
+
+        test.store
+            .record_discovered_files(std::slice::from_ref(&file))
+            .await
+            .unwrap();
+        test.store
+            .record_code_index(
+                std::slice::from_ref(&file),
+                std::slice::from_ref(&symbol),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let candidates = test
+            .store
+            .source_embedding_file_candidates("invoice ledger balancing", 5)
+            .await
+            .unwrap();
+
+        assert_eq!(candidates[0].path, "src/payments.rs");
+        assert_eq!(candidates[0].language.as_deref(), Some("rust"));
+        assert!(discovery::source_embedding_rank(candidates[0].score).is_some());
     }
 
     #[tokio::test]
