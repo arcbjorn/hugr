@@ -587,7 +587,7 @@ fn tools() -> Vec<Value> {
         ),
         tool_schema(
             "hugr_move_symbol",
-            "Safely move one unreferenced local symbol from a source file to a destination file. Refuses inbound references, language mismatches, destination collisions, and files that fail to parse after the move.",
+            "Safely move one local symbol from a source file to a destination file. With rewrite_references, rewrites or validates supported inbound references; otherwise refuses referenced symbols. Refuses language mismatches, destination collisions, and files that fail to parse after the move.",
             &[
                 ("source_path", "string"),
                 ("name", "string"),
