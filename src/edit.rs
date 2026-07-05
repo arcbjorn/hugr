@@ -496,8 +496,30 @@ fn plan_reference_rewrites(
         );
     }
 
+    if matches!(source_language, Some("typescript" | "javascript"))
+        && source_language == destination_language
+    {
+        let old_reference = format!("{}#{}", target.path, target.name);
+        return rewrite_reference_files(
+            target,
+            references_by_path,
+            reference_contents,
+            &old_reference,
+            |path, contents, line_numbers| {
+                rewrite_javascript_references_on_lines(
+                    path,
+                    contents,
+                    &target.path,
+                    destination_path,
+                    &target.name,
+                    line_numbers,
+                )
+            },
+        );
+    }
+
     Err(
-        "move-symbol --rewrite-references currently supports Rust and Python source files only"
+        "move-symbol --rewrite-references currently supports Rust, Python, TypeScript, and JavaScript source files only"
             .to_string(),
     )
 }
@@ -1529,6 +1551,529 @@ fn python_attr_boundary_before(char: Option<char>) -> bool {
 
 fn python_attr_boundary_after(char: Option<char>) -> bool {
     char.is_none_or(|char| !(char.is_alphanumeric() || char == '_'))
+}
+
+fn rewrite_javascript_references_on_lines(
+    path: &str,
+    contents: &str,
+    source_path: &str,
+    destination_path: &str,
+    symbol_name: &str,
+    line_numbers: &BTreeSet<i64>,
+) -> Result<(String, usize), String> {
+    let trailing_newline = contents.ends_with('\n');
+    let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
+    let namespace_aliases = javascript_namespace_aliases_for_source(&lines, path, source_path);
+    let used_namespace_aliases =
+        javascript_used_namespace_aliases(&lines, line_numbers, &namespace_aliases, symbol_name)?;
+    let mut replacement_count = rewrite_javascript_namespace_import_lines(
+        &mut lines,
+        path,
+        source_path,
+        destination_path,
+        &used_namespace_aliases,
+    );
+
+    for line_number in line_numbers.iter().rev() {
+        if *line_number < 1 {
+            return Err(format!(
+                "move-symbol reference line {line_number} in {path} is invalid"
+            ));
+        }
+        let index = usize::try_from(line_number - 1).map_err(|error| error.to_string())?;
+        let Some(line) = lines.get(index) else {
+            return Err(format!(
+                "move-symbol reference line {line_number} is past end of {path}"
+            ));
+        };
+        let (rewritten, line_replacements) = rewrite_javascript_reference_line(
+            line,
+            path,
+            source_path,
+            destination_path,
+            symbol_name,
+        );
+        if line_replacements > 0 {
+            lines.splice(index..=index, rewritten);
+            replacement_count += line_replacements;
+        }
+    }
+
+    let mut rendered = lines.join("\n");
+    if trailing_newline {
+        rendered.push('\n');
+    }
+    Ok((rendered, replacement_count))
+}
+
+fn javascript_used_namespace_aliases(
+    lines: &[String],
+    line_numbers: &BTreeSet<i64>,
+    namespace_aliases: &BTreeSet<String>,
+    symbol_name: &str,
+) -> Result<BTreeSet<String>, String> {
+    let mut used_aliases = BTreeSet::new();
+    for line_number in line_numbers {
+        if *line_number < 1 {
+            return Err(format!(
+                "move-symbol reference line {line_number} is invalid"
+            ));
+        }
+        let index = usize::try_from(line_number - 1).map_err(|error| error.to_string())?;
+        let Some(line) = lines.get(index) else {
+            return Err(format!(
+                "move-symbol reference line {line_number} is past end"
+            ));
+        };
+        for alias in namespace_aliases {
+            if javascript_line_has_member_reference(line, alias, symbol_name) {
+                used_aliases.insert(alias.clone());
+            }
+        }
+    }
+    Ok(used_aliases)
+}
+
+fn rewrite_javascript_reference_line(
+    line: &str,
+    reference_path: &str,
+    source_path: &str,
+    destination_path: &str,
+    symbol_name: &str,
+) -> (Vec<String>, usize) {
+    if let Some((rewritten, replacements)) = rewrite_javascript_named_import_line(
+        line,
+        reference_path,
+        source_path,
+        destination_path,
+        symbol_name,
+    ) {
+        return (rewritten, replacements);
+    }
+
+    (vec![line.to_string()], 0)
+}
+
+fn rewrite_javascript_named_import_line(
+    line: &str,
+    reference_path: &str,
+    source_path: &str,
+    destination_path: &str,
+    symbol_name: &str,
+) -> Option<(Vec<String>, usize)> {
+    if javascript_import_line_is_unsupported(line) {
+        return None;
+    }
+    let parts = javascript_named_import_parts(line)?;
+    if !javascript_module_spec_targets_path(&parts.module_spec, reference_path, source_path) {
+        return None;
+    }
+
+    let new_module_spec = javascript_module_spec_for_destination(
+        reference_path,
+        destination_path,
+        &parts.module_spec,
+    )?;
+    let mut moved_items = Vec::new();
+    let mut kept_items = Vec::new();
+    for item in parts.items {
+        if javascript_import_item_name(&item) == symbol_name {
+            moved_items.push(item);
+        } else {
+            kept_items.push(item);
+        }
+    }
+    if moved_items.is_empty() {
+        return None;
+    }
+
+    let mut rewritten = Vec::new();
+    if !kept_items.is_empty() {
+        rewritten.push(render_javascript_named_import_line(
+            &parts.leading,
+            &parts.import_keyword,
+            &kept_items,
+            &parts.quote,
+            &parts.module_spec,
+            &parts.suffix,
+        ));
+    }
+    rewritten.push(render_javascript_named_import_line(
+        &parts.leading,
+        &parts.import_keyword,
+        &moved_items,
+        &parts.quote,
+        &new_module_spec,
+        &parts.suffix,
+    ));
+    Some((rewritten, moved_items.len()))
+}
+
+fn rewrite_javascript_namespace_import_lines(
+    lines: &mut [String],
+    reference_path: &str,
+    source_path: &str,
+    destination_path: &str,
+    used_aliases: &BTreeSet<String>,
+) -> usize {
+    if used_aliases.is_empty() {
+        return 0;
+    }
+
+    let mut replacement_count = 0;
+    for line in lines {
+        if javascript_import_line_is_unsupported(line) {
+            continue;
+        }
+        let Some(parts) = javascript_namespace_import_parts(line) else {
+            continue;
+        };
+        if !used_aliases.contains(&parts.alias)
+            || !javascript_module_spec_targets_path(&parts.module_spec, reference_path, source_path)
+        {
+            continue;
+        }
+        let Some(new_module_spec) = javascript_module_spec_for_destination(
+            reference_path,
+            destination_path,
+            &parts.module_spec,
+        ) else {
+            continue;
+        };
+        *line = render_javascript_namespace_import_line(
+            &parts.leading,
+            &parts.alias,
+            &parts.quote,
+            &new_module_spec,
+            &parts.suffix,
+        );
+        replacement_count += 1;
+    }
+    replacement_count
+}
+
+fn javascript_namespace_aliases_for_source(
+    lines: &[String],
+    reference_path: &str,
+    source_path: &str,
+) -> BTreeSet<String> {
+    let mut aliases = BTreeSet::new();
+    for line in lines {
+        if javascript_import_line_is_unsupported(line) {
+            continue;
+        }
+        let Some(parts) = javascript_namespace_import_parts(line) else {
+            continue;
+        };
+        if javascript_module_spec_targets_path(&parts.module_spec, reference_path, source_path) {
+            aliases.insert(parts.alias);
+        }
+    }
+    aliases
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JavascriptNamedImportParts {
+    leading: String,
+    import_keyword: String,
+    items: Vec<String>,
+    quote: String,
+    module_spec: String,
+    suffix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JavascriptNamespaceImportParts {
+    leading: String,
+    alias: String,
+    quote: String,
+    module_spec: String,
+    suffix: String,
+}
+
+fn javascript_named_import_parts(line: &str) -> Option<JavascriptNamedImportParts> {
+    let trimmed = line.trim_start();
+    let leading = line[..line.len().saturating_sub(trimmed.len())].to_string();
+    let (import_keyword, rest) = javascript_import_keyword_and_rest(trimmed)?;
+    let rest = rest.trim_start();
+    let after_open = rest.strip_prefix('{')?;
+    let close_index = after_open.find('}')?;
+    let item_text = &after_open[..close_index];
+    let after_brace = after_open[close_index + 1..].trim_start();
+    let after_from = after_brace.strip_prefix("from")?.trim_start();
+    let (quote, module_spec, suffix) = javascript_module_spec_parts(after_from)?;
+    Some(JavascriptNamedImportParts {
+        leading,
+        import_keyword,
+        items: split_javascript_import_items(item_text)?,
+        quote,
+        module_spec,
+        suffix,
+    })
+}
+
+fn javascript_namespace_import_parts(line: &str) -> Option<JavascriptNamespaceImportParts> {
+    let trimmed = line.trim_start();
+    let leading = line[..line.len().saturating_sub(trimmed.len())].to_string();
+    let rest = trimmed.strip_prefix("import ")?.trim_start();
+    let rest = rest.strip_prefix("*")?.trim_start();
+    let rest = rest.strip_prefix("as")?.trim_start();
+    let (alias, after_alias) = split_javascript_identifier(rest)?;
+    let after_from = after_alias.trim_start().strip_prefix("from")?.trim_start();
+    let (quote, module_spec, suffix) = javascript_module_spec_parts(after_from)?;
+    Some(JavascriptNamespaceImportParts {
+        leading,
+        alias: alias.to_string(),
+        quote,
+        module_spec,
+        suffix,
+    })
+}
+
+fn javascript_import_keyword_and_rest(trimmed: &str) -> Option<(String, &str)> {
+    for keyword in ["import type", "import", "export type", "export"] {
+        if let Some(rest) = trimmed.strip_prefix(keyword)
+            && rest.starts_with(char::is_whitespace)
+        {
+            return Some((keyword.to_string(), rest));
+        }
+    }
+    None
+}
+
+fn javascript_module_spec_parts(value: &str) -> Option<(String, String, String)> {
+    let value = value.trim_start();
+    let quote = value.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let after_quote = &value[quote.len_utf8()..];
+    let end_quote = after_quote.find(quote)?;
+    let module_spec = after_quote[..end_quote].to_string();
+    let suffix = after_quote[end_quote + quote.len_utf8()..].trim();
+    if suffix != ";" && !suffix.is_empty() {
+        return None;
+    }
+    Some((quote.to_string(), module_spec, suffix.to_string()))
+}
+
+fn split_javascript_import_items(items: &str) -> Option<Vec<String>> {
+    let parsed = items
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if parsed.is_empty()
+        || parsed
+            .iter()
+            .any(|item| item.contains('{') || item.contains('}'))
+    {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+fn split_javascript_identifier(value: &str) -> Option<(&str, &str)> {
+    let trimmed = value.trim_start();
+    let mut end = 0usize;
+    for (index, char) in trimmed.char_indices() {
+        if index == 0 {
+            if !(char.is_ascii_alphabetic() || char == '_' || char == '$') {
+                return None;
+            }
+            end = char.len_utf8();
+            continue;
+        }
+        if char.is_ascii_alphanumeric() || char == '_' || char == '$' {
+            end = index + char.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        None
+    } else {
+        Some((&trimmed[..end], &trimmed[end..]))
+    }
+}
+
+fn render_javascript_named_import_line(
+    leading: &str,
+    import_keyword: &str,
+    items: &[String],
+    quote: &str,
+    module_spec: &str,
+    suffix: &str,
+) -> String {
+    format!(
+        "{leading}{import_keyword} {{ {} }} from {quote}{module_spec}{quote}{suffix}",
+        items.join(", ")
+    )
+}
+
+fn render_javascript_namespace_import_line(
+    leading: &str,
+    alias: &str,
+    quote: &str,
+    module_spec: &str,
+    suffix: &str,
+) -> String {
+    format!("{leading}import * as {alias} from {quote}{module_spec}{quote}{suffix}")
+}
+
+fn javascript_import_line_is_unsupported(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.contains("//")
+        || trimmed.contains("/*")
+        || trimmed.contains('\\')
+        || trimmed.ends_with(',')
+}
+
+fn javascript_import_item_name(item: &str) -> String {
+    let item = item
+        .strip_prefix("type ")
+        .map(str::trim_start)
+        .unwrap_or(item.trim());
+    item.split_once(" as ")
+        .map(|(name, _alias)| name.trim())
+        .unwrap_or(item)
+        .to_string()
+}
+
+fn javascript_line_has_member_reference(
+    line: &str,
+    namespace_alias: &str,
+    symbol_name: &str,
+) -> bool {
+    let member = format!("{namespace_alias}.{symbol_name}");
+    line.match_indices(&member).any(|(index, _)| {
+        let end = index + member.len();
+        javascript_member_boundary_before(line[..index].chars().next_back())
+            && javascript_member_boundary_after(line[end..].chars().next())
+    })
+}
+
+fn javascript_member_boundary_before(char: Option<char>) -> bool {
+    char.is_none_or(|char| !(char.is_alphanumeric() || char == '_' || char == '$' || char == '.'))
+}
+
+fn javascript_member_boundary_after(char: Option<char>) -> bool {
+    char.is_none_or(|char| !(char.is_alphanumeric() || char == '_' || char == '$'))
+}
+
+fn javascript_module_spec_targets_path(
+    spec: &str,
+    reference_path: &str,
+    target_path: &str,
+) -> bool {
+    if !spec.starts_with('.') {
+        return false;
+    }
+    let Some(resolved) = resolve_relative_module_spec(reference_path, spec) else {
+        return false;
+    };
+    let target = normalize_path_string(target_path);
+    let target_without_extension = strip_javascript_extension(&target);
+    resolved == target || resolved == target_without_extension
+}
+
+fn javascript_module_spec_for_destination(
+    reference_path: &str,
+    destination_path: &str,
+    old_spec: &str,
+) -> Option<String> {
+    let include_extension = javascript_spec_includes_extension(old_spec);
+    let mut target = normalize_path_string(destination_path);
+    if !include_extension {
+        target = strip_javascript_extension(&target);
+    }
+    relative_module_spec(reference_path, &target)
+}
+
+fn resolve_relative_module_spec(reference_path: &str, spec: &str) -> Option<String> {
+    let mut segments = path_parent_segments(reference_path);
+    for segment in spec.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            value => segments.push(value.to_string()),
+        }
+    }
+    if segments.is_empty() {
+        None
+    } else {
+        Some(segments.join("/"))
+    }
+}
+
+fn relative_module_spec(reference_path: &str, target_path: &str) -> Option<String> {
+    let from = path_parent_segments(reference_path);
+    let to = path_segments(target_path);
+    if to.is_empty() {
+        return None;
+    }
+
+    let mut common = 0usize;
+    while common < from.len() && common < to.len() && from[common] == to[common] {
+        common += 1;
+    }
+
+    let mut relative = Vec::new();
+    for _ in common..from.len() {
+        relative.push("..".to_string());
+    }
+    relative.extend(to.iter().skip(common).cloned());
+    if relative.is_empty() {
+        return None;
+    }
+    let rendered = relative.join("/");
+    if rendered.starts_with("..") {
+        Some(rendered)
+    } else {
+        Some(format!("./{rendered}"))
+    }
+}
+
+fn path_parent_segments(path: &str) -> Vec<String> {
+    let mut segments = path_segments(path);
+    segments.pop();
+    segments
+}
+
+fn path_segments(path: &str) -> Vec<String> {
+    normalize_path_string(path)
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .map(str::to_string)
+        .collect()
+}
+
+fn normalize_path_string(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn strip_javascript_extension(path: &str) -> String {
+    for extension in [
+        ".d.ts", ".tsx", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".ts", ".js",
+    ] {
+        if let Some(stripped) = path.strip_suffix(extension) {
+            return stripped.to_string();
+        }
+    }
+    path.to_string()
+}
+
+fn javascript_spec_includes_extension(spec: &str) -> bool {
+    let last_segment = spec.rsplit('/').next().unwrap_or(spec);
+    [
+        ".d.ts", ".tsx", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".ts", ".js",
+    ]
+    .iter()
+    .any(|extension| last_segment.ends_with(extension))
 }
 
 fn language_for_path(path: &str) -> Option<&'static str> {
@@ -2620,6 +3165,98 @@ mod tests {
         assert!(caller_file.contents.contains("value = helpers.helper()"));
         assert!(!caller_file.contents.contains("plugin_hooks"));
         assert_eq!(planned.summary.rewritten_reference_count, 2);
+    }
+
+    #[test]
+    fn plans_move_with_typescript_named_import_rewrite() {
+        let source = "export function helper() {\n    return 1;\n}\n\nexport function other() {\n    return 2;\n}\n";
+        let destination = "export function existing() {\n    return 0;\n}\n";
+        let caller = "import { helper as runHelper, other } from \"./pluginHooks\";\n\nconst value = runHelper();\n";
+        let target =
+            resolve_symbol_in_source("src/pluginHooks.ts", source, "helper", None, "move").unwrap();
+        let references = vec![CodeReference {
+            path: "src/main.ts".to_string(),
+            language: Some("typescript".to_string()),
+            target_path: "src/pluginHooks.ts".to_string(),
+            target_name: "helper".to_string(),
+            target_kind: "function".to_string(),
+            kind: "import".to_string(),
+            line_start: 1,
+            excerpt: "import { helper as runHelper, other } from \"./pluginHooks\";".to_string(),
+        }];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "src/helpers.ts",
+            destination,
+            vec![("src/main.ts".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+        let caller_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/main.ts")
+            .unwrap();
+
+        assert!(
+            caller_file
+                .contents
+                .contains("import { other } from \"./pluginHooks\";")
+        );
+        assert!(
+            caller_file
+                .contents
+                .contains("import { helper as runHelper } from \"./helpers\";")
+        );
+        assert!(caller_file.contents.contains("runHelper();"));
+        assert_eq!(planned.summary.rewritten_reference_count, 1);
+    }
+
+    #[test]
+    fn plans_move_with_typescript_namespace_import_rewrite() {
+        let source = "export function helper() {\n    return 1;\n}\n";
+        let destination = "export function existing() {\n    return 0;\n}\n";
+        let caller = "import * as hooks from \"./pluginHooks\";\n\nconst value = hooks.helper();\n";
+        let target =
+            resolve_symbol_in_source("src/pluginHooks.ts", source, "helper", None, "move").unwrap();
+        let references = vec![CodeReference {
+            path: "src/main.ts".to_string(),
+            language: Some("typescript".to_string()),
+            target_path: "src/pluginHooks.ts".to_string(),
+            target_name: "helper".to_string(),
+            target_kind: "function".to_string(),
+            kind: "call".to_string(),
+            line_start: 3,
+            excerpt: "const value = hooks.helper();".to_string(),
+        }];
+
+        let planned = plan_move(
+            &target,
+            &references,
+            source,
+            "src/helpers.ts",
+            destination,
+            vec![("src/main.ts".to_string(), caller.to_string())],
+            true,
+        )
+        .unwrap();
+        let caller_file = planned
+            .files
+            .iter()
+            .find(|file| file.path == "src/main.ts")
+            .unwrap();
+
+        assert!(
+            caller_file
+                .contents
+                .contains("import * as hooks from \"./helpers\";")
+        );
+        assert!(caller_file.contents.contains("hooks.helper();"));
+        assert!(!caller_file.contents.contains("./pluginHooks"));
+        assert_eq!(planned.summary.rewritten_reference_count, 1);
     }
 
     #[test]
