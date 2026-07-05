@@ -745,6 +745,70 @@ fn move_symbol_rewrites_javascript_references_and_refreshes_index() {
 }
 
 #[test]
+fn move_symbol_rewrites_commonjs_references_and_exports() {
+    let hugr = env!("CARGO_BIN_EXE_hugr");
+    let workspace = temp_workspace("move_symbol_commonjs_rewrite");
+    let source = workspace.join("pluginHooks.js");
+    let destination = workspace.join("helpers.js");
+    let main = workspace.join("main.js");
+    fs::write(
+        &source,
+        "function helper() {\n    return 1;\n}\n\nfunction other() {\n    return 2;\n}\n\nmodule.exports = { helper, other };\n",
+    )
+    .expect("source file should be written");
+    fs::write(
+        &destination,
+        "function existing() {\n    return 0;\n}\n\nmodule.exports = { existing };\n",
+    )
+    .expect("destination should be written");
+    fs::write(
+        &main,
+        "const { helper: runHelper, other } = require(\"./pluginHooks.js\");\nconst hooks = require(\"./pluginHooks.js\");\nconst direct = require(\"./pluginHooks.js\").helper;\n\nconst value = runHelper() + hooks.helper() + direct();\n",
+    )
+    .expect("main source should be written");
+
+    let init = run_local_hugr(hugr, &workspace, &["init"]);
+    assert!(init.status.success(), "init failed: {init:?}");
+
+    let moved = run_local_hugr(
+        hugr,
+        &workspace,
+        &[
+            "move-symbol",
+            "--json",
+            "--rewrite-references",
+            "--kind",
+            "function",
+            "pluginHooks.js",
+            "helper",
+            "helpers.js",
+        ],
+    );
+    assert!(moved.status.success(), "move failed: {moved:?}");
+    let moved_json = String::from_utf8(moved.stdout).unwrap();
+    assert!(moved_json.contains("\"rewritten_reference_count\":5"));
+
+    let edited_source = fs::read_to_string(&source).unwrap();
+    let edited_destination = fs::read_to_string(&destination).unwrap();
+    let edited_main = fs::read_to_string(&main).unwrap();
+    assert!(!edited_source.contains("function helper"));
+    assert!(edited_source.contains("module.exports = { other };"));
+    assert!(edited_destination.contains("function helper()"));
+    assert!(edited_destination.contains("module.exports = { existing, helper };"));
+    assert!(edited_main.contains("const { other } = require(\"./pluginHooks.js\");"));
+    assert!(edited_main.contains("const { helper: runHelper } = require(\"./helpers.js\");"));
+    assert!(edited_main.contains("const hooks = require(\"./helpers.js\");"));
+    assert!(edited_main.contains("const direct = require(\"./helpers.js\").helper;"));
+
+    let symbols = run_local_hugr(hugr, &workspace, &["symbols", "--json", "helper"]);
+    assert!(symbols.status.success(), "symbols failed: {symbols:?}");
+    let symbols_json = String::from_utf8(symbols.stdout).unwrap();
+    assert!(symbols_json.contains("\"path\":\"helpers.js\""));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
 fn move_symbol_allows_go_same_package_references_and_refreshes_index() {
     let hugr = env!("CARGO_BIN_EXE_hugr");
     let workspace = temp_workspace("move_symbol_go_same_package");
@@ -802,6 +866,73 @@ fn move_symbol_allows_go_same_package_references_and_refreshes_index() {
     assert!(symbols.status.success(), "symbols failed: {symbols:?}");
     let symbols_json = String::from_utf8(symbols.stdout).unwrap();
     assert!(symbols_json.contains("\"path\":\"plugin/helpers.go\""));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn move_symbol_rewrites_go_cross_package_imports_with_module_path() {
+    let hugr = env!("CARGO_BIN_EXE_hugr");
+    let workspace = temp_workspace("move_symbol_go_cross_package");
+    fs::create_dir_all(workspace.join("plugin")).expect("plugin dir");
+    fs::create_dir_all(workspace.join("helpers")).expect("helpers dir");
+    fs::create_dir_all(workspace.join("app")).expect("app dir");
+    let source = workspace.join("plugin/hooks.go");
+    let destination = workspace.join("helpers/helpers.go");
+    let caller = workspace.join("app/caller.go");
+    fs::write(workspace.join("go.mod"), "module example.com/hugrtest\n")
+        .expect("go.mod should be written");
+    fs::write(
+        &source,
+        "package plugin\n\nfunc Helper() int {\n    return 1\n}\n",
+    )
+    .expect("source file should be written");
+    fs::write(
+        &destination,
+        "package helpers\n\nfunc Existing() int {\n    return 0\n}\n",
+    )
+    .expect("destination should be written");
+    fs::write(
+        &caller,
+        "package app\n\nimport \"example.com/hugrtest/plugin\"\n\nfunc UseHelper() int {\n    return plugin.Helper()\n}\n",
+    )
+    .expect("caller should be written");
+
+    let init = run_local_hugr(hugr, &workspace, &["init"]);
+    assert!(init.status.success(), "init failed: {init:?}");
+
+    let moved = run_local_hugr(
+        hugr,
+        &workspace,
+        &[
+            "move-symbol",
+            "--json",
+            "--rewrite-references",
+            "--kind",
+            "function",
+            "plugin/hooks.go",
+            "Helper",
+            "helpers/helpers.go",
+        ],
+    );
+    assert!(moved.status.success(), "move failed: {moved:?}");
+    let moved_json = String::from_utf8(moved.stdout).unwrap();
+    assert!(moved_json.contains("\"rewritten_reference_count\":1"));
+
+    let edited_source = fs::read_to_string(&source).unwrap();
+    let edited_destination = fs::read_to_string(&destination).unwrap();
+    let edited_caller = fs::read_to_string(&caller).unwrap();
+    assert!(!edited_source.contains("func Helper"));
+    assert!(edited_destination.contains("func Helper() int"));
+    assert!(edited_caller.contains("import \"example.com/hugrtest/helpers\""));
+    assert!(edited_caller.contains("return helpers.Helper()"));
+    assert!(!edited_caller.contains("example.com/hugrtest/plugin"));
+    assert!(!edited_caller.contains("plugin.Helper"));
+
+    let symbols = run_local_hugr(hugr, &workspace, &["symbols", "--json", "Helper"]);
+    assert!(symbols.status.success(), "symbols failed: {symbols:?}");
+    let symbols_json = String::from_utf8(symbols.stdout).unwrap();
+    assert!(symbols_json.contains("\"path\":\"helpers/helpers.go\""));
 
     let _ = fs::remove_dir_all(&workspace);
 }
@@ -1086,6 +1217,70 @@ fn move_symbol_allows_swift_same_module_type_references_and_refreshes_index() {
     assert!(symbols.status.success(), "symbols failed: {symbols:?}");
     let symbols_json = String::from_utf8(symbols.stdout).unwrap();
     assert!(symbols_json.contains("\"path\":\"Sources/App/Helper.swift\""));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn move_symbol_rewrites_swift_cross_module_imports_with_package_manifest() {
+    let hugr = env!("CARGO_BIN_EXE_hugr");
+    let workspace = temp_workspace("move_symbol_swift_cross_module");
+    fs::create_dir_all(workspace.join("Sources/App")).expect("app module dir");
+    fs::create_dir_all(workspace.join("Sources/Helpers")).expect("helpers module dir");
+    let source = workspace.join("Sources/App/Hooks.swift");
+    let destination = workspace.join("Sources/Helpers/Helper.swift");
+    let caller = workspace.join("Sources/App/Caller.swift");
+    fs::write(
+        workspace.join("Package.swift"),
+        "// swift-tools-version: 5.9\nimport PackageDescription\n\nlet package = Package(\n    name: \"HugrTest\",\n    products: [],\n    targets: [.target(name: \"App\"), .target(name: \"Helpers\")]\n)\n",
+    )
+    .expect("Package.swift should be written");
+    fs::write(
+        &source,
+        "public struct Helper {\n    public init() {}\n}\n\nstruct Other {}\n",
+    )
+    .expect("source file should be written");
+    fs::write(&destination, "public struct Existing {}\n").expect("destination should be written");
+    fs::write(&caller, "struct Caller {\n    let helper = Helper()\n}\n")
+        .expect("caller should be written");
+
+    let init = run_local_hugr(hugr, &workspace, &["init"]);
+    assert!(init.status.success(), "init failed: {init:?}");
+
+    let moved = run_local_hugr(
+        hugr,
+        &workspace,
+        &[
+            "move-symbol",
+            "--json",
+            "--rewrite-references",
+            "--kind",
+            "struct",
+            "Sources/App/Hooks.swift",
+            "Helper",
+            "Sources/Helpers/Helper.swift",
+        ],
+    );
+    assert!(moved.status.success(), "move failed: {moved:?}");
+    let moved_json = String::from_utf8(moved.stdout).unwrap();
+    assert!(moved_json.contains("\"rewritten_reference_count\":1"));
+
+    let edited_source = fs::read_to_string(&source).unwrap();
+    let edited_destination = fs::read_to_string(&destination).unwrap();
+    let edited_caller = fs::read_to_string(&caller).unwrap();
+    assert!(!edited_source.contains("public struct Helper"));
+    assert!(edited_source.contains("struct Other"));
+    assert!(edited_destination.contains("public struct Helper"));
+    assert!(
+        edited_caller.starts_with("import Helpers\n"),
+        "caller import should be inserted: {edited_caller}"
+    );
+    assert!(edited_caller.contains("let helper = Helper()"));
+
+    let symbols = run_local_hugr(hugr, &workspace, &["symbols", "--json", "Helper"]);
+    assert!(symbols.status.success(), "symbols failed: {symbols:?}");
+    let symbols_json = String::from_utf8(symbols.stdout).unwrap();
+    assert!(symbols_json.contains("\"path\":\"Sources/Helpers/Helper.swift\""));
 
     let _ = fs::remove_dir_all(&workspace);
 }
