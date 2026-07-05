@@ -138,7 +138,11 @@ async fn tool_context(arguments: &Value) -> Result<Value, String> {
         })
         .collect::<Vec<_>>();
     let sessions = store.recent_session_facts(&task, 5).await?;
-    let file_candidates = discovery::discover_candidate_files(Path::new("."), &task, 12)?;
+    let file_candidates = discovery::merge_file_candidates(
+        discovery::discover_candidate_files(Path::new("."), &task, 12)?,
+        store.source_embedding_file_candidates(&task, 12).await?,
+        12,
+    );
     indexer::index_candidates(&store, Path::new("."), &file_candidates).await?;
     let symbols = store.recall_symbols(&task, 8).await?;
     let files = file_candidates
