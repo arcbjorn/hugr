@@ -443,7 +443,6 @@ fn plan_reference_rewrites(
         )
     })?;
     let old_qualified = format!("{old_module}::{}", target.name);
-    let new_qualified = format!("{new_module}::{}", target.name);
     let reference_contents = reference_files.into_iter().collect::<BTreeMap<_, _>>();
     let mut references_by_path = BTreeMap::<String, Vec<CodeReference>>::new();
     for reference in inbound_references {
