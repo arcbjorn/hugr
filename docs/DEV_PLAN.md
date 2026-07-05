@@ -102,6 +102,8 @@ Implemented:
 - `hugr move-symbol --rewrite-references` supports same-package Kotlin type moves by validating package declarations and indexed references for class, interface, enum, annotation, object, and type-alias declarations that require no textual rewrite
 - `hugr move-symbol --rewrite-references` supports same-module Swift type moves by validating module directories and indexed references for class, struct, enum, actor, protocol, extension, and type-alias declarations that require no textual rewrite
 - `hugr move-symbol --rewrite-references` supports cross-package Kotlin and Java type moves by rewriting qualified imports in referencing files (inserting a fresh import in source-package files, rewriting the path in foreign-package files, and dropping the now-redundant import in destination-package files), refusing wildcard and aliased imports it cannot safely rewrite
+- `hugr move-symbol --rewrite-references` supports exported Go cross-package moves by resolving the nearest enclosing `go.mod`, including nested module roots, and rewriting import paths plus package-qualified references
+- `hugr move-symbol --rewrite-references` supports public/open Swift type moves across modules by resolving the nearest enclosing SwiftPM `Package.swift`, including nested packages, and inserting destination-module imports
 - `hugr move-symbol` refreshes the index immediately after a successful move and records a session edit event when a session is active
 - `hugr context` and `hugr_context` include a first code-health risk signal for large indexed symbols using deterministic symbol line ranges
 - `hugr context` and `hugr_context` include cross-file refactor-surface risks when code graph references span multiple files
@@ -127,7 +129,7 @@ The near-term plan is close to complete, but the broader vision and technical bl
 - Automatic session observation: daemon captures file-change and git/worktree events for active sessions, `hugr run <command>` captures command/test outcomes, `hugr shell-hook <bash|zsh>` can observe ordinary shell command statuses, and daemon indexing captures classified discovery summaries.
 - Session summarization and memory promotion: manual `hugr session promote` summarizes latest session facts into long-term memory, and the daemon periodically promotes ended, unpromoted sessions.
 - Risk and health signals: context packs now include deterministic risks for stale memory conflicts, changed relevant files, missing tests/symbols, graph coupling, public/exported API surfaces, cross-file refactor surfaces, unreferenced private symbols, recent failure facts, index freshness, stale-after-edit and stale-context invalidation, recent diagnostic output, structured diagnostics with source locations, large indexed symbols, long parameter lists, high fan-in blast radius, deep nesting, and cyclomatic branching from indexed symbol bodies.
-- Semantic operations: read-only CLI/MCP symbol lookup exists; safe local symbol replacement exists with parse and identity checks; the first reference-aware local rename exists for definitions plus indexed inbound references; reference-aware moves rewrite Rust, Python, TypeScript, JavaScript ES-module imports, and supported CommonJS `require` forms while rewriting CommonJS `module.exports` object/property exports; validate same-package Go/Java/Kotlin and same-module Swift moves; rewrite Java and Kotlin imports across packages; rewrite exported Go symbols across package directories using `go.mod` module paths; and rewrite public/open Swift type moves across `Package.swift` module directories by inserting destination-module imports.
+- Semantic operations: read-only CLI/MCP symbol lookup exists; safe local symbol replacement exists with parse and identity checks; the first reference-aware local rename exists for definitions plus indexed inbound references; reference-aware moves rewrite Rust, Python, TypeScript, JavaScript ES-module imports, and supported CommonJS `require` forms while rewriting CommonJS `module.exports` object/property exports; validate same-package Go/Java/Kotlin and same-module Swift moves; rewrite Java and Kotlin imports across packages; rewrite exported Go symbols across package directories using nearest `go.mod` module paths; and rewrite public/open Swift type moves across nearest `Package.swift` module directories by inserting destination-module imports.
 - Incremental freshness: full and daemon indexing prune discovered-file, symbol, code-reference, test-mapping, and source-embedding rows (including dangling target edges) for files that no longer exist on disk; the daemon and `hugr index --paths` now re-index only changed paths plus their inbound-reference sources instead of the whole project, keeping cross-file references correct; indexing refreshes persisted heuristic test mappings and metadata-only source embeddings for changed source paths; context packs use persisted source embeddings as a semantic file-ranking signal; and context packs surface a `stale_context` risk when a cited file's on-disk modification time is newer than the latest persisted pack, closing the direct-edit staleness gap (persisted packs are audit/sync artifacts and are always recompiled, never re-served).
 
 ## Runtime Decision
@@ -386,7 +388,7 @@ Implemented first slice:
 - Rust, Python, TypeScript, JavaScript/JSX, Go, Java, Kotlin, and Swift symbol extraction use tree-sitter when parsing succeeds, with line-scanner fallback.
 - `hugr replace-symbol` and `hugr_replace_symbol` use indexed symbols plus parser validation to perform the first safe local structural edit.
 - `hugr rename-symbol` and `hugr_rename_symbol` use indexed symbols and code references to safely rename a local definition plus inbound reference lines, then re-index.
-- `hugr move-symbol` and `hugr_move_symbol` safely move an unreferenced local symbol between files with parser validation and destination collision checks, and can opt into Rust module-path, nested import, symbol-alias, and module-alias rewrites, Python import/call rewrites, TypeScript/JavaScript ES-module rewrites, same-package Go reference validation, same-package Java type reference validation, same-package Kotlin type reference validation, and same-module Swift type reference validation for supported inbound references.
+- `hugr move-symbol` and `hugr_move_symbol` safely move an unreferenced local symbol between files with parser validation and destination collision checks, and can opt into Rust module-path, nested import, symbol-alias, and module-alias rewrites, Python import/call rewrites, TypeScript/JavaScript ES-module and CommonJS rewrites, same-package Go reference validation, same-package Java type reference validation, same-package Kotlin type reference validation, same-module Swift type reference validation, Java/Kotlin cross-package import rewrites, Go nearest-`go.mod` package rewrites, and SwiftPM nearest-`Package.swift` module import insertion for supported inbound references.
 
 Open questions:
 
@@ -613,6 +615,8 @@ Recommended next commits:
 91. Done: `feat(context): flag high fan-in symbols`
 92. Done: `feat(context): flag body complexity`
 93. Done: `feat(edit): handle move source references`
+94. Done: `feat(context): rank source embeddings`
+95. Done: `feat(edit): resolve nested manifests`
 
 Each commit should leave the CLI usable.
 
@@ -634,6 +638,6 @@ The planned product systems are complete. Incremental freshness (deletion prunin
 The remaining items are optional deep extensions, each opening a substantial new design space rather than closing a committed gap:
 
 - CommonJS support remains intentionally conservative for one-line `require` and export assignments; broader dynamic export patterns would need a deeper JavaScript module model.
-- Go and Swift manifest support currently resolves common `go.mod` and SwiftPM `Sources/<Module>` layouts; monorepos with generated manifests or custom build systems remain future work.
+- Go and Swift manifest support now resolves nearest nested `go.mod` and SwiftPM `Sources/<Module>` roots; monorepos with generated manifests or custom build systems remain future work.
 
 None of these is required for the core `hugr context` experience, which is complete: it compiles ranked memories, files, symbols, graph neighborhoods, tests, git state, structured diagnostics, and a broad deterministic risk surface with citations, in local and hosted API storage modes.
