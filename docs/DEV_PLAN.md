@@ -47,6 +47,7 @@ Implemented:
 - `hugr daemon` local HTTP runtime with `/health`, `/status`, file watching, debounced background indexing, and periodic memory-maintenance audits
 - daemon background indexing records discovery session events with indexed file/symbol summaries
 - `hugr index`, MCP `hugr_index`, and daemon discovery facts include file-role, language, and symbol-kind classifications
+- `hugr index` and daemon background indexing prune discovered-file, symbol, and code-reference rows for files that no longer exist on disk, removing dangling reference edges and reporting pruned counts
 - `hugr index` for explicit project indexing
 - best-effort code symbol extraction stored in `code_symbols`
 - best-effort direct reference/call/import extraction stored in `code_references`
@@ -123,7 +124,7 @@ The near-term plan is close to complete, but the broader vision and technical bl
 - Session summarization and memory promotion: manual `hugr session promote` summarizes latest session facts into long-term memory, and the daemon periodically promotes ended, unpromoted sessions.
 - Risk and health signals: context packs now include deterministic risks for stale memory conflicts, changed relevant files, missing tests/symbols, graph coupling, public/exported API surfaces, cross-file refactor surfaces, unreferenced private symbols, recent failure facts, index freshness, stale-after-edit context invalidation, recent diagnostic output, structured diagnostics with source locations, and large indexed symbols; deeper complexity and risky paths remain.
 - Semantic operations: read-only CLI/MCP symbol lookup exists; safe local symbol replacement exists with parse and identity checks; the first reference-aware local rename exists for definitions plus indexed inbound references; broader multi-file structural edits remain.
-- Incremental freshness: watcher-driven invalidation and refresh for file discovery, symbols, graph edges, tests, and context evidence.
+- Incremental freshness: full and daemon indexing now prune discovered-file, symbol, and code-reference rows (including dangling target edges) for files that no longer exist on disk, so recall, context, and impact stop surfacing deleted files; watcher-driven partial refresh and context-pack invalidation remain.
 
 ## Runtime Decision
 
@@ -597,6 +598,7 @@ Recommended next commits:
 82. Done: `feat(edit): allow same-package Go moves`
 83. Done: `feat(edit): allow same-package Java type moves`
 84. Done: `feat(edit): allow same-package Kotlin and Swift moves`
+85. Done: `feat(index): prune deleted file rows`
 
 Each commit should leave the CLI usable.
 
@@ -613,6 +615,6 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-Add watcher-driven incremental freshness so daemon file events invalidate and refresh stale discovery, symbols, graph edges, tests, and persisted context evidence.
+Extend incremental freshness from deletion pruning to watcher-scoped partial refresh: re-index only the specific paths a daemon file event reports, and invalidate persisted context packs whose cited files changed.
 
-That is the right next step because the semantic edit surface is now broad: context packs persist, sync, rank evidence, include graph neighborhoods, surface deterministic risk signals, cite structured diagnostics with exact locations, expose symbol lookup, have safe local symbol replacement, flag several code-health/refactor surfaces, identify Hugr edits that invalidate persisted context, support a first reference-aware rename, can move unreferenced symbols between files, can rewrite supported Rust, Python, TypeScript, and JavaScript reference/import forms on move, and can validate same-package Go, Java, and Kotlin plus same-module Swift referenced moves. The largest remaining product system in the Completion Gap Review is incremental freshness: the daemon already indexes on file changes, but discovery rows, symbols, graph edges, test mappings, and persisted context packs are not yet invalidated or refreshed from watcher events, so agents can read stale evidence after edits land outside `hugr` edit commands. Narrower semantic follow-ups remain afterward: broader cross-package Go/Java/Kotlin moves, cross-module Swift moves, and broader non-ES-module JavaScript patterns.
+That is the right next step because deletion pruning now closes the most dangerous freshness gap: `hugr index` and daemon background indexing remove discovered-file, symbol, and code-reference rows (including dangling target edges) for files that no longer exist, so recall, context, and impact stop citing deleted files. The remaining freshness work is efficiency and context-pack correctness rather than stale reads of missing files: today every change triggers a full ranked re-index of up to 5000 files, and persisted context packs are not invalidated when their cited files change after compilation. A watcher-scoped partial refresh keyed on the debounced `pending_paths` set, plus context-pack invalidation using existing edit-freshness timestamps, would make the daemon cheap on large repositories and keep compiled packs trustworthy. Narrower semantic follow-ups also remain: broader cross-package Go/Java/Kotlin moves, cross-module Swift moves, and broader non-ES-module JavaScript patterns.
