@@ -3,7 +3,17 @@ name = "hugr"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["local-embeddings"]
+# In-process ONNX text embeddings (fastembed). Disable for a slim binary:
+# the deterministic, ollama, and openai providers remain available.
+local-embeddings = ["dep:fastembed"]
+
 [dependencies]
+fastembed = { version = "5.17.2", optional = true, default-features = false, features = [
+    "ort-download-binaries-native-tls",
+    "hf-hub-native-tls",
+] }
 libsql = "0.9.30"
 notify = "8.2.0"
 regex = "1.12.4"

@@ -14,6 +14,8 @@ const DEFAULT_OPENAI_EMBEDDING_URL: &str = "https://api.openai.com/v1/embeddings
 const DEFAULT_OLLAMA_EMBEDDING_MODEL: &str = "nomic-embed-text";
 const DEFAULT_OLLAMA_EMBEDDING_URL: &str = "http://localhost:11434/v1/embeddings";
 const DEFAULT_OLLAMA_EMBEDDING_DIMENSIONS: usize = 768;
+#[cfg(feature = "local-embeddings")]
+const DEFAULT_LOCAL_EMBEDDING_MODEL: &str = "bge-small-en-v1.5";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Embedding {
@@ -66,6 +68,8 @@ pub(crate) trait EmbeddingProvider {
 pub(crate) enum SelectedEmbeddingProvider {
     Deterministic(DeterministicEmbeddingProvider),
     OpenAi(OpenAiEmbeddingProvider),
+    #[cfg(feature = "local-embeddings")]
+    Local(LocalEmbeddingProvider),
 }
 
 impl SelectedEmbeddingProvider {
@@ -85,6 +89,8 @@ impl EmbeddingProvider for SelectedEmbeddingProvider {
         match self {
             Self::Deterministic(provider) => provider.model(),
             Self::OpenAi(provider) => provider.model(),
+            #[cfg(feature = "local-embeddings")]
+            Self::Local(provider) => provider.model(),
         }
     }
 
@@ -92,6 +98,8 @@ impl EmbeddingProvider for SelectedEmbeddingProvider {
         match self {
             Self::Deterministic(provider) => provider.dimensions(),
             Self::OpenAi(provider) => provider.dimensions(),
+            #[cfg(feature = "local-embeddings")]
+            Self::Local(provider) => provider.dimensions(),
         }
     }
 
@@ -99,6 +107,8 @@ impl EmbeddingProvider for SelectedEmbeddingProvider {
         match self {
             Self::Deterministic(provider) => provider.embed(text),
             Self::OpenAi(provider) => provider.embed(text),
+            #[cfg(feature = "local-embeddings")]
+            Self::Local(provider) => provider.embed(text),
         }
     }
 }
@@ -113,6 +123,10 @@ pub(crate) enum EmbeddingProviderConfig {
         model: String,
         url: String,
         dimensions: usize,
+    },
+    #[cfg(feature = "local-embeddings")]
+    Local {
+        model: String,
     },
 }
 
@@ -137,6 +151,10 @@ impl EmbeddingProviderConfig {
                 url,
                 dimensions,
             })),
+            #[cfg(feature = "local-embeddings")]
+            Self::Local { model } => Ok(SelectedEmbeddingProvider::Local(
+                LocalEmbeddingProvider::new(&model)?,
+            )),
         }
     }
 
@@ -203,8 +221,30 @@ impl EmbeddingProviderConfig {
                     dimensions: dimensions_override.unwrap_or(DEFAULT_OLLAMA_EMBEDDING_DIMENSIONS),
                 })
             }
+            // In-process ONNX embeddings: no service, no key, model fetched
+            // once into the cache directory. Available unless the binary was
+            // built without the local-embeddings feature.
+            "local" => {
+                #[cfg(feature = "local-embeddings")]
+                {
+                    let model = lookup("HUGR_LOCAL_EMBEDDING_MODEL")
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| DEFAULT_LOCAL_EMBEDDING_MODEL.to_string());
+                    local_embedding_model(&model)?;
+                    Ok(Self::Local { model })
+                }
+                #[cfg(not(feature = "local-embeddings"))]
+                {
+                    Err(
+                        "this hugr build does not include local embeddings; rebuild with \
+                         --features local-embeddings or use the ollama or openai provider"
+                            .to_string(),
+                    )
+                }
+            }
             unknown => Err(format!(
-                "unknown embedding provider '{unknown}'; expected deterministic, openai, or ollama"
+                "unknown embedding provider '{unknown}'; expected deterministic, local, openai, or ollama"
             )),
         }
     }
@@ -259,6 +299,119 @@ impl EmbeddingProvider for DeterministicEmbeddingProvider {
             vector,
         })
     }
+}
+
+/// In-process ONNX text embeddings via fastembed. The engine is loaded once
+/// on first use (downloading the model into the cache directory when absent)
+/// and shared behind a mutex because ONNX sessions want exclusive access
+/// during inference.
+#[cfg(feature = "local-embeddings")]
+#[derive(Clone)]
+pub(crate) struct LocalEmbeddingProvider {
+    model_name: String,
+    dimensions: usize,
+    engine: std::sync::Arc<
+        std::sync::OnceLock<Result<std::sync::Mutex<fastembed::TextEmbedding>, String>>,
+    >,
+}
+
+#[cfg(feature = "local-embeddings")]
+impl std::fmt::Debug for LocalEmbeddingProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalEmbeddingProvider")
+            .field("model_name", &self.model_name)
+            .field("dimensions", &self.dimensions)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "local-embeddings")]
+impl LocalEmbeddingProvider {
+    pub fn new(model_name: &str) -> Result<Self, String> {
+        let (_, dimensions) = local_embedding_model(model_name)?;
+        Ok(Self {
+            model_name: model_name.to_string(),
+            dimensions,
+            engine: std::sync::Arc::new(std::sync::OnceLock::new()),
+        })
+    }
+}
+
+#[cfg(feature = "local-embeddings")]
+impl EmbeddingProvider for LocalEmbeddingProvider {
+    fn model(&self) -> &str {
+        &self.model_name
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    fn embed(&self, text: &str) -> Result<Embedding, String> {
+        let engine = self.engine.get_or_init(|| {
+            build_local_embedding_engine(&self.model_name).map(std::sync::Mutex::new)
+        });
+        let engine = engine.as_ref().map_err(Clone::clone)?;
+        let mut engine = engine
+            .lock()
+            .map_err(|_| "local embedding engine mutex poisoned".to_string())?;
+        let mut vectors = engine
+            .embed(vec![text.to_string()], None)
+            .map_err(|error| format!("local embedding failed: {error}"))?;
+        let vector = vectors
+            .pop()
+            .ok_or_else(|| "local embedding returned no vector".to_string())?;
+
+        Ok(Embedding {
+            model: self.model_name.clone(),
+            vector,
+        })
+    }
+}
+
+/// Maps a user-facing model name to fastembed's model id and its native
+/// dimensionality. Kept to a small curated set so configuration errors
+/// surface at startup instead of after a model download.
+#[cfg(feature = "local-embeddings")]
+fn local_embedding_model(name: &str) -> Result<(fastembed::EmbeddingModel, usize), String> {
+    match name {
+        "bge-small-en-v1.5" => Ok((fastembed::EmbeddingModel::BGESmallENV15, 384)),
+        "bge-base-en-v1.5" => Ok((fastembed::EmbeddingModel::BGEBaseENV15, 768)),
+        "all-minilm-l6-v2" => Ok((fastembed::EmbeddingModel::AllMiniLML6V2, 384)),
+        "nomic-embed-text-v1.5" => Ok((fastembed::EmbeddingModel::NomicEmbedTextV15, 768)),
+        "multilingual-e5-small" => Ok((fastembed::EmbeddingModel::MultilingualE5Small, 384)),
+        unknown => Err(format!(
+            "unknown local embedding model '{unknown}'; expected one of bge-small-en-v1.5, \
+             bge-base-en-v1.5, all-minilm-l6-v2, nomic-embed-text-v1.5, multilingual-e5-small"
+        )),
+    }
+}
+
+#[cfg(feature = "local-embeddings")]
+fn build_local_embedding_engine(model_name: &str) -> Result<fastembed::TextEmbedding, String> {
+    let (model, _) = local_embedding_model(model_name)?;
+    let mut options = fastembed::TextInitOptions::new(model).with_show_download_progress(false);
+    if let Some(cache_dir) = local_embedding_cache_dir(|name| env::var(name).ok()) {
+        options = options.with_cache_dir(cache_dir);
+    }
+    fastembed::TextEmbedding::try_new(options)
+        .map_err(|error| format!("failed to load local embedding model '{model_name}': {error}"))
+}
+
+/// Model cache resolution: explicit override, else ~/.hugr/models next to the
+/// global memory store, else fastembed's own default.
+#[cfg(feature = "local-embeddings")]
+fn local_embedding_cache_dir(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<std::path::PathBuf> {
+    if let Some(dir) = lookup("HUGR_LOCAL_EMBEDDING_CACHE").filter(|value| !value.trim().is_empty())
+    {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    lookup("HOME")
+        .filter(|value| !value.trim().is_empty())
+        .map(|home| std::path::PathBuf::from(home).join(".hugr").join("models"))
 }
 
 #[derive(Debug, Clone)]
@@ -537,6 +690,102 @@ mod tests {
         let native_order = native(&query, &close) > native(&query, &far);
         let padded_order = padded(&query, &close) > padded(&query, &far);
         assert_eq!(native_order, padded_order);
+    }
+
+    #[cfg(feature = "local-embeddings")]
+    #[test]
+    fn config_reads_local_provider_and_validates_models() {
+        let config = EmbeddingProviderConfig::from_lookup(env_lookup(&[(
+            "HUGR_EMBEDDING_PROVIDER",
+            "local",
+        )]))
+        .unwrap();
+        assert_eq!(
+            config,
+            EmbeddingProviderConfig::Local {
+                model: "bge-small-en-v1.5".to_string()
+            }
+        );
+
+        let overridden = EmbeddingProviderConfig::from_lookup(env_lookup(&[
+            ("HUGR_EMBEDDING_PROVIDER", "local"),
+            ("HUGR_LOCAL_EMBEDDING_MODEL", "all-minilm-l6-v2"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            overridden,
+            EmbeddingProviderConfig::Local {
+                model: "all-minilm-l6-v2".to_string()
+            }
+        );
+
+        let unknown = EmbeddingProviderConfig::from_lookup(env_lookup(&[
+            ("HUGR_EMBEDDING_PROVIDER", "local"),
+            ("HUGR_LOCAL_EMBEDDING_MODEL", "made-up-model"),
+        ]));
+        assert!(unknown.is_err(), "unknown models must fail at config time");
+    }
+
+    #[cfg(feature = "local-embeddings")]
+    #[test]
+    fn local_provider_reports_dimensions_without_loading_the_model() {
+        let provider = super::LocalEmbeddingProvider::new("bge-small-en-v1.5").unwrap();
+        assert_eq!(provider.dimensions(), 384);
+        assert_eq!(provider.model(), "bge-small-en-v1.5");
+    }
+
+    #[cfg(feature = "local-embeddings")]
+    #[test]
+    fn local_cache_dir_prefers_override_then_home() {
+        let override_lookup =
+            |name: &str| (name == "HUGR_LOCAL_EMBEDDING_CACHE").then(|| "/models".to_string());
+        assert_eq!(
+            super::local_embedding_cache_dir(override_lookup),
+            Some(std::path::PathBuf::from("/models"))
+        );
+
+        let home_lookup = |name: &str| (name == "HOME").then(|| "/home/dev".to_string());
+        assert_eq!(
+            super::local_embedding_cache_dir(home_lookup),
+            Some(std::path::PathBuf::from("/home/dev/.hugr/models"))
+        );
+
+        assert_eq!(super::local_embedding_cache_dir(|_| None), None);
+    }
+
+    #[cfg(feature = "local-embeddings")]
+    #[test]
+    #[ignore = "downloads the embedding model on first run"]
+    fn local_provider_embeds_with_real_semantics() {
+        let provider = super::LocalEmbeddingProvider::new("bge-small-en-v1.5").unwrap();
+
+        let query = provider.embed("database connection pooling").unwrap();
+        let close = provider
+            .embed("reusing sql connections efficiently")
+            .unwrap();
+        let far = provider.embed("css button hover animation").unwrap();
+
+        assert_eq!(query.dimensions(), 384);
+        assert_eq!(
+            query.to_f32_blob().len(),
+            STORAGE_EMBEDDING_DIMENSIONS * 4,
+            "local vectors must normalize to storage width"
+        );
+
+        let cosine = |left: &super::Embedding, right: &super::Embedding| {
+            let dot = left
+                .vector
+                .iter()
+                .zip(&right.vector)
+                .map(|(a, b)| a * b)
+                .sum::<f32>();
+            let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (norm(&left.vector) * norm(&right.vector))
+        };
+        assert!(
+            cosine(&query, &close) > cosine(&query, &far),
+            "semantically close text must score higher"
+        );
     }
 
     #[test]
