@@ -4,9 +4,16 @@ use std::io::Write as _;
 use std::process::{Command as ProcessCommand, Stdio};
 
 pub(crate) const DEFAULT_EMBEDDING_DIMENSIONS: usize = 1536;
+/// Width of the F32_BLOB vector columns in the schema. Every stored blob and
+/// query literal is normalized to this width so providers with other native
+/// dimensionalities still work against the fixed-width vector indexes.
+pub(crate) const STORAGE_EMBEDDING_DIMENSIONS: usize = 1536;
 pub(crate) const DETERMINISTIC_MODEL: &str = "hugr-deterministic-v1";
 const DEFAULT_OPENAI_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 const DEFAULT_OPENAI_EMBEDDING_URL: &str = "https://api.openai.com/v1/embeddings";
+const DEFAULT_OLLAMA_EMBEDDING_MODEL: &str = "nomic-embed-text";
+const DEFAULT_OLLAMA_EMBEDDING_URL: &str = "http://localhost:11434/v1/embeddings";
+const DEFAULT_OLLAMA_EMBEDDING_DIMENSIONS: usize = 768;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Embedding {
@@ -19,9 +26,19 @@ impl Embedding {
         self.vector.len()
     }
 
+    /// Shorter vectors zero-pad up to the storage width, which leaves cosine
+    /// and Euclidean ordering unchanged; longer vectors truncate, which is
+    /// approximate but keeps oversized models usable against the schema.
+    fn storage_vector(&self) -> Vec<f32> {
+        let mut vector = self.vector.clone();
+        vector.resize(STORAGE_EMBEDDING_DIMENSIONS, 0.0);
+        vector
+    }
+
     pub fn to_f32_blob(&self) -> Vec<u8> {
-        let mut blob = Vec::with_capacity(self.vector.len() * 4);
-        for value in &self.vector {
+        let vector = self.storage_vector();
+        let mut blob = Vec::with_capacity(vector.len() * 4);
+        for value in &vector {
             blob.extend_from_slice(&value.to_le_bytes());
         }
         blob
@@ -30,7 +47,7 @@ impl Embedding {
     pub fn to_vector_literal(&self) -> String {
         format!(
             "[{}]",
-            self.vector
+            self.storage_vector()
                 .iter()
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>()
@@ -128,14 +145,15 @@ impl EmbeddingProviderConfig {
             .unwrap_or_else(|| "deterministic".to_string())
             .trim()
             .to_lowercase();
-        let dimensions = lookup("HUGR_EMBEDDING_DIMENSIONS")
+        let dimensions_override = lookup("HUGR_EMBEDDING_DIMENSIONS")
             .as_deref()
             .map(parse_dimensions)
-            .transpose()?
-            .unwrap_or(DEFAULT_EMBEDDING_DIMENSIONS);
+            .transpose()?;
 
         match provider.as_str() {
-            "deterministic" | "local" | "offline" => Ok(Self::Deterministic { dimensions }),
+            "deterministic" | "offline" => Ok(Self::Deterministic {
+                dimensions: dimensions_override.unwrap_or(DEFAULT_EMBEDDING_DIMENSIONS),
+            }),
             "openai" => {
                 let api_key = lookup("HUGR_OPENAI_API_KEY")
                     .or_else(|| lookup("OPENAI_API_KEY"))
@@ -158,11 +176,35 @@ impl EmbeddingProviderConfig {
                     api_key,
                     model,
                     url,
-                    dimensions,
+                    dimensions: dimensions_override.unwrap_or(DEFAULT_EMBEDDING_DIMENSIONS),
+                })
+            }
+            // Ollama exposes an OpenAI-compatible embeddings endpoint, so the
+            // alias reuses that transport with localhost defaults and no key:
+            // real local semantic recall without a cloud account.
+            "ollama" => {
+                let api_key = lookup("HUGR_OLLAMA_API_KEY")
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_default();
+                let model = lookup("HUGR_OLLAMA_EMBEDDING_MODEL")
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| DEFAULT_OLLAMA_EMBEDDING_MODEL.to_string());
+                let url = lookup("HUGR_OLLAMA_EMBEDDING_URL")
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| DEFAULT_OLLAMA_EMBEDDING_URL.to_string());
+
+                Ok(Self::OpenAi {
+                    api_key,
+                    model,
+                    url,
+                    dimensions: dimensions_override.unwrap_or(DEFAULT_OLLAMA_EMBEDDING_DIMENSIONS),
                 })
             }
             unknown => Err(format!(
-                "unknown embedding provider '{unknown}'; expected deterministic or openai"
+                "unknown embedding provider '{unknown}'; expected deterministic, openai, or ollama"
             )),
         }
     }
@@ -251,19 +293,23 @@ fn openai_embedding_request(model: &str, text: &str) -> Value {
 }
 
 fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String, String> {
+    let mut args = vec![
+        "-fsS".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        url.to_string(),
+        "-H".to_string(),
+        "Content-Type: application/json".to_string(),
+    ];
+    if !api_key.is_empty() {
+        args.push("-H".to_string());
+        args.push(format!("Authorization: Bearer {api_key}"));
+    }
+    args.push("--data-binary".to_string());
+    args.push("@-".to_string());
+
     let mut child = ProcessCommand::new("curl")
-        .args([
-            "-fsS",
-            "-X",
-            "POST",
-            url,
-            "-H",
-            "Content-Type: application/json",
-            "-H",
-            &format!("Authorization: Bearer {api_key}"),
-            "--data-binary",
-            "@-",
-        ])
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -389,7 +435,8 @@ fn normalize(vector: &mut [f32]) {
 mod tests {
     use super::{
         DEFAULT_EMBEDDING_DIMENSIONS, DETERMINISTIC_MODEL, DeterministicEmbeddingProvider,
-        EmbeddingProvider, EmbeddingProviderConfig, parse_openai_embedding_response,
+        EmbeddingProvider, EmbeddingProviderConfig, STORAGE_EMBEDDING_DIMENSIONS,
+        parse_openai_embedding_response,
     };
     use std::collections::HashMap;
 
@@ -420,22 +467,119 @@ mod tests {
     }
 
     #[test]
-    fn embeddings_encode_as_f32_blob_bytes() {
+    fn embeddings_encode_as_storage_width_f32_blobs() {
         let provider = DeterministicEmbeddingProvider::new(8).unwrap();
         let embedding = provider.embed("plugin hooks").unwrap();
 
-        assert_eq!(embedding.to_f32_blob().len(), 8 * 4);
+        assert_eq!(embedding.dimensions(), 8, "native dimensions are reported");
+        assert_eq!(
+            embedding.to_f32_blob().len(),
+            STORAGE_EMBEDDING_DIMENSIONS * 4,
+            "stored blobs are padded to the schema vector width"
+        );
     }
 
     #[test]
-    fn embeddings_encode_as_vector_literals() {
+    fn embeddings_encode_as_storage_width_vector_literals() {
         let provider = DeterministicEmbeddingProvider::new(4).unwrap();
         let embedding = provider.embed("plugin hooks").unwrap();
         let literal = embedding.to_vector_literal();
 
         assert!(literal.starts_with('['));
         assert!(literal.ends_with(']'));
-        assert_eq!(literal.matches(',').count(), 3);
+        assert_eq!(
+            literal.matches(',').count(),
+            STORAGE_EMBEDDING_DIMENSIONS - 1
+        );
+    }
+
+    #[test]
+    fn oversized_embeddings_truncate_to_storage_width() {
+        let embedding = super::Embedding {
+            model: "test".to_string(),
+            vector: vec![1.0; STORAGE_EMBEDDING_DIMENSIONS + 100],
+        };
+
+        assert_eq!(
+            embedding.to_f32_blob().len(),
+            STORAGE_EMBEDDING_DIMENSIONS * 4
+        );
+    }
+
+    #[test]
+    fn zero_padding_preserves_cosine_ordering() {
+        let provider = DeterministicEmbeddingProvider::new(16).unwrap();
+        let query = provider.embed("plugin hooks").unwrap();
+        let close = provider.embed("plugin hooks loaded").unwrap();
+        let far = provider.embed("database migrations").unwrap();
+
+        let native = |left: &super::Embedding, right: &super::Embedding| {
+            left.vector
+                .iter()
+                .zip(&right.vector)
+                .map(|(a, b)| a * b)
+                .sum::<f32>()
+        };
+        let padded = |left: &super::Embedding, right: &super::Embedding| {
+            left.to_f32_blob()
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .zip(
+                    right
+                        .to_f32_blob()
+                        .chunks_exact(4)
+                        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])),
+                )
+                .map(|(a, b)| a * b)
+                .sum::<f32>()
+        };
+
+        let native_order = native(&query, &close) > native(&query, &far);
+        let padded_order = padded(&query, &close) > padded(&query, &far);
+        assert_eq!(native_order, padded_order);
+    }
+
+    #[test]
+    fn config_reads_ollama_provider_with_local_defaults() {
+        let config = EmbeddingProviderConfig::from_lookup(env_lookup(&[(
+            "HUGR_EMBEDDING_PROVIDER",
+            "ollama",
+        )]))
+        .unwrap();
+
+        assert_eq!(
+            config,
+            EmbeddingProviderConfig::OpenAi {
+                api_key: String::new(),
+                model: "nomic-embed-text".to_string(),
+                url: "http://localhost:11434/v1/embeddings".to_string(),
+                dimensions: 768
+            }
+        );
+    }
+
+    #[test]
+    fn config_reads_ollama_overrides() {
+        let config = EmbeddingProviderConfig::from_lookup(env_lookup(&[
+            ("HUGR_EMBEDDING_PROVIDER", "ollama"),
+            ("HUGR_OLLAMA_EMBEDDING_MODEL", "mxbai-embed-large"),
+            (
+                "HUGR_OLLAMA_EMBEDDING_URL",
+                "http://box:11434/v1/embeddings",
+            ),
+            ("HUGR_EMBEDDING_DIMENSIONS", "1024"),
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            config,
+            EmbeddingProviderConfig::OpenAi {
+                api_key: String::new(),
+                model: "mxbai-embed-large".to_string(),
+                url: "http://box:11434/v1/embeddings".to_string(),
+                dimensions: 1024
+            }
+        );
     }
 
     #[test]
