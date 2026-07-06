@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 libsql = "0.9.30"
 notify = "8.2.0"
+regex = "1.12.4"
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
 tree-sitter = "0.26.10"

@@ -2,6 +2,7 @@ use crate::code::{self, CodeReference, CodeSymbol};
 use crate::discovery::FileCandidate;
 use crate::embedding::{Embedding, EmbeddingProvider, SelectedEmbeddingProvider};
 use crate::migrations;
+use crate::redact;
 use crate::testmap::{self, TestCandidate};
 use libsql::{Builder, Connection, Row, params};
 use serde_json::json;
@@ -1365,6 +1366,15 @@ impl Store {
             return Ok(Vec::new());
         }
 
+        let diagnostics = diagnostics
+            .iter()
+            .map(|input| DiagnosticInput {
+                message: redact::redact_secrets(&input.message),
+                command: input.command.as_deref().map(redact::redact_secrets),
+                ..input.clone()
+            })
+            .collect::<Vec<_>>();
+        let diagnostics = diagnostics.as_slice();
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return record_diagnostics_via_hugr_api(&storage_config, diagnostics);
@@ -1559,15 +1569,16 @@ impl Store {
         kind: &str,
         detail: &str,
     ) -> Result<SessionEvent, String> {
+        let detail = redact::redact_secrets(detail);
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
-            return record_session_event_via_hugr_api(&storage_config, kind, detail);
+            return record_session_event_via_hugr_api(&storage_config, kind, &detail);
         }
 
         self.init().await?;
         let conn = self.connect().await?;
         let session_id = active_session_id(&conn).await?;
-        insert_session_event(&conn, session_id, kind, detail).await
+        insert_session_event(&conn, session_id, kind, &detail).await
     }
 
     pub(crate) async fn record_session_event_if_active(
@@ -1575,9 +1586,10 @@ impl Store {
         kind: &str,
         detail: &str,
     ) -> Result<Option<SessionEvent>, String> {
+        let detail = redact::redact_secrets(detail);
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
-            return record_session_event_if_active_via_hugr_api(&storage_config, kind, detail);
+            return record_session_event_if_active_via_hugr_api(&storage_config, kind, &detail);
         }
 
         if !self.exists() {
@@ -1588,12 +1600,14 @@ impl Store {
         let Some(session_id) = active_session_id_optional(&conn).await? else {
             return Ok(None);
         };
-        insert_session_event(&conn, session_id, kind, detail)
+        insert_session_event(&conn, session_id, kind, &detail)
             .await
             .map(Some)
     }
 
     pub async fn end_session(&self, summary: Option<&str>) -> Result<Session, String> {
+        let summary = summary.map(|summary| redact::redact_secrets(summary));
+        let summary = summary.as_deref();
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return end_session_via_hugr_api(&storage_config, summary);
@@ -14720,6 +14734,64 @@ mod tests {
 
         assert!(facts.iter().any(|fact| fact.kind == "test"));
         assert!(facts.iter().any(|fact| fact.kind == "summary"));
+    }
+
+    #[tokio::test]
+    async fn session_events_and_diagnostics_store_redacted_text() {
+        let test = TestStore::new("redacted_observations");
+        test.store
+            .start_session("wire deploy secrets")
+            .await
+            .unwrap();
+
+        let event = test
+            .store
+            .record_session_event(
+                "command",
+                "ran: export OPENAI_API_KEY=sk-abcdefghijklmnopqrstuv && deploy",
+            )
+            .await
+            .unwrap();
+        assert!(
+            !event.detail.contains("sk-abcdefghijklmnopqrstuv"),
+            "stored event must not contain the secret: {}",
+            event.detail
+        );
+        assert!(event.detail.contains("OPENAI_API_KEY=[REDACTED]"));
+
+        let ended = test
+            .store
+            .end_session(Some("deployed with token=abc123xyz989"))
+            .await
+            .unwrap();
+        assert_eq!(
+            ended.final_summary.as_deref(),
+            Some("deployed with token=[REDACTED]")
+        );
+
+        let diagnostics = test
+            .store
+            .record_diagnostics(&[DiagnosticInput {
+                source: "stderr".to_string(),
+                path: Some("src/deploy.rs".to_string()),
+                line_start: Some(3),
+                line_end: None,
+                severity: "error".to_string(),
+                code: None,
+                message: "auth failed for Authorization: Bearer abc.def.ghi".to_string(),
+                command: Some("deploy --token abcdefgh".to_string()),
+            }])
+            .await
+            .unwrap();
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("Authorization: Bearer [REDACTED]")
+        );
+        assert_eq!(
+            diagnostics[0].command.as_deref(),
+            Some("deploy --token [REDACTED]")
+        );
     }
 
     #[tokio::test]

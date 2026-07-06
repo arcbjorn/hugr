@@ -632,6 +632,7 @@ version = "0.1.0"
 dependencies = [
  "libsql",
  "notify",
+ "regex",
  "serde_json",
  "tokio",
  "tree-sitter",

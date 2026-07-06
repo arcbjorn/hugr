@@ -12,6 +12,7 @@ mod indexer;
 mod install;
 mod mcp;
 mod migrations;
+mod redact;
 mod store;
 mod testmap;
 mod worktree;
