@@ -123,6 +123,12 @@ Implemented:
 - `hugr eval [--json] [--from-git <n>] [--max-files <n>] [--min-hit-rate <f>]` replays recent commit subjects as tasks and scores the real context compiler against the files each commit touched (recall, hit rate, MRR, symbol-file hits, pre-budget candidate hits) with skip-reason accounting and an optional CI gate
 - `hugr install <claude-code|cursor> [--shared]` writes merged, idempotent MCP registration plus Claude Code session hooks, and the hidden `hugr hook claude-code <event>` stdin adapter maps agent events to session start/edit/end-plus-promote without ever failing the agent
 - GitHub Actions runs a report-only context-eval job against the last 30 commits on every push
+- `hugr context --budget <tokens>` plus `HUGR_CONTEXT_TOKEN_BUDGET` and an MCP `budget` argument size packs for different agent context windows; MCP `hugr_context` now shares the CLI compile pipeline including pack persistence
+- symbol recall prefilters candidates in SQL per query term (with stem-aware name matching) instead of scoring a blind recency-limited scan, so symbols beyond the first 2000 rows stay reachable on large repositories
+- `HUGR_EMBEDDING_PROVIDER=ollama` targets a local OpenAI-compatible embeddings endpoint with no API key, and all stored vectors normalize to the schema's 1536-wide columns (zero-padding preserves cosine ordering)
+- session events, session summaries, and diagnostics are secret-redacted at the storage boundary (API keys, tokens, JWTs, PEM blocks, authorization headers, secret assignments, URL credentials) before they can reach sync or LLM synthesis
+- `hugr session promote --llm` distills session facts through an OpenAI-compatible chat endpoint (`HUGR_LLM_PROVIDER=ollama|openai`) with synthesis provenance in the memory payload and deterministic fallback on any failure; daemon auto-promotion stays deterministic
+- `hugr remember|recall|forget --global` operate on a device-local user store at `~/.hugr` (or `HUGR_GLOBAL_DIR`), global memories carry `scope: global` provenance without project scope, never sync, and merge best-effort into every project's context pack
 - initial vision, storage, and technical blueprint docs
 
 Near-term parser and hosted API checklist is complete. Remaining broader product gaps are tracked below.
@@ -635,6 +641,12 @@ Recommended next commits:
 102. Done: `feat(eval): score context against git history`
 103. Done: `feat(install): wire agents in one command`
 104. Done: `ci(eval): report context eval baseline`
+105. Done: `feat(context): add budget option`
+106. Done: `perf(store): prefilter symbol recall in sql`
+107. Done: `feat(embed): add ollama provider alias`
+108. Done: `feat(session): redact secrets in observations`
+109. Done: `feat(memory): add llm session synthesis`
+110. Done: `feat(memory): add global memory scope`
 
 Each commit should leave the CLI usable.
 
@@ -654,6 +666,8 @@ Before ending each future session:
 Context quality is now measurable: `hugr eval --from-git` scores the real compiler against the repository's own commit history, and CI reports it on every push. The first baseline on this repository (30 commits) is file recall 0.925, hit rate 0.933, MRR 0.274. The gap between recall and MRR is the next concrete target: the right files are almost always retrieved but rarely ranked near the top, so ranking-order work (and only that work) will move MRR without risking recall. Before turning the CI job into a `--min-hit-rate` gate, run the harness on two or three foreign repositories to make sure thresholds are not overfitted to this repository's commit style.
 
 Adoption now has a one-command path (`hugr install claude-code|cursor`); a natural follow-up is a Codex/other-agent target and an install-time `hugr index` kick-off.
+
+Dependency policy shifted from "no new crates" to "best tool where it removes a liability" (regex landed for secret redaction). The queued replacements under that policy, in value order: swap the curl subprocess for a proper HTTP client (`ureq` or async `reqwest`) in the embedding, LLM, and Hugr API sync transports; move the daemon's hand-parsed HTTP handling onto `axum` (tokio is already the runtime); replace hand-escaped JSON rendering in context packs with serde derive; consider `fastembed` for fully in-process local embeddings once the build-weight tradeoff is worth it (the `ollama` provider covers local semantic recall today); and a `scip` importer for LSP-grade reference graphs.
 
 A dogfooding review of `hugr context` on this repository previously fixed four output-quality gaps: reference extraction was accidentally quadratic (a full index of this repo never finished; it now takes seconds), Rust files with inline `#[cfg(test)]` modules produced false `missing_test_mapping` risks, symbol ranking listed top-of-file declarations because every symbol in a path-matched file scored identically, and graph neighborhoods spent most of their token budget on repeated same-file reference lines with ambiguous labels. The follow-up pass fixed cross-file edge erosion during context runs and ambiguous same-name reference targets.
 
