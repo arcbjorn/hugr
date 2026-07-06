@@ -126,6 +126,7 @@ Implemented:
 - `hugr context --budget <tokens>` plus `HUGR_CONTEXT_TOKEN_BUDGET` and an MCP `budget` argument size packs for different agent context windows; MCP `hugr_context` now shares the CLI compile pipeline including pack persistence
 - symbol recall prefilters candidates in SQL per query term (with stem-aware name matching) instead of scoring a blind recency-limited scan, so symbols beyond the first 2000 rows stay reachable on large repositories
 - `HUGR_EMBEDDING_PROVIDER=ollama` targets a local OpenAI-compatible embeddings endpoint with no API key, and all stored vectors normalize to the schema's 1536-wide columns (zero-padding preserves cosine ordering)
+- `HUGR_EMBEDDING_PROVIDER=local` runs in-process ONNX embeddings (fastembed, default model bge-small-en-v1.5, curated model list via `HUGR_LOCAL_EMBEDDING_MODEL`, cache under `~/.hugr/models` or `HUGR_LOCAL_EMBEDDING_CACHE`), behind a default-on `local-embeddings` cargo feature so slim builds can opt out
 - session events, session summaries, and diagnostics are secret-redacted at the storage boundary (API keys, tokens, JWTs, PEM blocks, authorization headers, secret assignments, URL credentials) before they can reach sync or LLM synthesis
 - `hugr session promote --llm` distills session facts through an OpenAI-compatible chat endpoint (`HUGR_LLM_PROVIDER=ollama|openai`) with synthesis provenance in the memory payload and deterministic fallback on any failure; daemon auto-promotion stays deterministic
 - `hugr remember|recall|forget --global` operate on a device-local user store at `~/.hugr` (or `HUGR_GLOBAL_DIR`), global memories carry `scope: global` provenance without project scope, never sync, and merge best-effort into every project's context pack
@@ -647,6 +648,7 @@ Recommended next commits:
 108. Done: `feat(session): redact secrets in observations`
 109. Done: `feat(memory): add llm session synthesis`
 110. Done: `feat(memory): add global memory scope`
+111. Done: `feat(embed): add in-process onnx provider`
 
 Each commit should leave the CLI usable.
 
@@ -667,7 +669,7 @@ Context quality is now measurable: `hugr eval --from-git` scores the real compil
 
 Adoption now has a one-command path (`hugr install claude-code|cursor`); a natural follow-up is a Codex/other-agent target and an install-time `hugr index` kick-off.
 
-Dependency policy shifted from "no new crates" to "best tool where it removes a liability" (regex landed for secret redaction). The queued replacements under that policy, in value order: swap the curl subprocess for a proper HTTP client (`ureq` or async `reqwest`) in the embedding, LLM, and Hugr API sync transports; move the daemon's hand-parsed HTTP handling onto `axum` (tokio is already the runtime); replace hand-escaped JSON rendering in context packs with serde derive; consider `fastembed` for fully in-process local embeddings once the build-weight tradeoff is worth it (the `ollama` provider covers local semantic recall today); and a `scip` importer for LSP-grade reference graphs.
+Dependency policy shifted from "no new crates" to "best tool where it removes a liability": regex landed for secret redaction, and fastembed landed for in-process ONNX embeddings (`HUGR_EMBEDDING_PROVIDER=local`, default-on `local-embeddings` cargo feature, models cached under `~/.hugr/models`), so real semantic recall needs no API key and no sidecar service. The queued replacements still open, in value order: swap the curl subprocess for a proper HTTP client (`ureq` or async `reqwest`) in the embedding, LLM, and Hugr API sync transports; move the daemon's hand-parsed HTTP handling onto `axum` (tokio is already the runtime); replace hand-escaped JSON rendering in context packs with serde derive; and a `scip` importer for LSP-grade reference graphs. A follow-up decision: whether `local` should replace `deterministic` as the default provider once first-run download UX (progress reporting, offline behavior) is settled.
 
 A dogfooding review of `hugr context` on this repository previously fixed four output-quality gaps: reference extraction was accidentally quadratic (a full index of this repo never finished; it now takes seconds), Rust files with inline `#[cfg(test)]` modules produced false `missing_test_mapping` risks, symbol ranking listed top-of-file declarations because every symbol in a path-matched file scored identically, and graph neighborhoods spent most of their token budget on repeated same-file reference lines with ambiguous labels. The follow-up pass fixed cross-file edge erosion during context runs and ambiguous same-name reference targets.
 
