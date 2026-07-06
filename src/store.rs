@@ -276,6 +276,9 @@ pub struct Store {
     root: PathBuf,
     embedding_provider: Result<SelectedEmbeddingProvider, String>,
     storage_config: Result<StorageConfig, String>,
+    /// True for the user-level store under ~/.hugr: no project registration,
+    /// always local storage, memories tagged with global scope provenance.
+    global: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -380,7 +383,20 @@ impl Store {
             root: PathBuf::from(HUGR_DIR),
             embedding_provider: SelectedEmbeddingProvider::from_env(),
             storage_config: StorageConfig::from_env(),
+            global: false,
         }
+    }
+
+    /// Opens the user-level memory store shared across projects. Global
+    /// memory is deliberately device-local: it ignores remote storage modes
+    /// and is never part of project sync classes.
+    pub fn open_global() -> Result<Self, String> {
+        Ok(Self {
+            root: global_root(|name| env::var(name).ok())?,
+            embedding_provider: SelectedEmbeddingProvider::from_env(),
+            storage_config: Ok(StorageConfig::local()),
+            global: true,
+        })
     }
 
     #[cfg(test)]
@@ -389,6 +405,15 @@ impl Store {
             root,
             embedding_provider: Ok(SelectedEmbeddingProvider::default()),
             storage_config: Ok(StorageConfig::local()),
+            global: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn open_global_at(root: PathBuf) -> Self {
+        Self {
+            global: true,
+            ..Self::open_at(root)
         }
     }
 
@@ -400,8 +425,10 @@ impl Store {
         }
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
-        let project = current_project_input()?;
-        upsert_project(&conn, project).await?;
+        if !self.global {
+            let project = current_project_input()?;
+            upsert_project(&conn, project).await?;
+        }
         Ok(())
     }
 
@@ -452,8 +479,12 @@ impl Store {
         self.init().await?;
         let conn = self.connect().await?;
         let options = normalize_memory_write_options(options)?;
-        let project = project_from_conn(&conn).await?;
-        let structured_payload = memory_write_payload(&options, project.as_ref());
+        let project = if self.global {
+            None
+        } else {
+            project_from_conn(&conn).await?
+        };
+        let structured_payload = memory_write_payload(&options, project.as_ref(), self.global);
         insert_memory(
             &conn,
             self.embedding_provider()?,
@@ -2962,7 +2993,7 @@ fn hugr_api_remember_payloads(
     let options = normalize_memory_write_options(options)?;
     let now = now_ms()?;
     let project = project_from_input(current_project_input()?, now);
-    let structured_payload = memory_write_payload(&options, Some(&project));
+    let structured_payload = memory_write_payload(&options, Some(&project), false);
     let memory = Memory {
         id: format!("mem_{now}"),
         created_at_ms: now,
@@ -10314,7 +10345,6 @@ impl SyncBackend {
 }
 
 impl StorageConfig {
-    #[cfg(test)]
     fn local() -> Self {
         Self {
             mode: StorageMode::Local,
@@ -11239,9 +11269,16 @@ fn project_scope_payload(project: &Project) -> serde_json::Value {
     })
 }
 
-fn memory_write_payload(options: &MemoryWriteOptions, project: Option<&Project>) -> Option<String> {
+fn memory_write_payload(
+    options: &MemoryWriteOptions,
+    project: Option<&Project>,
+    global_scope: bool,
+) -> Option<String> {
     let mut payload = serde_json::Map::new();
 
+    if global_scope {
+        payload.insert("scope".to_string(), json!("global"));
+    }
     if let Some(project) = project {
         payload.insert("project".to_string(), project_scope_payload(project));
     }
@@ -11537,6 +11574,16 @@ fn query_terms(query: &str) -> Vec<String> {
         .filter(|term| term.len() > 2)
         .map(|term| term.to_lowercase())
         .collect()
+}
+
+fn global_root(lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+    if let Some(dir) = lookup("HUGR_GLOBAL_DIR").filter(|value| !value.trim().is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    lookup("HOME")
+        .filter(|value| !value.trim().is_empty())
+        .map(|home| PathBuf::from(home).join(HUGR_DIR))
+        .ok_or_else(|| "global memory requires HOME or HUGR_GLOBAL_DIR".to_string())
 }
 
 fn now_ms() -> Result<i64, String> {
@@ -14801,6 +14848,66 @@ mod tests {
 
         assert!(facts.iter().any(|fact| fact.kind == "test"));
         assert!(facts.iter().any(|fact| fact.kind == "summary"));
+    }
+
+    #[tokio::test]
+    async fn global_store_tags_scope_and_skips_project_registration() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("hugr_global_{unique}"));
+        let store = Store::open_global_at(workspace.join(".hugr"));
+
+        let memory = store
+            .remember_with_options(
+                "prefer rebase over merge",
+                super::MemoryWriteOptions::default(),
+            )
+            .await
+            .unwrap();
+        let payload = memory.structured_payload.as_deref().unwrap();
+        let parsed = serde_json::from_str::<serde_json::Value>(payload).unwrap();
+        assert_eq!(parsed["scope"], "global");
+        assert!(
+            parsed.get("project").is_none(),
+            "global memories must not carry project scope: {payload}"
+        );
+
+        let recalled = store.recall("rebase", 5).await.unwrap();
+        assert_eq!(recalled.len(), 1);
+
+        let conn = store.connect().await.unwrap();
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM projects", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            row.get::<i64>(0).unwrap(),
+            0,
+            "global store must not register the current project"
+        );
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn global_root_prefers_override_then_home() {
+        let override_lookup =
+            |name: &str| (name == "HUGR_GLOBAL_DIR").then(|| "/custom/global".to_string());
+        assert_eq!(
+            super::global_root(override_lookup).unwrap(),
+            PathBuf::from("/custom/global")
+        );
+
+        let home_lookup = |name: &str| (name == "HOME").then(|| "/home/dev".to_string());
+        assert_eq!(
+            super::global_root(home_lookup).unwrap(),
+            PathBuf::from("/home/dev/.hugr")
+        );
+
+        assert!(super::global_root(|_| None).is_err());
     }
 
     #[tokio::test]

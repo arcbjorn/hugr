@@ -7,10 +7,12 @@ pub enum Command {
     Remember {
         text: String,
         options: MemoryWriteArgs,
+        global: bool,
     },
     Recall {
         query: String,
         format: OutputFormat,
+        global: bool,
     },
     Context {
         task: String,
@@ -102,6 +104,7 @@ pub enum Command {
     Forget {
         query: String,
         format: OutputFormat,
+        global: bool,
     },
     Eval {
         from_git: usize,
@@ -157,6 +160,7 @@ impl Command {
                 Ok(Self::Recall {
                     query: text.value,
                     format: text.format,
+                    global: text.global,
                 })
             }
             "context" => parse_context_command(args),
@@ -200,6 +204,7 @@ impl Command {
                 Ok(Self::Forget {
                     query: text.value,
                     format: text.format,
+                    global: text.global,
                 })
             }
             "eval" => parse_eval_command(args),
@@ -215,6 +220,7 @@ impl Command {
 fn parse_remember_command(args: &[String]) -> Result<Command, String> {
     let mut options = MemoryWriteArgs::default();
     let mut words = Vec::new();
+    let mut global = false;
     let mut index = 2;
 
     while index < args.len() {
@@ -274,6 +280,8 @@ fn parse_remember_command(args: &[String]) -> Result<Command, String> {
                 Some(value),
                 "hugr remember --valid-to",
             )?);
+        } else if arg == "--global" {
+            global = true;
         } else if arg.starts_with("--") {
             return Err(format!("unknown option '{arg}'"));
         } else {
@@ -287,7 +295,11 @@ fn parse_remember_command(args: &[String]) -> Result<Command, String> {
     if text.trim().is_empty() {
         Err("hugr remember requires text".to_string())
     } else {
-        Ok(Command::Remember { text, options })
+        Ok(Command::Remember {
+            text,
+            options,
+            global,
+        })
     }
 }
 
@@ -720,6 +732,7 @@ struct ImproveOptions {
 struct TextOutput {
     value: String,
     format: OutputFormat,
+    global: bool,
 }
 
 fn required_text_from(args: &[String], start: usize, command: &str) -> Result<String, String> {
@@ -728,11 +741,14 @@ fn required_text_from(args: &[String], start: usize, command: &str) -> Result<St
 
 fn required_text_output(args: &[String], command: &str) -> Result<TextOutput, String> {
     let mut format = OutputFormat::Markdown;
+    let mut global = false;
     let mut words = Vec::new();
 
     for arg in args.iter().skip(2) {
         if arg == "--json" {
             format = OutputFormat::Json;
+        } else if arg == "--global" {
+            global = true;
         } else {
             words.push(arg.clone());
         }
@@ -742,7 +758,11 @@ fn required_text_output(args: &[String], command: &str) -> Result<TextOutput, St
     if value.trim().is_empty() {
         Err(format!("hugr {command} requires text"))
     } else {
-        Ok(TextOutput { value, format })
+        Ok(TextOutput {
+            value,
+            format,
+            global,
+        })
     }
 }
 
@@ -922,7 +942,7 @@ fn parse_hook_command(args: &[String]) -> Result<Command, String> {
 }
 
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] [--budget <tokens>] <task>\n  hugr index [--paths <p1,p2,...>]\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr replace-symbol [--json] [--kind <kind>] <path> <symbol> (--body <source> | --body-file <path>)\n  hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>\n  hugr move-symbol [--json] [--kind <kind>] [--rewrite-references] <source-path> <symbol> <destination-path>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--llm] [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr eval [--json] [--from-git <n>] [--max-files <n>] [--min-hit-rate <0.0-1.0>]\n  hugr install <claude-code|cursor> [--shared]\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--global] [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--global] [--json] <query>\n  hugr context [--json] [--budget <tokens>] <task>\n  hugr index [--paths <p1,p2,...>]\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr replace-symbol [--json] [--kind <kind>] <path> <symbol> (--body <source> | --body-file <path>)\n  hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>\n  hugr move-symbol [--json] [--kind <kind>] [--rewrite-references] <source-path> <symbol> <destination-path>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--llm] [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--global] [--json] <query>\n  hugr eval [--json] [--from-git <n>] [--max-files <n>] [--min-hit-rate <0.0-1.0>]\n  hugr install <claude-code|cursor> [--shared]\n  hugr doctor\n"
 }
 
 #[cfg(test)]
@@ -989,7 +1009,8 @@ mod tests {
             Command::parse(&args),
             Ok(Command::Recall {
                 query: "plugin hooks".into(),
-                format: OutputFormat::Json
+                format: OutputFormat::Json,
+                global: false,
             })
         );
     }
@@ -1499,6 +1520,52 @@ mod tests {
             Ok(Command::Remember {
                 text: "plugin hooks".into(),
                 options: MemoryWriteArgs::default(),
+                global: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_global_memory_flags() {
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "remember".into(),
+                "--global".into(),
+                "prefer".into(),
+                "rebase".into()
+            ]),
+            Ok(Command::Remember {
+                text: "prefer rebase".into(),
+                options: MemoryWriteArgs::default(),
+                global: true,
+            })
+        );
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "recall".into(),
+                "--global".into(),
+                "--json".into(),
+                "rebase".into()
+            ]),
+            Ok(Command::Recall {
+                query: "rebase".into(),
+                format: OutputFormat::Json,
+                global: true,
+            })
+        );
+        assert_eq!(
+            Command::parse(&[
+                "hugr".into(),
+                "forget".into(),
+                "--global".into(),
+                "rebase".into()
+            ]),
+            Ok(Command::Forget {
+                query: "rebase".into(),
+                format: OutputFormat::Markdown,
+                global: true,
             })
         );
     }
@@ -1523,6 +1590,7 @@ mod tests {
                     }),
                     ..MemoryWriteArgs::default()
                 },
+                global: false,
             })
         );
         assert_eq!(
@@ -1542,6 +1610,7 @@ mod tests {
                     }),
                     ..MemoryWriteArgs::default()
                 },
+                global: false,
             })
         );
     }
@@ -1570,6 +1639,7 @@ mod tests {
                     valid_to: Some("2026-12-31".into()),
                     ..MemoryWriteArgs::default()
                 },
+                global: false,
             })
         );
     }
@@ -1641,7 +1711,8 @@ mod tests {
             ]),
             Ok(Command::Forget {
                 query: "plugin hooks".into(),
-                format: OutputFormat::Json
+                format: OutputFormat::Json,
+                global: false,
             })
         );
     }

@@ -27,8 +27,16 @@ pub async fn execute(command: Command) -> Result<(), String> {
     match command {
         Command::Init => init().await,
         Command::Status => status().await,
-        Command::Remember { text, options } => remember(&text, &options).await,
-        Command::Recall { query, format } => recall(&query, format).await,
+        Command::Remember {
+            text,
+            options,
+            global,
+        } => remember(&text, &options, global).await,
+        Command::Recall {
+            query,
+            format,
+            global,
+        } => recall(&query, format, global).await,
         Command::Context {
             task,
             format,
@@ -91,7 +99,11 @@ pub async fn execute(command: Command) -> Result<(), String> {
             stale,
             format,
         } => improve(execute, duplicates, stale, format).await,
-        Command::Forget { query, format } => forget(&query, format).await,
+        Command::Forget {
+            query,
+            format,
+            global,
+        } => forget(&query, format, global).await,
         Command::Eval {
             from_git,
             max_files,
@@ -151,16 +163,28 @@ async fn status() -> Result<(), String> {
     Ok(())
 }
 
-async fn remember(text: &str, options: &MemoryWriteArgs) -> Result<(), String> {
-    let store = Store::open_current();
+async fn remember(text: &str, options: &MemoryWriteArgs, global: bool) -> Result<(), String> {
+    let store = store_for_scope(global)?;
     let write_options = memory_write_options_from_args(options)?;
-    let memory = if write_options == MemoryWriteOptions::default() {
+    let memory = if write_options == MemoryWriteOptions::default() && !global {
         store.remember(text).await?
     } else {
         store.remember_with_options(text, write_options).await?
     };
-    println!("remembered {}", memory.id);
+    if global {
+        println!("remembered {} (global)", memory.id);
+    } else {
+        println!("remembered {}", memory.id);
+    }
     Ok(())
+}
+
+fn store_for_scope(global: bool) -> Result<Store, String> {
+    if global {
+        Store::open_global()
+    } else {
+        Ok(Store::open_current())
+    }
 }
 
 fn memory_write_options_from_args(args: &MemoryWriteArgs) -> Result<MemoryWriteOptions, String> {
@@ -194,8 +218,8 @@ fn parse_memory_confidence(value: &str) -> Result<f64, String> {
         .map_err(|_| "memory confidence must be a number".to_string())
 }
 
-async fn recall(query: &str, format: OutputFormat) -> Result<(), String> {
-    let matches = Store::open_current().recall(query, 10).await?;
+async fn recall(query: &str, format: OutputFormat, global: bool) -> Result<(), String> {
+    let matches = store_for_scope(global)?.recall(query, 10).await?;
 
     if format == OutputFormat::Json {
         println!("{}", render_recall_json(query, &matches));
@@ -264,7 +288,22 @@ pub(crate) async fn compile_context_pack_with_file_candidates(
 ) -> Result<(ContextPack, Vec<String>), String> {
     let token_budget = resolve_context_token_budget(budget, |name| std::env::var(name).ok())?;
     let store = Store::open_current();
-    let memories = store.recall(task, 5).await?;
+    let mut memories = store.recall(task, 5).await?;
+    // User-level memories join project recall best-effort: a missing HOME or
+    // absent global store must never fail project context compilation.
+    if let Ok(global_store) = Store::open_global() {
+        if let Ok(global_memories) = global_store.recall(task, 3).await {
+            let seen = memories
+                .iter()
+                .map(|memory| memory.id.clone())
+                .collect::<HashSet<_>>();
+            memories.extend(
+                global_memories
+                    .into_iter()
+                    .filter(|memory| !seen.contains(&memory.id)),
+            );
+        }
+    }
     let relevant_memory_ids = memories
         .iter()
         .map(|memory| memory.id.clone())
@@ -1122,8 +1161,8 @@ async fn improve(
     Ok(())
 }
 
-async fn forget(query: &str, format: OutputFormat) -> Result<(), String> {
-    let result = Store::open_current().forget(query, 25).await?;
+async fn forget(query: &str, format: OutputFormat, global: bool) -> Result<(), String> {
+    let result = store_for_scope(global)?.forget(query, 25).await?;
 
     if format == OutputFormat::Json {
         println!("{}", render_forget_json(&result));
