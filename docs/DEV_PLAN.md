@@ -118,6 +118,11 @@ Implemented:
 - Rust `#[cfg(test)]` inline test modules map their own file as a test candidate in local, hosted, sync-record, and persisted mapping paths
 - symbol retrieval and context evidence rank identifier-word and bounded-stem name matches above signature and path hits, prefer callable kinds on ties, and report which field matched
 - graph neighborhoods collapse repeated reference sites per (kind, path, target) into one entry with a structured `site_count`, rank cross-file relationships above same-file ones, and name the defining file for cross-file targets in labels and citation ids
+- partial indexing (`hugr context` candidate refresh) resolves references against refreshed candidate symbols plus stored symbols for all other files, so context runs no longer erode cross-file edges
+- ambiguous same-name references resolve per file: local definitions shadow foreign ones, import-line file-stem evidence narrows the rest behind a generic-stem deny list, and member calls keep every candidate
+- `hugr eval [--json] [--from-git <n>] [--max-files <n>] [--min-hit-rate <f>]` replays recent commit subjects as tasks and scores the real context compiler against the files each commit touched (recall, hit rate, MRR, symbol-file hits, pre-budget candidate hits) with skip-reason accounting and an optional CI gate
+- `hugr install <claude-code|cursor> [--shared]` writes merged, idempotent MCP registration plus Claude Code session hooks, and the hidden `hugr hook claude-code <event>` stdin adapter maps agent events to session start/edit/end-plus-promote without ever failing the agent
+- GitHub Actions runs a report-only context-eval job against the last 30 commits on every push
 - initial vision, storage, and technical blueprint docs
 
 Near-term parser and hosted API checklist is complete. Remaining broader product gaps are tracked below.
@@ -625,6 +630,11 @@ Recommended next commits:
 97. Done: `feat(testmap): map rust inline test modules`
 98. Done: `feat(context): rank symbols by name relevance`
 99. Done: `feat(context): collapse graph reference sites`
+100. Done: `fix(index): keep cross-file refs on partial index`
+101. Done: `feat(code): resolve ambiguous references`
+102. Done: `feat(eval): score context against git history`
+103. Done: `feat(install): wire agents in one command`
+104. Done: `ci(eval): report context eval baseline`
 
 Each commit should leave the CLI usable.
 
@@ -641,7 +651,11 @@ Before ending each future session:
 
 ## Current Best Next Step
 
-A dogfooding review of `hugr context` on this repository fixed four output-quality gaps: reference extraction was accidentally quadratic (a full index of this repo never finished; it now takes seconds), Rust files with inline `#[cfg(test)]` modules produced false `missing_test_mapping` risks, symbol ranking listed top-of-file declarations because every symbol in a path-matched file scored identically, and graph neighborhoods spent most of their token budget on repeated same-file reference lines with ambiguous labels. Context packs on this repository now surface the task-relevant functions first, map inline tests, and compress the graph section into distinct cross-file relationships.
+Context quality is now measurable: `hugr eval --from-git` scores the real compiler against the repository's own commit history, and CI reports it on every push. The first baseline on this repository (30 commits) is file recall 0.925, hit rate 0.933, MRR 0.274. The gap between recall and MRR is the next concrete target: the right files are almost always retrieved but rarely ranked near the top, so ranking-order work (and only that work) will move MRR without risking recall. Before turning the CI job into a `--min-hit-rate` gate, run the harness on two or three foreign repositories to make sure thresholds are not overfitted to this repository's commit style.
+
+Adoption now has a one-command path (`hugr install claude-code|cursor`); a natural follow-up is a Codex/other-agent target and an install-time `hugr index` kick-off.
+
+A dogfooding review of `hugr context` on this repository previously fixed four output-quality gaps: reference extraction was accidentally quadratic (a full index of this repo never finished; it now takes seconds), Rust files with inline `#[cfg(test)]` modules produced false `missing_test_mapping` risks, symbol ranking listed top-of-file declarations because every symbol in a path-matched file scored identically, and graph neighborhoods spent most of their token budget on repeated same-file reference lines with ambiguous labels. The follow-up pass fixed cross-file edge erosion during context runs and ambiguous same-name reference targets.
 
 The planned product systems are complete. Incremental freshness (deletion pruning, watcher-scoped partial refresh, persisted test-map/source-embedding refresh, semantic source-embedding file ranking, and `stale_context` invalidation), broader structural edits (Kotlin/Java import rewriting, manifest-resolved Go package moves, manifest-resolved Swift module moves, CommonJS `require` and export rewrites), safer source/destination-file reference handling during moves, and deeper deterministic risk signals (`long_parameter_list`, `high_fan_in`, `deep_nesting`, `cyclomatic_complexity`) all landed with unit and live coverage.
 
