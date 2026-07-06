@@ -8,12 +8,13 @@ use crate::eval;
 use crate::impact as impact_analysis;
 use crate::indexer;
 use crate::install;
+use crate::llm;
 use crate::mcp;
 use crate::store::{
     DiagnosticInput, ForgetResult, Memory, MemoryConsolidationResult, MemoryMaintenanceReport,
-    MemorySource, MemoryWriteOptions, SessionPromotionResult, StaleRetirementResult, Store,
-    SyncConflictSummary, SyncExecutionPlan, SyncPullResult, SyncPushResult, SyncRunHistory,
-    SyncTableResult,
+    MemorySource, MemoryWriteOptions, SessionFact, SessionPromotionResult, SessionSynthesis,
+    StaleRetirementResult, Store, SyncConflictSummary, SyncExecutionPlan, SyncPullResult,
+    SyncPushResult, SyncRunHistory, SyncTableResult,
 };
 use crate::worktree;
 use std::collections::HashSet;
@@ -72,7 +73,7 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::SessionStart { task } => session_start(&task).await,
         Command::SessionEvent { kind, detail } => session_event(&kind, &detail).await,
         Command::SessionEnd { summary } => session_end(summary.as_deref()).await,
-        Command::SessionPromote { format } => session_promote(format).await,
+        Command::SessionPromote { format, llm } => session_promote(format, llm).await,
         Command::SyncStatus { format } => sync_status(format).await,
         Command::SyncPush { dry_run, format } => sync_push(dry_run, format).await,
         Command::SyncPull { dry_run, format } => sync_pull(dry_run, format).await,
@@ -683,8 +684,28 @@ async fn session_end(summary: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-async fn session_promote(format: OutputFormat) -> Result<(), String> {
-    let result = Store::open_current().promote_latest_session().await?;
+async fn session_promote(format: OutputFormat, llm: bool) -> Result<(), String> {
+    let store = Store::open_current();
+    let result = if llm {
+        let synthesizer = llm::ChatSynthesizer::from_env()?;
+        let synthesize = |task: &str, facts: &[SessionFact]| -> Result<SessionSynthesis, String> {
+            let lines = facts
+                .iter()
+                .map(|fact| format!("{}: {}", fact.kind, fact.detail))
+                .collect::<Vec<_>>();
+            let text = synthesizer.synthesize(task, &lines)?;
+            Ok(SessionSynthesis {
+                text,
+                provider: synthesizer.provider().to_string(),
+                model: synthesizer.model().to_string(),
+            })
+        };
+        store
+            .promote_latest_session_with_synthesis(Some(&synthesize))
+            .await?
+    } else {
+        store.promote_latest_session().await?
+    };
 
     if format == OutputFormat::Json {
         println!("{}", render_session_promotion_json(&result));

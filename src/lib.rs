@@ -10,6 +10,7 @@ mod eval;
 mod impact;
 mod indexer;
 mod install;
+mod llm;
 mod mcp;
 mod migrations;
 mod redact;

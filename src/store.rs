@@ -208,6 +208,23 @@ pub struct SessionPromotionResult {
     pub memory: Memory,
 }
 
+/// An LLM-distilled session summary supplied by the command layer. The store
+/// records which provider and model produced the text so the promoted memory
+/// carries synthesis provenance next to its session facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSynthesis {
+    pub text: String,
+    pub provider: String,
+    pub model: String,
+}
+
+/// Callers hand promotion an optional synthesizer instead of a finished text
+/// because the session facts only become known inside the store; any error
+/// falls back to the deterministic digest so promotion never fails because a
+/// model was unreachable.
+pub type SessionSynthesizerFn<'a> =
+    &'a (dyn Fn(&str, &[SessionFact]) -> Result<SessionSynthesis, String> + Send + Sync);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgetResult {
     pub query: String,
@@ -1639,11 +1656,19 @@ impl Store {
     }
 
     pub async fn promote_latest_session(&self) -> Result<SessionPromotionResult, String> {
+        self.promote_latest_session_with_synthesis(None).await
+    }
+
+    pub async fn promote_latest_session_with_synthesis(
+        &self,
+        synthesizer: Option<SessionSynthesizerFn<'_>>,
+    ) -> Result<SessionPromotionResult, String> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return promote_latest_session_via_hugr_api(
                 &storage_config,
                 self.embedding_provider()?,
+                synthesizer,
             );
         }
 
@@ -1656,7 +1681,7 @@ impl Store {
         let session = latest_session(&conn)
             .await?
             .ok_or_else(|| "no session available to promote".to_string())?;
-        self.promote_session(&conn, session).await
+        self.promote_session(&conn, session, synthesizer).await
     }
 
     pub(crate) async fn promote_next_unpromoted_session(
@@ -1672,13 +1697,14 @@ impl Store {
             return Ok(None);
         };
 
-        self.promote_session(&conn, session).await.map(Some)
+        self.promote_session(&conn, session, None).await.map(Some)
     }
 
     async fn promote_session(
         &self,
         conn: &Connection,
         session: Session,
+        synthesizer: Option<SessionSynthesizerFn<'_>>,
     ) -> Result<SessionPromotionResult, String> {
         let facts = session_promotion_facts(conn, &session).await?;
         if facts.is_empty() {
@@ -1694,9 +1720,14 @@ impl Store {
             });
         }
 
-        let memory_text = session_promotion_text(&session, &facts);
+        let synthesis = apply_session_synthesizer(synthesizer, &session.task, &facts);
+        let memory_text = synthesis
+            .as_ref()
+            .map(|synthesis| synthesis.text.clone())
+            .unwrap_or_else(|| session_promotion_text(&session, &facts));
         let project = project_from_conn(conn).await?;
-        let structured_payload = session_promotion_payload(&session, &facts, project.as_ref());
+        let structured_payload =
+            session_promotion_payload(&session, &facts, project.as_ref(), synthesis.as_ref());
         let memory = insert_memory(
             conn,
             self.embedding_provider()?,
@@ -2984,14 +3015,19 @@ fn hugr_api_session_promotion_payloads(
     session: &Session,
     facts: &[SessionFact],
     project: Option<&Project>,
+    synthesis: Option<&SessionSynthesis>,
 ) -> Result<(Memory, Vec<SyncApiTablePayload>, SessionPromotionSyncRecord), String> {
     let now = now_ms()?;
-    let structured_payload = Some(session_promotion_payload(session, facts, project));
+    let structured_payload = Some(session_promotion_payload(
+        session, facts, project, synthesis,
+    ));
     let memory = Memory {
         id: format!("mem_{now}"),
         created_at_ms: now,
         kind: "fact".to_string(),
-        text: session_promotion_text(session, facts),
+        text: synthesis
+            .map(|synthesis| synthesis.text.clone())
+            .unwrap_or_else(|| session_promotion_text(session, facts)),
         structured_payload: structured_payload.clone(),
     };
     let memory_record = MemorySyncRecord {
@@ -5002,6 +5038,7 @@ fn end_session_via_hugr_api(
 fn promote_latest_session_via_hugr_api(
     config: &StorageConfig,
     embedding_provider: &SelectedEmbeddingProvider,
+    synthesizer: Option<SessionSynthesizerFn<'_>>,
 ) -> Result<SessionPromotionResult, String> {
     let snapshot = fetch_hugr_api_storage_snapshot(config)?;
     let sessions = storage_sessions(&snapshot)?;
@@ -5027,11 +5064,13 @@ fn promote_latest_session_via_hugr_api(
     }
 
     let project = project_for_storage_snapshot(&snapshot)?;
+    let synthesis = apply_session_synthesizer(synthesizer, &session.task, &facts);
     let (memory, payloads, promotion_record) = hugr_api_session_promotion_payloads(
         embedding_provider,
         &session,
         &facts,
         project.as_ref(),
+        synthesis.as_ref(),
     )?;
     post_hugr_api_memory_payloads(config, "promote session", &payloads)?;
     post_hugr_api_storage_payloads(
@@ -11131,6 +11170,7 @@ fn session_promotion_payload(
     session: &Session,
     facts: &[SessionFact],
     project: Option<&Project>,
+    synthesis: Option<&SessionSynthesis>,
 ) -> String {
     let facts = facts
         .iter()
@@ -11159,8 +11199,34 @@ fn session_promotion_payload(
     if let Some(project) = project {
         payload.insert("project".to_string(), project_scope_payload(project));
     }
+    if let Some(synthesis) = synthesis {
+        payload.insert(
+            "synthesis".to_string(),
+            json!({
+                "provider": &synthesis.provider,
+                "model": &synthesis.model
+            }),
+        );
+    }
 
     json!(payload).to_string()
+}
+
+/// Runs the optional synthesizer, downgrading any failure to a warning so
+/// promotion always succeeds with the deterministic digest as fallback.
+fn apply_session_synthesizer(
+    synthesizer: Option<SessionSynthesizerFn<'_>>,
+    task: &str,
+    facts: &[SessionFact],
+) -> Option<SessionSynthesis> {
+    let synthesizer = synthesizer?;
+    match synthesizer(task, facts) {
+        Ok(synthesis) => Some(synthesis),
+        Err(error) => {
+            eprintln!("llm synthesis failed, falling back to deterministic summary: {error}");
+            None
+        }
+    }
 }
 
 fn project_scope_payload(project: &Project) -> serde_json::Value {
@@ -12716,6 +12782,7 @@ mod tests {
             &session,
             &facts,
             Some(&project),
+            None,
         )
         .unwrap();
 
@@ -14734,6 +14801,86 @@ mod tests {
 
         assert!(facts.iter().any(|fact| fact.kind == "test"));
         assert!(facts.iter().any(|fact| fact.kind == "summary"));
+    }
+
+    #[tokio::test]
+    async fn promotes_sessions_with_llm_synthesis_and_provenance() {
+        let test = TestStore::new("llm_promotion");
+        test.store
+            .start_session("stabilize plugin hooks")
+            .await
+            .unwrap();
+        test.store
+            .record_session_event("test", "cargo test failed on hook ordering")
+            .await
+            .unwrap();
+        test.store
+            .end_session(Some("hooks now run after config"))
+            .await
+            .unwrap();
+
+        let synthesize =
+            |task: &str, facts: &[super::SessionFact]| -> Result<super::SessionSynthesis, String> {
+                Ok(super::SessionSynthesis {
+                    text: format!("Distilled: {task} taught us {} facts.", facts.len()),
+                    provider: "test-provider".to_string(),
+                    model: "fake-model".to_string(),
+                })
+            };
+        let promoted = test
+            .store
+            .promote_latest_session_with_synthesis(Some(&synthesize))
+            .await
+            .unwrap();
+
+        assert!(
+            promoted
+                .memory
+                .text
+                .starts_with("Distilled: stabilize plugin hooks")
+        );
+        let payload = promoted.memory.structured_payload.as_deref().unwrap();
+        let parsed = serde_json::from_str::<serde_json::Value>(payload).unwrap();
+        assert_eq!(parsed["synthesis"]["provider"], "test-provider");
+        assert_eq!(parsed["synthesis"]["model"], "fake-model");
+        assert_eq!(parsed["source"]["type"], "session_promotion");
+    }
+
+    #[tokio::test]
+    async fn failed_synthesis_falls_back_to_deterministic_promotion() {
+        let test = TestStore::new("llm_promotion_fallback");
+        test.store
+            .start_session("stabilize plugin hooks")
+            .await
+            .unwrap();
+        test.store
+            .end_session(Some("hooks are wired"))
+            .await
+            .unwrap();
+
+        let synthesize =
+            |_: &str, _: &[super::SessionFact]| -> Result<super::SessionSynthesis, String> {
+                Err("model unreachable".to_string())
+            };
+        let promoted = test
+            .store
+            .promote_latest_session_with_synthesis(Some(&synthesize))
+            .await
+            .unwrap();
+
+        assert!(
+            promoted
+                .memory
+                .text
+                .starts_with("Session 'stabilize plugin hooks' produced durable findings"),
+            "fallback must use the deterministic digest: {}",
+            promoted.memory.text
+        );
+        let payload = promoted.memory.structured_payload.as_deref().unwrap();
+        assert!(
+            !payload.contains("\"synthesis\""),
+            "failed synthesis must not claim provenance"
+        );
     }
 
     #[tokio::test]
