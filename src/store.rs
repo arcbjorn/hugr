@@ -1479,17 +1479,9 @@ impl Store {
 
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
+        let (sql, args) = symbol_recall_query(&terms);
         let mut rows = conn
-            .query(
-                "
-                SELECT path, language, name, kind, line_start, line_end, signature
-                FROM code_symbols
-                WHERE project_id = ?1
-                ORDER BY indexed_at_ms DESC, path ASC, line_start ASC
-                LIMIT 2000
-                ",
-                params![LOCAL_PROJECT_ID],
-            )
+            .query(&sql, args)
             .await
             .map_err(|error| error.to_string())?;
         let mut matches = Vec::new();
@@ -11294,6 +11286,38 @@ fn session_fact_score(fact: &SessionFact, terms: &[String]) -> usize {
         .count()
 }
 
+/// Builds the SQL prefilter for symbol recall. A blind recency-ordered LIMIT
+/// made symbols beyond the first 2000 rows invisible on large repositories,
+/// so the WHERE clause narrows candidates per term instead. The name check
+/// uses the term's four-character stem so bounded prefix stemming
+/// (rank/ranking) still reaches the scorer, which remains the arbiter; LIKE
+/// underscore wildcards only widen the candidate set, never narrow it.
+fn symbol_recall_query(terms: &[String]) -> (String, Vec<libsql::Value>) {
+    let mut sql = String::from(
+        "SELECT path, language, name, kind, line_start, line_end, signature \
+         FROM code_symbols WHERE project_id = ? AND (",
+    );
+    let mut args: Vec<libsql::Value> = vec![LOCAL_PROJECT_ID.into()];
+
+    for (index, term) in terms.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(" OR ");
+        }
+        sql.push_str(
+            "name LIKE '%' || ? || '%' OR path LIKE '%' || ? || '%' \
+             OR signature LIKE '%' || ? || '%' OR kind = ?",
+        );
+        let name_stem = term.chars().take(4).collect::<String>();
+        args.push(name_stem.into());
+        args.push(term.clone().into());
+        args.push(term.clone().into());
+        args.push(term.clone().into());
+    }
+
+    sql.push_str(") ORDER BY indexed_at_ms DESC, path ASC, line_start ASC LIMIT 5000");
+    (sql, args)
+}
+
 fn code_symbol_score(symbol: &CodeSymbol, terms: &[String], query: &str) -> usize {
     let name = symbol.name.to_lowercase();
     let path = symbol.path.to_lowercase();
@@ -14066,6 +14090,77 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_symbols_finds_targets_beyond_recency_windows() {
+        let test = TestStore::new("symbol_prefilter");
+        let target_file = FileCandidate {
+            path: "src/zz_special.rs".to_string(),
+            score: 0,
+            language: Some("rust".to_string()),
+            size_bytes: Some(120),
+        };
+        let target = CodeSymbol {
+            path: target_file.path.clone(),
+            language: target_file.language.clone(),
+            name: "special_target_fn".to_string(),
+            kind: "function".to_string(),
+            line_start: 1,
+            line_end: None,
+            signature: "pub fn special_target_fn()".to_string(),
+        };
+        test.store
+            .record_code_index(
+                std::slice::from_ref(&target_file),
+                std::slice::from_ref(&target),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        // Newer filler rows in excess of the old blind LIMIT 2000 window, so a
+        // recency-ordered scan without a prefilter would never see the target.
+        let filler_file = FileCandidate {
+            path: "src/aa_filler.rs".to_string(),
+            score: 0,
+            language: Some("rust".to_string()),
+            size_bytes: Some(120),
+        };
+        let fillers = (0..2100)
+            .map(|index| CodeSymbol {
+                path: filler_file.path.clone(),
+                language: filler_file.language.clone(),
+                name: format!("filler_helper_{index}"),
+                kind: "function".to_string(),
+                line_start: index + 1,
+                line_end: None,
+                signature: format!("fn filler_helper_{index}()"),
+            })
+            .collect::<Vec<_>>();
+        test.store
+            .record_code_index(std::slice::from_ref(&filler_file), &fillers, &[])
+            .await
+            .unwrap();
+
+        let matches = test
+            .store
+            .recall_symbols("special target", 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            matches.first().map(|symbol| symbol.name.as_str()),
+            Some("special_target_fn"),
+            "prefiltered recall must reach symbols older than the recency window"
+        );
+
+        let stemmed = test.store.recall_symbols("targeting", 5).await.unwrap();
+        assert!(
+            stemmed
+                .iter()
+                .any(|symbol| symbol.name == "special_target_fn"),
+            "stem matches must survive the SQL prefilter"
         );
     }
 
