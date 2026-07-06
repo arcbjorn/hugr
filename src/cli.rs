@@ -15,6 +15,7 @@ pub enum Command {
     Context {
         task: String,
         format: OutputFormat,
+        budget: Option<usize>,
     },
     Index {
         paths: Vec<String>,
@@ -157,13 +158,7 @@ impl Command {
                     format: text.format,
                 })
             }
-            "context" => {
-                let text = required_text_output(args, "context")?;
-                Ok(Self::Context {
-                    task: text.value,
-                    format: text.format,
-                })
-            }
+            "context" => parse_context_command(args),
             "index" => parse_index_command(args),
             "symbols" => {
                 let text = required_text_output(args, "symbols")?;
@@ -807,6 +802,35 @@ fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions,
     })
 }
 
+fn parse_context_command(args: &[String]) -> Result<Command, String> {
+    let mut format = OutputFormat::Markdown;
+    let mut budget = None;
+    let mut words = Vec::new();
+    let mut index = 2;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => format = OutputFormat::Json,
+            "--budget" => {
+                index += 1;
+                budget = Some(parse_positive_usize(args.get(index), "--budget")?);
+            }
+            word => words.push(word.to_string()),
+        }
+        index += 1;
+    }
+
+    let task = words.join(" ");
+    if task.trim().is_empty() {
+        return Err("hugr context requires text".to_string());
+    }
+    Ok(Command::Context {
+        task,
+        format,
+        budget,
+    })
+}
+
 fn parse_eval_command(args: &[String]) -> Result<Command, String> {
     let mut from_git = 30usize;
     let mut max_files = 8usize;
@@ -888,7 +912,7 @@ fn parse_hook_command(args: &[String]) -> Result<Command, String> {
 }
 
 pub fn help_text() -> &'static str {
-    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] <task>\n  hugr index [--paths <p1,p2,...>]\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr replace-symbol [--json] [--kind <kind>] <path> <symbol> (--body <source> | --body-file <path>)\n  hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>\n  hugr move-symbol [--json] [--kind <kind>] [--rewrite-references] <source-path> <symbol> <destination-path>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr eval [--json] [--from-git <n>] [--max-files <n>] [--min-hit-rate <0.0-1.0>]\n  hugr install <claude-code|cursor> [--shared]\n  hugr doctor\n"
+    "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--json] <query>\n  hugr context [--json] [--budget <tokens>] <task>\n  hugr index [--paths <p1,p2,...>]\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr replace-symbol [--json] [--kind <kind>] <path> <symbol> (--body <source> | --body-file <path>)\n  hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>\n  hugr move-symbol [--json] [--kind <kind>] [--rewrite-references] <source-path> <symbol> <destination-path>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--json] <query>\n  hugr eval [--json] [--from-git <n>] [--max-files <n>] [--min-hit-rate <0.0-1.0>]\n  hugr install <claude-code|cursor> [--shared]\n  hugr doctor\n"
 }
 
 #[cfg(test)]
@@ -907,9 +931,39 @@ mod tests {
             Command::parse(&args),
             Ok(Command::Context {
                 task: "add hooks".into(),
-                format: OutputFormat::Markdown
+                format: OutputFormat::Markdown,
+                budget: None
             })
         );
+    }
+
+    #[test]
+    fn parses_context_budget_option() {
+        let args = vec![
+            "hugr".into(),
+            "context".into(),
+            "--budget".into(),
+            "16000".into(),
+            "add".into(),
+            "hooks".into(),
+        ];
+        assert_eq!(
+            Command::parse(&args),
+            Ok(Command::Context {
+                task: "add hooks".into(),
+                format: OutputFormat::Markdown,
+                budget: Some(16000)
+            })
+        );
+
+        let invalid = vec![
+            "hugr".into(),
+            "context".into(),
+            "--budget".into(),
+            "zero".into(),
+            "task".into(),
+        ];
+        assert!(Command::parse(&invalid).is_err());
     }
 
     #[test]

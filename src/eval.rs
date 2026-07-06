@@ -118,7 +118,7 @@ pub(crate) async fn run(options: EvalOptions) -> Result<(), String> {
         match prepare_case(commit, options.max_files, &|path| Path::new(path).is_file()) {
             Ok(case) => {
                 let (pack, candidates) =
-                    commands::compile_context_pack_with_file_candidates(&case.task).await?;
+                    commands::compile_context_pack_with_file_candidates(&case.task, None).await?;
                 let pack_files = pack
                     .relevant_files
                     .iter()

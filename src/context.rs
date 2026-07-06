@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::fs;
 
-const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 4000;
+pub(crate) const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 4000;
 const LARGE_SYMBOL_LINE_THRESHOLD: i64 = 80;
 const VERY_LARGE_SYMBOL_LINE_THRESHOLD: i64 = 200;
 const REFACTOR_SURFACE_FILE_THRESHOLD: usize = 3;
@@ -289,6 +289,7 @@ impl ContextPack {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
         task: &str,
         file_candidates: Vec<FileCandidate>,
@@ -301,6 +302,37 @@ impl ContextPack {
         graph_neighbors: Vec<GraphNeighbor>,
         freshness_signals: Vec<FreshnessSignal>,
         diagnostics: Vec<Diagnostic>,
+    ) -> Self {
+        Self::with_inputs_and_budget(
+            task,
+            file_candidates,
+            memories,
+            sessions,
+            symbols,
+            tests,
+            branch_state,
+            stale_candidates,
+            graph_neighbors,
+            freshness_signals,
+            diagnostics,
+            DEFAULT_CONTEXT_TOKEN_BUDGET,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_inputs_and_budget(
+        task: &str,
+        file_candidates: Vec<FileCandidate>,
+        memories: Vec<Memory>,
+        sessions: Vec<SessionFact>,
+        symbols: Vec<CodeSymbol>,
+        tests: Vec<TestCandidate>,
+        branch_state: Option<WorktreeState>,
+        stale_candidates: Vec<StaleMemoryCandidate>,
+        graph_neighbors: Vec<GraphNeighbor>,
+        freshness_signals: Vec<FreshnessSignal>,
+        diagnostics: Vec<Diagnostic>,
+        token_budget: usize,
     ) -> Self {
         let terms = context_query_terms(task);
         let relevant_files = file_candidates
@@ -471,7 +503,7 @@ impl ContextPack {
         let mut pack = Self {
             task: task.to_string(),
             budget: ContextBudget {
-                max_tokens: DEFAULT_CONTEXT_TOKEN_BUDGET,
+                max_tokens: token_budget,
                 estimated_tokens: 0,
                 truncated_sections: Vec::new(),
             },
@@ -494,7 +526,7 @@ impl ContextPack {
             citations: Vec::new(),
         };
         pack.rank_context_sections();
-        pack.apply_token_budget(DEFAULT_CONTEXT_TOKEN_BUDGET);
+        pack.apply_token_budget(token_budget);
         pack
     }
 
@@ -2925,6 +2957,47 @@ mod tests {
     use crate::worktree::{ChangedFile, WorktreeState};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn custom_budgets_reach_the_pack_and_control_trimming() {
+        let inputs = |budget: usize| {
+            ContextPack::with_inputs_and_budget(
+                "add plugin hooks",
+                vec![FileCandidate {
+                    path: "src/plugin.rs".to_string(),
+                    score: 3,
+                    language: Some("rust".to_string()),
+                    size_bytes: Some(1000),
+                }],
+                vec![Memory {
+                    id: "mem_1".to_string(),
+                    created_at_ms: 7,
+                    kind: "fact".to_string(),
+                    text: "plugin hooks run after configuration is loaded".to_string(),
+                    structured_payload: None,
+                }],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                budget,
+            )
+        };
+
+        let generous = inputs(16000);
+        assert_eq!(generous.budget.max_tokens, 16000);
+        assert!(generous.budget.truncated_sections.is_empty());
+        assert_eq!(generous.relevant_files.len(), 1);
+
+        let starved = inputs(1);
+        assert_eq!(starved.budget.max_tokens, 1);
+        assert!(!starved.budget.truncated_sections.is_empty());
+        assert!(starved.relevant_files.is_empty());
+    }
 
     #[test]
     fn symbol_evidence_distinguishes_name_matches_from_path_matches() {

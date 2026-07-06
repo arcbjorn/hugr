@@ -28,7 +28,11 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::Status => status().await,
         Command::Remember { text, options } => remember(&text, &options).await,
         Command::Recall { query, format } => recall(&query, format).await,
-        Command::Context { task, format } => context(&task, format).await,
+        Command::Context {
+            task,
+            format,
+            budget,
+        } => context(&task, format, budget).await,
         Command::Index { paths } => index(&paths).await,
         Command::Symbols { query, format } => symbols(&query, format).await,
         Command::Impact { target, format } => impact(&target, format).await,
@@ -209,8 +213,10 @@ async fn recall(query: &str, format: OutputFormat) -> Result<(), String> {
     Ok(())
 }
 
-async fn context(task: &str, format: OutputFormat) -> Result<(), String> {
-    let pack = compile_context_pack(task).await?;
+async fn context(task: &str, format: OutputFormat, budget: Option<usize>) -> Result<(), String> {
+    let pack = compile_context_pack_with_file_candidates(task, budget)
+        .await?
+        .0;
 
     if format == OutputFormat::Json {
         println!("{}", pack.render_json());
@@ -221,8 +227,31 @@ async fn context(task: &str, format: OutputFormat) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) async fn compile_context_pack(task: &str) -> Result<ContextPack, String> {
-    Ok(compile_context_pack_with_file_candidates(task).await?.0)
+const MIN_CONTEXT_TOKEN_BUDGET: usize = 500;
+
+/// Budgets come from the explicit flag/tool argument first, then the
+/// HUGR_CONTEXT_TOKEN_BUDGET environment variable, then the default. Budgets
+/// below the minimum would trim every section and produce useless packs, so
+/// they are rejected rather than clamped silently.
+pub(crate) fn resolve_context_token_budget(
+    explicit: Option<usize>,
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> Result<usize, String> {
+    let budget = match explicit {
+        Some(value) => value,
+        None => match env_lookup("HUGR_CONTEXT_TOKEN_BUDGET") {
+            Some(value) => value.trim().parse::<usize>().map_err(|_| {
+                format!("HUGR_CONTEXT_TOKEN_BUDGET must be a positive integer, got '{value}'")
+            })?,
+            None => crate::context::DEFAULT_CONTEXT_TOKEN_BUDGET,
+        },
+    };
+    if budget < MIN_CONTEXT_TOKEN_BUDGET {
+        return Err(format!(
+            "context token budget must be at least {MIN_CONTEXT_TOKEN_BUDGET}, got {budget}"
+        ));
+    }
+    Ok(budget)
 }
 
 /// Compiles a context pack and also returns the pre-budget relevant-file
@@ -230,7 +259,9 @@ pub(crate) async fn compile_context_pack(task: &str) -> Result<ContextPack, Stri
 /// retrieval versus budget trimming.
 pub(crate) async fn compile_context_pack_with_file_candidates(
     task: &str,
+    budget: Option<usize>,
 ) -> Result<(ContextPack, Vec<String>), String> {
+    let token_budget = resolve_context_token_budget(budget, |name| std::env::var(name).ok())?;
     let store = Store::open_current();
     let memories = store.recall(task, 5).await?;
     let relevant_memory_ids = memories
@@ -268,20 +299,20 @@ pub(crate) async fn compile_context_pack_with_file_candidates(
         .await?;
     let diagnostics = store.recent_diagnostics(task, &files, &symbols, 8).await?;
     let branch_state = worktree::inspect(Path::new("."));
-    let pack =
-        ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
-            task,
-            file_candidates,
-            memories,
-            sessions,
-            symbols,
-            affected_tests,
-            Some(branch_state),
-            stale_candidates,
-            graph_neighbors,
-            freshness_signals,
-            diagnostics,
-        );
+    let pack = ContextPack::with_inputs_and_budget(
+        task,
+        file_candidates,
+        memories,
+        sessions,
+        symbols,
+        affected_tests,
+        Some(branch_state),
+        stale_candidates,
+        graph_neighbors,
+        freshness_signals,
+        diagnostics,
+        token_budget,
+    );
     store
         .record_context_pack(&pack.task, &pack.render_json())
         .await?;
@@ -1696,7 +1727,7 @@ mod tests {
         render_symbols_json, render_symbols_text, render_sync_history_json,
         render_sync_history_text, render_sync_pull_json, render_sync_pull_text,
         render_sync_push_json, render_sync_push_text, render_sync_status_json,
-        render_sync_status_text, shell_hook_text,
+        render_sync_status_text, resolve_context_token_budget, shell_hook_text,
     };
     use crate::code::CodeSymbol;
     use crate::store::{
@@ -1705,6 +1736,27 @@ mod tests {
         StaleRetirementResult, SyncConflictSummary, SyncExecutionPlan, SyncPullResult,
         SyncPushResult, SyncRunHistory, SyncTableResult,
     };
+
+    #[test]
+    fn resolves_context_budgets_from_flag_env_and_default() {
+        let no_env = |_: &str| None;
+        let env_8000 = |name: &str| (name == "HUGR_CONTEXT_TOKEN_BUDGET").then(|| "8000".into());
+        let env_bad = |name: &str| (name == "HUGR_CONTEXT_TOKEN_BUDGET").then(|| "lots".into());
+
+        assert_eq!(resolve_context_token_budget(Some(16000), no_env), Ok(16000));
+        assert_eq!(resolve_context_token_budget(None, env_8000), Ok(8000));
+        assert_eq!(
+            resolve_context_token_budget(None, no_env),
+            Ok(crate::context::DEFAULT_CONTEXT_TOKEN_BUDGET)
+        );
+        assert!(resolve_context_token_budget(Some(100), no_env).is_err());
+        assert!(resolve_context_token_budget(None, env_bad).is_err());
+        assert_eq!(
+            resolve_context_token_budget(Some(16000), env_8000),
+            Ok(16000),
+            "explicit budget wins over the environment"
+        );
+    }
 
     #[test]
     fn command_observation_detail_records_status_and_output_tails() {
