@@ -1,8 +1,11 @@
 # Hugr
 
-**Hugr is a project memory and intelligence system for coding agents.** It gives an agent a durable, structured understanding of a codebase — what the code does, what changed, what was learned, what failed before, and which decisions still matter — and compiles that understanding into concise, cited context for the task at hand.
+[![CI](https://github.com/arcbjorn/hugr/actions/workflows/ci.yml/badge.svg)](https://github.com/arcbjorn/hugr/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Hugr runs locally, in the cloud, or as a hybrid service near your code. All state lives in a single SQLite-compatible libSQL database, so memory, full-text search, embeddings, and the code graph need no external services.
+**Hugr is a project memory and intelligence system for coding agents**, built on a local semantic code graph and a temporal, provenance-tracked memory store. It gives an agent a durable, structured understanding of a codebase — what the code does, what changed, what was learned, what failed before, and which decisions still matter — and compiles that understanding into concise, citation-grounded context for the task at hand.
+
+Hugr is local-first: it runs on the developer machine by default, in the cloud, or as a hybrid service near your code. All state lives in a single SQLite-compatible libSQL database, so memory, full-text search, embeddings, and the code graph need no external services.
 
 ## Why Hugr
 
@@ -10,9 +13,9 @@ Coding agents start every session from zero. They re-discover the same files, re
 
 Hugr solves that with three connected systems:
 
-1. **A memory engine** that stores facts with provenance, confidence, and validity windows, and that detects and retires duplicated or contradicted facts over time.
-2. **A code intelligence engine** that indexes symbols, references, tests, and git state across eight languages, incrementally and without an IDE.
-3. **A context compiler** that merges both into a ranked, token-budgeted, citation-backed context pack for a specific task.
+1. **A temporal memory engine** that stores facts in a provenance-tracked knowledge graph with confidence scores and validity windows, consolidates duplicates, and retires contradicted facts by supersession rather than deletion — memory stays auditable and correctable.
+2. **A code intelligence engine** that builds a local semantic code graph — AST-derived symbols, typed reference edges, test mappings, and git state across eight languages — incrementally and without an IDE or language server.
+3. **A context compiler** that runs hybrid retrieval (full-text, vector, and graph expansion) over both, then emits a ranked, token-budgeted, citation-grounded context pack for a specific task.
 
 ## The Flagship Command
 
@@ -58,11 +61,11 @@ Output is Markdown for humans or JSON (`--json`) for agents.
 
 - A local daemon watches file changes, git state, and worktree events for active sessions.
 - `hugr run <command>` captures command outcomes and parses structured diagnostics; `hugr shell-hook` observes ordinary shell commands.
-- Ended sessions are automatically summarized and promoted into durable memories, optionally distilled through a local or hosted LLM.
+- Ended sessions are automatically summarized and promoted into durable memories — episodic observations consolidated into semantic memory — optionally distilled through a local or hosted LLM.
 
-### Retrieval and embeddings
+### Hybrid retrieval and embeddings
 
-- Recall combines full-text search, vector similarity, and deterministic reranking.
+- Recall fuses FTS5 full-text search, vector similarity, and graph expansion with deterministic reranking — GraphRAG-style retrieval with no LLM in the loop.
 - Embedding providers: `deterministic` (offline default), `local` (in-process ONNX, no API key, no sidecar), `ollama`, and `openai`.
 
 ### Agent integration
@@ -74,7 +77,7 @@ Output is Markdown for humans or JSON (`--json`) for agents.
 
 - Local, hybrid, and remote storage modes with the same schema and commands.
 - Opt-in sync of safe data classes to remote libSQL/Turso or a hosted Hugr API; full source, raw output, and secrets never sync without explicit opt-in.
-- `hugr eval` scores the context compiler against your own git history (recall, hit rate, MRR) so context quality is measurable, and measured in CI.
+- `hugr eval` scores the context compiler against your own git history (recall, hit rate, MRR), so context quality is measurable — and measured on every push in CI.
 
 ## Quick Start
 
@@ -110,7 +113,7 @@ hugr context "add lifecycle hooks to plugins"
 | Services | `daemon`, `mcp` |
 | Sync | `sync status\|push\|pull\|history` |
 
-Most commands accept `--json`. See the [technical blueprint](docs/TECHNICAL_BLUEPRINT.md) for the full surface with flags.
+Most commands accept `--json`. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full surface with flags.
 
 ## Configuration
 
@@ -153,26 +156,49 @@ The daemon is useful without the cloud; the cloud needs no local state. The same
 | Term | Definition |
 | --- | --- |
 | **Context pack** | The compiled output of `hugr context`: ranked, cited, token-budgeted evidence for one task. |
+| **Semantic code graph** | The AST-derived index of symbols and the typed reference edges between them (calls, imports, inheritance, implementations, instantiations, type references). |
+| **Knowledge graph** | The linked network of memories, sources, entities, and edges that grounds every fact in its origin. Hugr's is temporal: facts carry validity windows and supersession links. |
+| **Hybrid retrieval** | Fusing full-text search, vector similarity, and graph expansion into one ranked result, rather than relying on any single signal. |
+| **GraphRAG** | Graph-augmented retrieval: expanding retrieved evidence through knowledge-graph relationships before ranking. Hugr does this deterministically, without an LLM in the retrieval loop. |
 | **Memory** | A durable remembered fact with provenance, confidence, sensitivity, and a validity window. |
 | **Provenance** | The recorded origin of a fact: file, symbol, commit, command, session, or user note. |
+| **Episodic / semantic memory** | Cognitive-science distinction Hugr follows: sessions capture episodic observations (what happened); promotion consolidates them into semantic memories (what is durably true). |
+| **Consolidation** | Memory maintenance over time: merging duplicates, resolving contradictions, and promoting session observations (`hugr improve`, session promotion). |
+| **Supersession** | Retiring a fact by linking it to the newer fact that replaces it (`superseded_by`), instead of deleting it. Keeps memory auditable. |
+| **Temporal validity** | Every memory carries `valid_from`/`valid_to` bounds, so facts can expire, be time-scoped, or be retired without loss of history. |
 | **Session** | One observed unit of agent or human work: files touched, commands run, outcomes, and a summary. |
-| **Promotion** | Turning an ended session's facts into a durable memory. |
-| **Code graph** | The indexed network of symbols and typed references between them. |
-| **Risk signal** | A deterministic warning attached to a context pack, such as a stale fact or an untested file. |
+| **Promotion** | Consolidating an ended session's episodic facts into a durable semantic memory. |
+| **Impact analysis** | Computing the blast radius of a change from the semantic code graph before editing (`hugr impact`). |
+| **Risk signal** | A deterministic warning attached to a context pack, such as a stale fact, an untested file, or a high fan-in symbol. |
+| **Local-first** | The full system — storage, indexing, embeddings, retrieval — works on the developer machine with no network dependency; cloud and sync are opt-in. |
+| **AST** | Abstract syntax tree — the parsed structure of source code, produced by tree-sitter, from which symbols and references are extracted. |
 | **MCP** | Model Context Protocol — the open standard agents use to call external tools. |
-| **FTS** | Full-text search, provided natively by the storage layer. |
+| **FTS5** | SQLite's full-text search engine, used natively by the storage layer for lexical recall. |
 | **ONNX** | Open Neural Network Exchange — the model format used for in-process local embeddings. |
 | **libSQL** | An open-source SQLite fork with native vector search, used embedded locally and server-side by Turso. |
 | **MRR** | Mean reciprocal rank — the ranking-quality metric reported by `hugr eval`. |
 | **SCIP** | SCIP Code Intelligence Protocol — a code-indexing format planned for LSP-grade reference import. |
 
+## Development
+
+```bash
+cargo fmt --check          # formatting
+cargo test                 # full test suite
+cargo test -- --ignored    # live Hugr API client/server contract tests
+```
+
+The `local-embeddings` cargo feature (in-process ONNX) is on by default; build with `--no-default-features` for a slim binary — the `deterministic`, `ollama`, and `openai` providers remain available. CI runs formatting, tests, the live API smoke, and a report-only context eval against the last 30 commits on every push.
+
 ## Documentation
 
-- [VISION.md](VISION.md) — product vision and principles
-- [docs/TECHNICAL_BLUEPRINT.md](docs/TECHNICAL_BLUEPRINT.md) — architecture, entities, and surfaces
-- [docs/STORAGE.md](docs/STORAGE.md) — storage model and retrieval
+- [VISION.md](VISION.md) — product principle and product test
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how it is built: storage, entities, engines, surfaces
 - [docs/ROADMAP.md](docs/ROADMAP.md) — what comes next
 
 ## Acknowledgements
 
-Hugr draws inspiration from Cognee, TraceDecay, Serena, Graphiti, Mem0, LangMem, and FastContext.
+Hugr draws inspiration from [Cognee](https://github.com/topoteretes/cognee), [TraceDecay](https://github.com/ScriptedAlchemy/tracedecay), [Serena](https://github.com/oraios/serena), [Graphiti](https://github.com/getzep/graphiti), [Mem0](https://github.com/mem0ai/mem0), [LangMem](https://github.com/langchain-ai/langmem), and FastContext.
+
+## License
+
+[MIT](LICENSE)
