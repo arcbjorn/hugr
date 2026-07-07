@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" role="img" aria-label="Hugr architecture diagram">
+  <style>
+    text { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; }
+    .h  { fill: #E6EDF3; font-size: 16px; font-weight: 600; }
+    .ha { fill: #F0B429; font-size: 16px; font-weight: 600; }
+    .s  { fill: #8B949E; font-size: 12px; }
+    .i  { fill: #C9D1D9; font-size: 13px; }
+    .cmd { fill: #F0B429; font-size: 15px; font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; }
+    .box { fill: #161B22; stroke: #30363D; stroke-width: 1.5; }
+    .edge { stroke: #8B949E; stroke-width: 1.5; fill: none; }
+    .edgeA { stroke: #F0B429; stroke-width: 2; fill: none; }
+    .link { stroke: #30363D; stroke-width: 1.5; stroke-dasharray: 3 3; fill: none; }
+  </style>
+  <defs>
+    <marker id="aS" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8B949E"/>
+    </marker>
+    <marker id="aA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#F0B429"/>
+    </marker>
+  </defs>
+
+  <rect x="0.75" y="0.75" width="1198.5" height="558.5" rx="12" fill="#0D1117" stroke="#30363D" stroke-width="1.5"/>
+
+  <!-- flagship command -->
+  <text x="745" y="48" text-anchor="middle" class="cmd">hugr context "task"</text>
+  <path d="M745,58 L745,102" class="link" marker-end="url(#aS)"/>
+
+  <!-- inputs -->
+  <rect x="40" y="89" width="180" height="58" rx="8" class="box"/>
+  <text x="130" y="115" text-anchor="middle" class="h" font-size="15">Source files</text>
+  <text x="130" y="134" text-anchor="middle" class="s">eight languages</text>
+
+  <rect x="40" y="249" width="180" height="58" rx="8" class="box"/>
+  <text x="130" y="275" text-anchor="middle" class="h" font-size="15">Remembered facts</text>
+  <text x="130" y="294" text-anchor="middle" class="s">hugr remember · promotion</text>
+
+  <rect x="40" y="409" width="180" height="58" rx="8" class="box"/>
+  <text x="130" y="435" text-anchor="middle" class="h" font-size="15">Agent activity</text>
+  <text x="130" y="454" text-anchor="middle" class="s">edits · commands · tests</text>
+
+  <line x1="222" y1="118" x2="294" y2="118" class="edge" marker-end="url(#aS)"/>
+  <line x1="222" y1="278" x2="294" y2="278" class="edge" marker-end="url(#aS)"/>
+  <line x1="222" y1="438" x2="294" y2="438" class="edge" marker-end="url(#aS)"/>
+
+  <!-- engines -->
+  <rect x="300" y="70" width="250" height="96" rx="8" class="box"/>
+  <text x="425" y="104" text-anchor="middle" class="h">Semantic code graph</text>
+  <text x="425" y="128" text-anchor="middle" class="s">AST symbols · typed references</text>
+  <text x="425" y="146" text-anchor="middle" class="s">test mapping · git state</text>
+
+  <rect x="300" y="230" width="250" height="96" rx="8" class="box"/>
+  <text x="425" y="264" text-anchor="middle" class="h">Temporal memory</text>
+  <text x="425" y="288" text-anchor="middle" class="s">facts · provenance · confidence</text>
+  <text x="425" y="306" text-anchor="middle" class="s">validity windows · supersession</text>
+
+  <rect x="300" y="390" width="250" height="96" rx="8" class="box"/>
+  <text x="425" y="424" text-anchor="middle" class="h">Session observation</text>
+  <text x="425" y="448" text-anchor="middle" class="s">commands · diagnostics · outcomes</text>
+  <text x="425" y="466" text-anchor="middle" class="s">secret-redacted</text>
+
+  <path d="M552,118 C592,118 578,176 614,176" class="edge" marker-end="url(#aS)"/>
+  <line x1="552" y1="278" x2="614" y2="278" class="edge" marker-end="url(#aS)"/>
+  <path d="M552,438 C592,438 578,384 614,384" class="edge" marker-end="url(#aS)"/>
+
+  <!-- context compiler -->
+  <rect x="620" y="110" width="250" height="340" rx="8" fill="#161B22" stroke="#F0B429" stroke-width="2"/>
+  <text x="745" y="152" text-anchor="middle" class="ha">Context compiler</text>
+  <circle cx="654" cy="192" r="3" fill="#F0B429"/>
+  <text x="668" y="197" class="i">hybrid retrieval</text>
+  <text x="668" y="229" class="s">FTS5 · vector · graph</text>
+  <circle cx="654" cy="260" r="3" fill="#F0B429"/>
+  <text x="668" y="265" class="i">evidence ranking</text>
+  <circle cx="654" cy="294" r="3" fill="#F0B429"/>
+  <text x="668" y="299" class="i">risk signals</text>
+  <circle cx="654" cy="328" r="3" fill="#F0B429"/>
+  <text x="668" y="333" class="i">token budgeting</text>
+  <circle cx="654" cy="362" r="3" fill="#F0B429"/>
+  <text x="668" y="367" class="i">citations</text>
+
+  <line x1="874" y1="280" x2="934" y2="280" class="edgeA" marker-end="url(#aA)"/>
+
+  <!-- context pack -->
+  <rect x="940" y="193" width="220" height="174" rx="8" class="box"/>
+  <text x="1050" y="225" text-anchor="middle" class="ha">Context pack</text>
+  <text x="1050" y="252" text-anchor="middle" class="s">memories · files · symbols</text>
+  <text x="1050" y="274" text-anchor="middle" class="s">graph neighbors · tests</text>
+  <text x="1050" y="296" text-anchor="middle" class="s">diagnostics · risk signals</text>
+  <text x="1050" y="318" text-anchor="middle" class="s">citations on every item</text>
+  <text x="1050" y="340" text-anchor="middle" class="s">within token budget</text>
+
+  <line x1="1050" y1="371" x2="1050" y2="412" class="edgeA" marker-end="url(#aA)"/>
+  <text x="1062" y="396" class="s">Markdown · JSON</text>
+
+  <!-- agent -->
+  <rect x="940" y="418" width="220" height="68" rx="8" class="box"/>
+  <text x="1050" y="446" text-anchor="middle" class="h" font-size="15">Coding agent</text>
+  <text x="1050" y="466" text-anchor="middle" class="s">Claude Code · Cursor · MCP</text>
+
+  <!-- storage -->
+  <rect x="300" y="498" width="570" height="38" rx="8" class="box"/>
+  <text x="585" y="522" text-anchor="middle" class="s">libSQL / Turso — relational · FTS5 · vector index · graph tables · sync history</text>
+  <path d="M425,488 L425,496" class="link"/>
+  <path d="M745,452 L745,496" class="link"/>
+</svg>
