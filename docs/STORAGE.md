@@ -4,10 +4,11 @@ Hugr uses libSQL/Turso Vector as its primary storage layer.
 
 The goal is to keep the early product simple and powerful: memory records, provenance, full-text search, graph edges, temporal fields, and embeddings live in one SQLite-compatible database.
 
-## Local Path
+## Local Paths
 
 ```text
-.hugr/hugr.db
+.hugr/hugr.db    project store
+~/.hugr/         global memory store and local embedding model cache
 ```
 
 ## Why This Fits
@@ -32,11 +33,11 @@ CREATE TABLE memory_embeddings (
 );
 ```
 
-The first implementation creates the vector-ready table before embedding generation exists. The first implementation also creates `memory_embeddings_vector_idx` with `libsql_vector_idx(embedding)`. When embeddings are wired in, Hugr should query it with `vector_top_k` and use vector search as one signal in recall and context-pack generation.
+`memory_embeddings_vector_idx` is created with `libsql_vector_idx(embedding)` and queried with `vector_top_k`. Embeddings are generated synchronously on `remember` by the configured provider (`HUGR_EMBEDDING_PROVIDER=deterministic|openai|ollama|local`); all vectors normalize to the 1536-wide columns so provider dimensions can differ.
 
-## Retrieval Plan
+## Retrieval
 
-Recall should rank evidence from multiple signals:
+Recall ranks evidence from multiple signals:
 
 1. Full-text memory search.
 2. Vector similarity over memory embeddings.
