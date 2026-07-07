@@ -1,6 +1,6 @@
 # Hugr Roadmap
 
-All product systems from the [technical blueprint](TECHNICAL_BLUEPRINT.md) have a first shipped implementation. This roadmap tracks what comes next; the shipped surface is documented in the [README](../README.md) and the blueprint.
+All planned product systems have a first shipped implementation. This roadmap tracks what comes next; the shipped surface is documented in the [README](../README.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Now
 
