@@ -89,7 +89,7 @@ hugr recall "plugin hooks"
 hugr context "add lifecycle hooks to plugins"
 hugr impact src/plugins/manager.ts
 hugr improve
-hugr forget --stale
+hugr forget "plugin hooks"
 hugr doctor
 ```
 
@@ -139,15 +139,6 @@ hugr daemon
     citations
 ```
 
-## Near-Term Build Order
+## Status
 
-1. Project registry and config.
-2. Fast file discovery and indexing.
-3. Session memory store.
-4. Basic remember and recall.
-5. Code symbol extraction.
-6. Task context packs.
-7. Git-aware freshness.
-8. Impact and affected tests.
-9. Memory improvement and stale fact handling.
-10. Cloud/hybrid service boundary.
+All capabilities in this vision have a first shipped implementation. See the [README](README.md) for the shipped surface and [docs/ROADMAP.md](docs/ROADMAP.md) for what comes next.
