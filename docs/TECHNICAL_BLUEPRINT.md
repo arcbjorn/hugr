@@ -85,11 +85,11 @@ The daemon should be useful without the cloud service.
 
 Start with embedded local storage. Keep the schema portable enough for a future server deployment.
 
-Recommended initial stack:
+Current stack:
 
 - libSQL/Turso Vector as the primary relational, FTS, and vector store.
 - `F32_BLOB(...)` columns for embeddings inside normal database tables.
-- `libsql_vector_idx(...)` vector indexes and `vector_top_k` for semantic recall once embeddings are wired in.
+- `libsql_vector_idx(...)` vector indexes and `vector_top_k` for semantic recall.
 - Embedded graph representation in relational tables first.
 - Optional graph database later only if graph traversal becomes the bottleneck.
 
@@ -115,7 +115,7 @@ Initial local path:
 .hugr/hugr.db
 ```
 
-Initial vector-ready table shape:
+Vector table shape:
 
 ```sql
 CREATE TABLE memory_embeddings (
@@ -126,7 +126,7 @@ CREATE TABLE memory_embeddings (
 );
 ```
 
-Once embedding generation is implemented, semantic recall should combine:
+Semantic recall combines:
 
 1. full-text search over memory text
 2. vector search over `memory_embeddings.embedding`
@@ -368,19 +368,20 @@ Index layers:
 
 ## Semantic Operations
 
-Hugr should not become a full IDE, but it should expose exact semantic capabilities where they improve agent reliability.
+Hugr should not become a full IDE, but it exposes exact semantic capabilities where they improve agent reliability.
 
-Capabilities:
+Shipped:
 
-- find symbol
-- find references
-- goto definition
-- diagnostics for file or project
-- replace symbol body
-- insert before or after symbol
-- rename when backed by language tooling
+- symbol lookup (`hugr symbols`)
+- reference and impact tracing (`hugr impact`)
+- structured diagnostics captured from `hugr run` output
+- safe symbol body replacement (`hugr replace-symbol`)
+- reference-aware rename (`hugr rename-symbol`)
+- reference-aware move across files, packages, and modules (`hugr move-symbol`)
 
-These operations should be treated as precise tools, not the main product identity.
+Future candidates: goto definition, insert before/after symbol, LSP-grade reference graphs via a `scip` importer.
+
+These operations are precise tools, not the main product identity.
 
 ## Context Compiler
 
@@ -422,9 +423,9 @@ Output sections:
 
 ## MCP Surface
 
-Start with a small high-value tool surface.
+Keep a small high-value tool surface.
 
-Required tools:
+Current tools:
 
 - `hugr_context`
 - `hugr_remember`
@@ -432,7 +433,11 @@ Required tools:
 - `hugr_forget`
 - `hugr_project_status`
 - `hugr_index`
+- `hugr_symbols`
 - `hugr_impact`
+- `hugr_replace_symbol`
+- `hugr_rename_symbol`
+- `hugr_move_symbol`
 - `hugr_session_start`
 - `hugr_session_event`
 - `hugr_session_end`
@@ -443,20 +448,31 @@ Avoid exposing dozens of low-level tools as the default interface. Add advanced 
 
 ```bash
 hugr init
-hugr daemon
-hugr index
 hugr status
-hugr remember <text>
-hugr recall <query>
-hugr context <task>
-hugr impact <file-or-symbol>
-hugr session start
-hugr session event
-hugr session end
-hugr improve
-hugr forget
 hugr doctor
+hugr daemon [--addr <host:port>]
+hugr index [--paths <p1,p2,...>]
+hugr remember <text> [--global] [--source <kind:locator>] [--confidence ...] [--sensitivity ...]
+hugr recall <query> [--global]
+hugr forget <query> [--global]
+hugr improve [--execute --duplicates|--stale]
+hugr context <task> [--budget <tokens>]
+hugr symbols <query>
+hugr impact <file-or-symbol>
+hugr replace-symbol <path> <symbol>
+hugr rename-symbol <path> <symbol> <new-symbol>
+hugr move-symbol <source-path> <symbol> <destination-path> [--rewrite-references]
+hugr project status
+hugr session start|event|end
+hugr session promote [--llm]
+hugr run <command>
+hugr shell-hook <bash|zsh>
+hugr sync status|push|pull|history
+hugr eval [--from-git <n>] [--min-hit-rate <f>]
+hugr install <claude-code|cursor> [--shared]
 ```
+
+Most commands accept `--json` for agent consumption.
 
 ## Sync Boundary
 
@@ -482,63 +498,9 @@ Should require explicit opt-in:
 - private user notes
 - shell history
 
-## MVP Phases
+## MVP Status
 
-### Phase 1: Local Memory Core
-
-- Rust CLI.
-- Project registry.
-- libSQL/Turso Vector storage.
-- Vector-ready memory schema with `F32_BLOB(...)` embedding columns.
-- `remember`, `recall`, `forget`.
-- Session table.
-- Basic MCP server.
-
-### Phase 2: Fast Project Index
-
-- File discovery.
-- Ignore rules.
-- FTS index.
-- Git state detection.
-- Incremental freshness.
-
-### Phase 3: Context Packs
-
-- `hugr context`.
-- Memory + file retrieval.
-- Citations.
-- Token budget.
-- Rendered agent output.
-
-### Phase 4: Code Graph
-
-- Symbol extraction.
-- Definitions and references.
-- Imports and module relationships.
-- Basic impact radius.
-
-### Phase 5: Sessions and Improve
-
-- Agent session hooks.
-- Command/test/file event capture.
-- Session summarization.
-- Memory promotion.
-- Duplicate and contradiction handling.
-
-### Phase 6: Tests and Risk
-
-- Test discovery.
-- Affected test mapping.
-- Complexity and coupling signals.
-- Risk section in context packs.
-
-### Phase 7: Cloud and Hybrid
-
-- Remote API.
-- Auth.
-- Sync protocol.
-- Worker separation.
-- Hosted memory service.
+All seven planned MVP phases have shipped: local memory core, fast project index, context packs, code graph, sessions and improve, tests and risk, and the cloud/hybrid boundary with a hosted API. See [ROADMAP.md](ROADMAP.md) for what comes next.
 
 ## Non-Goals For The First Build
 
