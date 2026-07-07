@@ -1,9 +1,4 @@
-# hugr
-.agent-out/
-.worktrees/
 target/
 .hugr/
-
-# arkestra
 .agent-out/
 .worktrees/
