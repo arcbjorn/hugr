@@ -1,5 +1,9 @@
 # Hugr
 
+<p align="center">
+  <img src="docs/assets/hugr-banner.png" alt="Hugr — the world tree, crown and roots mirrored, before a rising amber sun" width="100%">
+</p>
+
 [![CI](https://github.com/arcbjorn/hugr/actions/workflows/ci.yml/badge.svg)](https://github.com/arcbjorn/hugr/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -16,6 +20,14 @@ Hugr solves that with three connected systems:
 1. **A temporal memory engine** that stores facts in a provenance-tracked knowledge graph with confidence scores and validity windows, consolidates duplicates, and retires contradicted facts by supersession rather than deletion — memory stays auditable and correctable.
 2. **A code intelligence engine** that builds a local semantic code graph — AST-derived symbols, typed reference edges, test mappings, and git state across eight languages — incrementally and without an IDE or language server.
 3. **A context compiler** that runs hybrid retrieval (full-text, vector, and graph expansion) over both, then emits a ranked, token-budgeted, citation-grounded context pack for a specific task.
+
+## Architecture
+
+<p align="center">
+  <img src="docs/assets/architecture.svg" alt="Hugr architecture: source files, remembered facts, and agent activity feed the semantic code graph, temporal memory, and session observation engines; the context compiler runs hybrid retrieval over them and emits a cited, token-budgeted context pack to the coding agent, all backed by one libSQL database" width="100%">
+</p>
+
+A local daemon adds file watching, debounced background indexing, memory audits, session promotion, and the hosted `/v1` API (memories, storage, sync). The daemon is useful without the cloud; the cloud needs no local state. The same schema and commands work in every mode.
 
 ## The Flagship Command
 
@@ -134,23 +146,6 @@ Everything is configured through environment variables; nothing is required for 
 
 `hugr doctor` reports the active configuration with secrets redacted.
 
-## Architecture
-
-```text
-hugr cli / MCP server
-  └── context compiler        ranking, budgeting, risks, citations
-        ├── memory engine     remember / recall / improve / forget, provenance, staleness
-        ├── code engine       discovery, symbols, references, tests, git state
-        └── session engine    observation, diagnostics, promotion
-
-hugr daemon                   file watching, background indexing, memory audits,
-                              hosted /v1 API (memories, storage, sync)
-
-storage                       one libSQL database: relational + FTS + vector + graph
-```
-
-The daemon is useful without the cloud; the cloud needs no local state. The same schema and commands work in every mode.
-
 ## Terminology
 
 | Term | Definition |
@@ -194,6 +189,12 @@ The `local-embeddings` cargo feature (in-process ONNX) is on by default; build w
 - [VISION.md](VISION.md) — product principle and product test
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how it is built: storage, entities, engines, surfaces
 - [docs/ROADMAP.md](docs/ROADMAP.md) — what comes next
+
+## The Name
+
+[*Hugr*](https://en.wiktionary.org/wiki/hugr) is Old Norse for mind and thought — the faculty that perceives, remembers, and intends. It is the root of Huginn, one of the two ravens Odin sends out over the world each dawn: [Huginn is Thought, his twin Muninn is Memory](https://en.wikipedia.org/wiki/Huginn_and_Muninn), and each evening they return to whisper everything they have seen. In the [Grímnismál](https://en.wikipedia.org/wiki/Gr%C3%ADmnism%C3%A1l), Odin confesses that he fears for Huginn's return, "yet more anxious am I for Muninn" — losing memory worries him more than losing thought. Coding agents have precisely this problem. Hugr exists so they do not.
+
+The banner shows [Yggdrasil](https://en.wikipedia.org/wiki/Yggdrasil), the world tree whose branches and roots connect all realms — a living knowledge graph. The Norns keep it green by watering it daily from [Urðarbrunnr](https://en.wikipedia.org/wiki/Ur%C3%B0arbrunnr), the well of Urðr, whose name means *that which has happened*. A living structure, sustained by the past: that is the product.
 
 ## Acknowledgements
 
