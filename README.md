@@ -1,4 +1,4 @@
-# Hugr
+# Hugr (ᚼᚢᚴᚱ)
 
 <p align="center">
   <img src="docs/assets/hugr-banner.png" alt="Hugr — the world tree, crown and roots mirrored, before a rising amber sun" width="100%">
@@ -193,6 +193,8 @@ The `local-embeddings` cargo feature (in-process ONNX) is on by default; build w
 ## The Name
 
 [*Hugr*](https://en.wiktionary.org/wiki/hugr) is Old Norse for mind and thought — the faculty that perceives, remembers, and intends. It is the root of Huginn, one of the two ravens Odin sends out over the world each dawn: [Huginn is Thought, his twin Muninn is Memory](https://en.wikipedia.org/wiki/Huginn_and_Muninn), and each evening they return to whisper everything they have seen. In the [Grímnismál](https://en.wikipedia.org/wiki/Gr%C3%ADmnism%C3%A1l), Odin confesses that he fears for Huginn's return, "yet more anxious am I for Muninn" — losing memory worries him more than losing thought. Coding agents have precisely this problem. Hugr exists so they do not.
+
+The runes in the title are *hugr* written in the [Younger Futhark](https://en.wikipedia.org/wiki/Younger_Futhark) — ᚼᚢᚴᚱ, the 16-rune alphabet in use across Scandinavia during the Viking Age, where ᚴ *kaun* serves for both /k/ and /g/.
 
 The banner shows [Yggdrasil](https://en.wikipedia.org/wiki/Yggdrasil), the world tree whose branches and roots connect all realms — a living knowledge graph. The Norns keep it green by watering it daily from [Urðarbrunnr](https://en.wikipedia.org/wiki/Ur%C3%B0arbrunnr), the well of Urðr, whose name means *that which has happened*. A living structure, sustained by the past: that is the product.
 
