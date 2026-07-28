@@ -185,64 +185,40 @@ pub struct Citation {
     pub label: String,
 }
 
-impl ContextPack {
-    #[cfg(test)]
-    pub fn new(task: &str, files: Vec<String>, memories: Vec<Memory>) -> Self {
-        Self::with_sessions(task, files, memories, Vec::new())
+/// Assembles a [`ContextPack`] from the subset of compiler inputs a test
+/// actually cares about. The compiler takes eleven inputs plus a budget, and
+/// spelling every unused one out at each call site had grown a chain of
+/// `with_a_b_and_c` constructors that needed a new name for every field added.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ContextPackBuilder {
+    task: String,
+    file_candidates: Vec<FileCandidate>,
+    memories: Vec<Memory>,
+    sessions: Vec<SessionFact>,
+    symbols: Vec<CodeSymbol>,
+    tests: Vec<TestCandidate>,
+    branch_state: Option<WorktreeState>,
+    stale_candidates: Vec<StaleMemoryCandidate>,
+    graph_neighbors: Vec<GraphNeighbor>,
+    freshness_signals: Vec<FreshnessSignal>,
+    diagnostics: Vec<Diagnostic>,
+    token_budget: usize,
+}
+
+#[cfg(test)]
+impl ContextPackBuilder {
+    fn new(task: &str) -> Self {
+        Self {
+            task: task.to_string(),
+            token_budget: DEFAULT_CONTEXT_TOKEN_BUDGET,
+            ..Self::default()
+        }
     }
 
-    #[cfg(test)]
-    pub fn with_sessions(
-        task: &str,
-        files: Vec<String>,
-        memories: Vec<Memory>,
-        sessions: Vec<SessionFact>,
-    ) -> Self {
-        Self::with_sessions_symbols_tests_and_branch(
-            task,
-            files,
-            memories,
-            sessions,
-            Vec::new(),
-            Vec::new(),
-            None,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_sessions_symbols_tests_and_branch(
-        task: &str,
-        files: Vec<String>,
-        memories: Vec<Memory>,
-        sessions: Vec<SessionFact>,
-        symbols: Vec<CodeSymbol>,
-        tests: Vec<TestCandidate>,
-        branch_state: Option<WorktreeState>,
-    ) -> Self {
-        Self::with_sessions_symbols_tests_branch_and_stale_risks(
-            task,
-            files,
-            memories,
-            sessions,
-            symbols,
-            tests,
-            branch_state,
-            Vec::new(),
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_sessions_symbols_tests_branch_and_stale_risks(
-        task: &str,
-        files: Vec<String>,
-        memories: Vec<Memory>,
-        sessions: Vec<SessionFact>,
-        symbols: Vec<CodeSymbol>,
-        tests: Vec<TestCandidate>,
-        branch_state: Option<WorktreeState>,
-        stale_candidates: Vec<StaleMemoryCandidate>,
-    ) -> Self {
-        let file_candidates = files
+    /// Bare paths, for tests that do not exercise discovery scoring.
+    pub(crate) fn files(mut self, files: Vec<String>) -> Self {
+        self.file_candidates = files
             .into_iter()
             .map(|path| FileCandidate {
                 path,
@@ -250,73 +226,83 @@ impl ContextPack {
                 language: None,
                 size_bytes: None,
             })
-            .collect::<Vec<_>>();
-        Self::with_file_candidates_sessions_symbols_tests_branch_and_stale_risks(
-            task,
-            file_candidates,
-            memories,
-            sessions,
-            symbols,
-            tests,
-            branch_state,
-            stale_candidates,
-        )
+            .collect();
+        self
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_file_candidates_sessions_symbols_tests_branch_and_stale_risks(
-        task: &str,
-        file_candidates: Vec<FileCandidate>,
-        memories: Vec<Memory>,
-        sessions: Vec<SessionFact>,
-        symbols: Vec<CodeSymbol>,
-        tests: Vec<TestCandidate>,
-        branch_state: Option<WorktreeState>,
-        stale_candidates: Vec<StaleMemoryCandidate>,
-    ) -> Self {
-        Self::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
-            task,
-            file_candidates,
-            memories,
-            sessions,
-            symbols,
-            tests,
-            branch_state,
-            stale_candidates,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )
+    pub(crate) fn file_candidates(mut self, file_candidates: Vec<FileCandidate>) -> Self {
+        self.file_candidates = file_candidates;
+        self
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
-        task: &str,
-        file_candidates: Vec<FileCandidate>,
-        memories: Vec<Memory>,
-        sessions: Vec<SessionFact>,
-        symbols: Vec<CodeSymbol>,
-        tests: Vec<TestCandidate>,
-        branch_state: Option<WorktreeState>,
-        stale_candidates: Vec<StaleMemoryCandidate>,
-        graph_neighbors: Vec<GraphNeighbor>,
-        freshness_signals: Vec<FreshnessSignal>,
-        diagnostics: Vec<Diagnostic>,
-    ) -> Self {
-        Self::with_inputs_and_budget(
-            task,
-            file_candidates,
-            memories,
-            sessions,
-            symbols,
-            tests,
-            branch_state,
-            stale_candidates,
-            graph_neighbors,
-            freshness_signals,
-            diagnostics,
-            DEFAULT_CONTEXT_TOKEN_BUDGET,
+    pub(crate) fn memories(mut self, memories: Vec<Memory>) -> Self {
+        self.memories = memories;
+        self
+    }
+
+    pub(crate) fn sessions(mut self, sessions: Vec<SessionFact>) -> Self {
+        self.sessions = sessions;
+        self
+    }
+
+    pub(crate) fn symbols(mut self, symbols: Vec<CodeSymbol>) -> Self {
+        self.symbols = symbols;
+        self
+    }
+
+    pub(crate) fn tests(mut self, tests: Vec<TestCandidate>) -> Self {
+        self.tests = tests;
+        self
+    }
+
+    pub(crate) fn branch_state(mut self, branch_state: WorktreeState) -> Self {
+        self.branch_state = Some(branch_state);
+        self
+    }
+
+    pub(crate) fn stale_candidates(mut self, stale_candidates: Vec<StaleMemoryCandidate>) -> Self {
+        self.stale_candidates = stale_candidates;
+        self
+    }
+
+    pub(crate) fn graph_neighbors(mut self, graph_neighbors: Vec<GraphNeighbor>) -> Self {
+        self.graph_neighbors = graph_neighbors;
+        self
+    }
+
+    pub(crate) fn freshness_signals(mut self, freshness_signals: Vec<FreshnessSignal>) -> Self {
+        self.freshness_signals = freshness_signals;
+        self
+    }
+
+    pub(crate) fn diagnostics(mut self, diagnostics: Vec<Diagnostic>) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
+    pub(crate) fn build(self) -> ContextPack {
+        ContextPack::with_inputs_and_budget(
+            &self.task,
+            self.file_candidates,
+            self.memories,
+            self.sessions,
+            self.symbols,
+            self.tests,
+            self.branch_state,
+            self.stale_candidates,
+            self.graph_neighbors,
+            self.freshness_signals,
+            self.diagnostics,
+            self.token_budget,
         )
+    }
+}
+
+impl ContextPack {
+    /// Entry point for the test-only [`ContextPackBuilder`].
+    #[cfg(test)]
+    pub(crate) fn builder(task: &str) -> ContextPackBuilder {
+        ContextPackBuilder::new(task)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3034,10 +3020,9 @@ mod tests {
 
     #[test]
     fn markdown_includes_citations_for_files_and_memories() {
-        let pack = ContextPack::new(
-            "add plugin hooks",
-            vec!["src/plugin.rs".to_string()],
-            vec![Memory {
+        let pack = ContextPack::builder("add plugin hooks")
+            .files(vec!["src/plugin.rs".to_string()])
+            .memories(vec![Memory {
                 id: "mem_1".to_string(),
                 created_at_ms: 7,
                 kind: "fact".to_string(),
@@ -3045,8 +3030,8 @@ mod tests {
                 structured_payload: Some(
                     r#"{"source":{"type":"session_promotion","session_id":"ses_1"}}"#.to_string(),
                 ),
-            }],
-        );
+            }])
+            .build();
 
         let markdown = pack.render_markdown();
         let json = pack.render_json();
@@ -3068,12 +3053,9 @@ mod tests {
 
     #[test]
     fn markdown_and_json_include_symbols() {
-        let pack = ContextPack::with_sessions_symbols_tests_and_branch(
-            "add plugin hooks",
-            vec!["src/plugin_hooks.rs".to_string()],
-            Vec::new(),
-            Vec::new(),
-            vec![CodeSymbol {
+        let pack = ContextPack::builder("add plugin hooks")
+            .files(vec!["src/plugin_hooks.rs".to_string()])
+            .symbols(vec![CodeSymbol {
                 path: "src/plugin_hooks.rs".to_string(),
                 language: Some("rust".to_string()),
                 name: "PluginHooks".to_string(),
@@ -3081,14 +3063,13 @@ mod tests {
                 line_start: 3,
                 line_end: Some(8),
                 signature: "pub struct PluginHooks".to_string(),
-            }],
-            vec![TestCandidate {
+            }])
+            .tests(vec![TestCandidate {
                 path: "tests/plugin_hooks.rs".to_string(),
                 reason: "repository tests directory match".to_string(),
                 score: 50,
-            }],
-            None,
-        );
+            }])
+            .build();
 
         let markdown = pack.render_markdown();
         let json = pack.render_json();
@@ -3103,35 +3084,25 @@ mod tests {
 
     #[test]
     fn markdown_and_json_include_graph_neighbors() {
-        let pack =
-            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
-                "add plugin hooks",
-                vec![FileCandidate {
-                    path: "src/plugin_hooks.rs".to_string(),
-                    score: 5,
-                    language: Some("rust".to_string()),
-                    size_bytes: Some(100),
-                }],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                None,
-                Vec::new(),
-                vec![GraphNeighbor {
-                    kind: "incoming_reference".to_string(),
-                    label: "src/main.rs:8 references function run_after_config".to_string(),
-                    detail: "call reference to function run_after_config: run_after_config();"
-                        .to_string(),
-                    path: Some("src/main.rs".to_string()),
-                    target_path: Some("src/plugin_hooks.rs".to_string()),
-                    target_name: Some("run_after_config".to_string()),
-                    line_start: Some(8),
-                    site_count: 1,
-                }],
-                Vec::new(),
-                Vec::new(),
-            );
+        let pack = ContextPack::builder("add plugin hooks")
+            .file_candidates(vec![FileCandidate {
+                path: "src/plugin_hooks.rs".to_string(),
+                score: 5,
+                language: Some("rust".to_string()),
+                size_bytes: Some(100),
+            }])
+            .graph_neighbors(vec![GraphNeighbor {
+                kind: "incoming_reference".to_string(),
+                label: "src/main.rs:8 references function run_after_config".to_string(),
+                detail: "call reference to function run_after_config: run_after_config();"
+                    .to_string(),
+                path: Some("src/main.rs".to_string()),
+                target_path: Some("src/plugin_hooks.rs".to_string()),
+                target_name: Some("run_after_config".to_string()),
+                line_start: Some(8),
+                site_count: 1,
+            }])
+            .build();
 
         let markdown = pack.render_markdown();
         let json = pack.render_json();
@@ -3148,41 +3119,30 @@ mod tests {
 
     #[test]
     fn cross_file_references_render_as_refactor_surface_risks() {
-        let pack =
-            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
-                "refactor plugin hooks",
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                None,
-                Vec::new(),
-                vec![
-                    GraphNeighbor {
-                        kind: "incoming_reference".to_string(),
-                        label: "src/main.rs:8 references function run_after_config".to_string(),
-                        detail: "call reference to function run_after_config".to_string(),
-                        path: Some("src/main.rs".to_string()),
-                        target_path: Some("src/plugin_hooks.rs".to_string()),
-                        target_name: Some("run_after_config".to_string()),
-                        line_start: Some(8),
-                        site_count: 1,
-                    },
-                    GraphNeighbor {
-                        kind: "incoming_reference".to_string(),
-                        label: "src/worker.rs:14 references function run_after_config".to_string(),
-                        detail: "call reference to function run_after_config".to_string(),
-                        path: Some("src/worker.rs".to_string()),
-                        target_path: Some("src/plugin_hooks.rs".to_string()),
-                        target_name: Some("run_after_config".to_string()),
-                        line_start: Some(14),
-                        site_count: 1,
-                    },
-                ],
-                Vec::new(),
-                Vec::new(),
-            );
+        let pack = ContextPack::builder("refactor plugin hooks")
+            .graph_neighbors(vec![
+                GraphNeighbor {
+                    kind: "incoming_reference".to_string(),
+                    label: "src/main.rs:8 references function run_after_config".to_string(),
+                    detail: "call reference to function run_after_config".to_string(),
+                    path: Some("src/main.rs".to_string()),
+                    target_path: Some("src/plugin_hooks.rs".to_string()),
+                    target_name: Some("run_after_config".to_string()),
+                    line_start: Some(8),
+                    site_count: 1,
+                },
+                GraphNeighbor {
+                    kind: "incoming_reference".to_string(),
+                    label: "src/worker.rs:14 references function run_after_config".to_string(),
+                    detail: "call reference to function run_after_config".to_string(),
+                    path: Some("src/worker.rs".to_string()),
+                    target_path: Some("src/plugin_hooks.rs".to_string()),
+                    target_name: Some("run_after_config".to_string()),
+                    line_start: Some(14),
+                    site_count: 1,
+                },
+            ])
+            .build();
 
         let markdown = pack.render_markdown();
         let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
@@ -3210,32 +3170,22 @@ mod tests {
             line_start: Some(line),
             site_count: 1,
         };
-        let pack =
-            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
-                "change hot symbol",
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                vec![CodeSymbol {
-                    path: "src/core.rs".to_string(),
-                    language: Some("rust".to_string()),
-                    name: "hot_symbol".to_string(),
-                    kind: "function".to_string(),
-                    line_start: 10,
-                    line_end: Some(14),
-                    signature: "fn hot_symbol()".to_string(),
-                }],
-                Vec::new(),
-                None,
-                Vec::new(),
-                vec![
-                    neighbor("src/a.rs", 4),
-                    neighbor("src/b.rs", 9),
-                    neighbor("src/c.rs", 2),
-                ],
-                Vec::new(),
-                Vec::new(),
-            );
+        let pack = ContextPack::builder("change hot symbol")
+            .symbols(vec![CodeSymbol {
+                path: "src/core.rs".to_string(),
+                language: Some("rust".to_string()),
+                name: "hot_symbol".to_string(),
+                kind: "function".to_string(),
+                line_start: 10,
+                line_end: Some(14),
+                signature: "fn hot_symbol()".to_string(),
+            }])
+            .graph_neighbors(vec![
+                neighbor("src/a.rs", 4),
+                neighbor("src/b.rs", 9),
+                neighbor("src/c.rs", 2),
+            ])
+            .build();
 
         let markdown = pack.render_markdown();
         let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
@@ -3264,28 +3214,18 @@ mod tests {
             line_start: Some(line),
             site_count: 1,
         };
-        let pack =
-            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
-                "change warm symbol",
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                vec![CodeSymbol {
-                    path: "src/core.rs".to_string(),
-                    language: Some("rust".to_string()),
-                    name: "warm_symbol".to_string(),
-                    kind: "function".to_string(),
-                    line_start: 10,
-                    line_end: Some(14),
-                    signature: "fn warm_symbol()".to_string(),
-                }],
-                Vec::new(),
-                None,
-                Vec::new(),
-                vec![neighbor(3), neighbor(4), neighbor(5)],
-                Vec::new(),
-                Vec::new(),
-            );
+        let pack = ContextPack::builder("change warm symbol")
+            .symbols(vec![CodeSymbol {
+                path: "src/core.rs".to_string(),
+                language: Some("rust".to_string()),
+                name: "warm_symbol".to_string(),
+                kind: "function".to_string(),
+                line_start: 10,
+                line_end: Some(14),
+                signature: "fn warm_symbol()".to_string(),
+            }])
+            .graph_neighbors(vec![neighbor(3), neighbor(4), neighbor(5)])
+            .build();
 
         let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
         let risk_kinds = parsed["risk_signals"]
@@ -3300,60 +3240,50 @@ mod tests {
 
     #[test]
     fn public_symbols_render_as_api_surface_risks() {
-        let pack =
-            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
-                "change plugin hook api",
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                vec![
-                    CodeSymbol {
-                        path: "src/plugin_hooks.rs".to_string(),
-                        language: Some("rust".to_string()),
-                        name: "run_after_config".to_string(),
-                        kind: "function".to_string(),
-                        line_start: 12,
-                        line_end: Some(16),
-                        signature: "pub fn run_after_config()".to_string(),
-                    },
-                    CodeSymbol {
-                        path: "src/plugin_hooks.rs".to_string(),
-                        language: Some("rust".to_string()),
-                        name: "private_helper".to_string(),
-                        kind: "function".to_string(),
-                        line_start: 18,
-                        line_end: Some(20),
-                        signature: "fn private_helper()".to_string(),
-                    },
-                ],
-                Vec::new(),
-                None,
-                Vec::new(),
-                vec![
-                    GraphNeighbor {
-                        kind: "incoming_reference".to_string(),
-                        label: "src/main.rs:8 references function run_after_config".to_string(),
-                        detail: "call reference to function run_after_config".to_string(),
-                        path: Some("src/main.rs".to_string()),
-                        target_path: Some("src/plugin_hooks.rs".to_string()),
-                        target_name: Some("run_after_config".to_string()),
-                        line_start: Some(8),
-                        site_count: 1,
-                    },
-                    GraphNeighbor {
-                        kind: "incoming_reference".to_string(),
-                        label: "src/worker.rs:14 references function run_after_config".to_string(),
-                        detail: "call reference to function run_after_config".to_string(),
-                        path: Some("src/worker.rs".to_string()),
-                        target_path: Some("src/plugin_hooks.rs".to_string()),
-                        target_name: Some("run_after_config".to_string()),
-                        line_start: Some(14),
-                        site_count: 1,
-                    },
-                ],
-                Vec::new(),
-                Vec::new(),
-            );
+        let pack = ContextPack::builder("change plugin hook api")
+            .symbols(vec![
+                CodeSymbol {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    language: Some("rust".to_string()),
+                    name: "run_after_config".to_string(),
+                    kind: "function".to_string(),
+                    line_start: 12,
+                    line_end: Some(16),
+                    signature: "pub fn run_after_config()".to_string(),
+                },
+                CodeSymbol {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    language: Some("rust".to_string()),
+                    name: "private_helper".to_string(),
+                    kind: "function".to_string(),
+                    line_start: 18,
+                    line_end: Some(20),
+                    signature: "fn private_helper()".to_string(),
+                },
+            ])
+            .graph_neighbors(vec![
+                GraphNeighbor {
+                    kind: "incoming_reference".to_string(),
+                    label: "src/main.rs:8 references function run_after_config".to_string(),
+                    detail: "call reference to function run_after_config".to_string(),
+                    path: Some("src/main.rs".to_string()),
+                    target_path: Some("src/plugin_hooks.rs".to_string()),
+                    target_name: Some("run_after_config".to_string()),
+                    line_start: Some(8),
+                    site_count: 1,
+                },
+                GraphNeighbor {
+                    kind: "incoming_reference".to_string(),
+                    label: "src/worker.rs:14 references function run_after_config".to_string(),
+                    detail: "call reference to function run_after_config".to_string(),
+                    path: Some("src/worker.rs".to_string()),
+                    target_path: Some("src/plugin_hooks.rs".to_string()),
+                    target_name: Some("run_after_config".to_string()),
+                    line_start: Some(14),
+                    site_count: 1,
+                },
+            ])
+            .build();
 
         let markdown = pack.render_markdown();
         let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
@@ -3379,28 +3309,17 @@ mod tests {
 
     #[test]
     fn unreferenced_private_symbols_render_as_health_risks() {
-        let pack =
-            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
-                "clean plugin helper",
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                vec![CodeSymbol {
-                    path: "src/plugin_hooks.rs".to_string(),
-                    language: Some("rust".to_string()),
-                    name: "private_helper".to_string(),
-                    kind: "function".to_string(),
-                    line_start: 18,
-                    line_end: Some(20),
-                    signature: "fn private_helper()".to_string(),
-                }],
-                Vec::new(),
-                None,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            );
+        let pack = ContextPack::builder("clean plugin helper")
+            .symbols(vec![CodeSymbol {
+                path: "src/plugin_hooks.rs".to_string(),
+                language: Some("rust".to_string()),
+                name: "private_helper".to_string(),
+                kind: "function".to_string(),
+                line_start: 18,
+                line_end: Some(20),
+                signature: "fn private_helper()".to_string(),
+            }])
+            .build();
 
         let markdown = pack.render_markdown();
         let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
@@ -3418,32 +3337,22 @@ mod tests {
 
     #[test]
     fn freshness_signals_render_as_risk_signals() {
-        let pack =
-            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
-                "add plugin hooks",
-                vec![FileCandidate {
-                    path: "src/plugin_hooks.rs".to_string(),
-                    score: 5,
-                    language: Some("rust".to_string()),
-                    size_bytes: Some(100),
-                }],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                None,
-                Vec::new(),
-                Vec::new(),
-                vec![FreshnessSignal {
-                    path: "src/plugin_hooks.rs".to_string(),
-                    kind: "stale_index".to_string(),
-                    detail: "src/plugin_hooks.rs changed after its latest Hugr index timestamp"
-                        .to_string(),
-                    indexed_at_ms: Some(10),
-                    modified_at_ms: Some(20),
-                }],
-                Vec::new(),
-            );
+        let pack = ContextPack::builder("add plugin hooks")
+            .file_candidates(vec![FileCandidate {
+                path: "src/plugin_hooks.rs".to_string(),
+                score: 5,
+                language: Some("rust".to_string()),
+                size_bytes: Some(100),
+            }])
+            .freshness_signals(vec![FreshnessSignal {
+                path: "src/plugin_hooks.rs".to_string(),
+                kind: "stale_index".to_string(),
+                detail: "src/plugin_hooks.rs changed after its latest Hugr index timestamp"
+                    .to_string(),
+                indexed_at_ms: Some(10),
+                modified_at_ms: Some(20),
+            }])
+            .build();
 
         let json = pack.render_json();
         let parsed = serde_json::from_str::<serde_json::Value>(&json).unwrap();
@@ -3460,31 +3369,21 @@ mod tests {
 
     #[test]
     fn edit_freshness_signals_render_as_stale_after_edit_risks() {
-        let pack =
-            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
-                "refresh plugin hooks",
-                vec![FileCandidate {
-                    path: "src/plugin_hooks.rs".to_string(),
-                    score: 5,
-                    language: Some("rust".to_string()),
-                    size_bytes: Some(100),
-                }],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                None,
-                Vec::new(),
-                Vec::new(),
-                vec![FreshnessSignal {
-                    path: "src/plugin_hooks.rs".to_string(),
-                    kind: "edit_after_context".to_string(),
-                    detail: "src/plugin_hooks.rs has a Hugr edit event after context".to_string(),
-                    indexed_at_ms: Some(10),
-                    modified_at_ms: Some(20),
-                }],
-                Vec::new(),
-            );
+        let pack = ContextPack::builder("refresh plugin hooks")
+            .file_candidates(vec![FileCandidate {
+                path: "src/plugin_hooks.rs".to_string(),
+                score: 5,
+                language: Some("rust".to_string()),
+                size_bytes: Some(100),
+            }])
+            .freshness_signals(vec![FreshnessSignal {
+                path: "src/plugin_hooks.rs".to_string(),
+                kind: "edit_after_context".to_string(),
+                detail: "src/plugin_hooks.rs has a Hugr edit event after context".to_string(),
+                indexed_at_ms: Some(10),
+                modified_at_ms: Some(20),
+            }])
+            .build();
 
         let markdown = pack.render_markdown();
         let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
@@ -3501,31 +3400,23 @@ mod tests {
 
     #[test]
     fn stale_context_freshness_signals_render_as_risks() {
-        let pack =
-            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
-                "refresh plugin hooks",
-                vec![FileCandidate {
-                    path: "src/plugin_hooks.rs".to_string(),
-                    score: 5,
-                    language: Some("rust".to_string()),
-                    size_bytes: Some(100),
-                }],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                None,
-                Vec::new(),
-                Vec::new(),
-                vec![FreshnessSignal {
-                    path: "src/plugin_hooks.rs".to_string(),
-                    kind: "stale_context".to_string(),
-                    detail: "src/plugin_hooks.rs changed on disk after the latest persisted context pack".to_string(),
-                    indexed_at_ms: Some(10),
-                    modified_at_ms: Some(30),
-                }],
-                Vec::new(),
-            );
+        let pack = ContextPack::builder("refresh plugin hooks")
+            .file_candidates(vec![FileCandidate {
+                path: "src/plugin_hooks.rs".to_string(),
+                score: 5,
+                language: Some("rust".to_string()),
+                size_bytes: Some(100),
+            }])
+            .freshness_signals(vec![FreshnessSignal {
+                path: "src/plugin_hooks.rs".to_string(),
+                kind: "stale_context".to_string(),
+                detail:
+                    "src/plugin_hooks.rs changed on disk after the latest persisted context pack"
+                        .to_string(),
+                indexed_at_ms: Some(10),
+                modified_at_ms: Some(30),
+            }])
+            .build();
 
         let markdown = pack.render_markdown();
         let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
@@ -3542,12 +3433,9 @@ mod tests {
 
     #[test]
     fn large_symbols_render_as_code_health_risks() {
-        let pack = ContextPack::with_sessions_symbols_tests_and_branch(
-            "refactor plugin hooks",
-            vec!["src/plugin_hooks.rs".to_string()],
-            Vec::new(),
-            Vec::new(),
-            vec![CodeSymbol {
+        let pack = ContextPack::builder("refactor plugin hooks")
+            .files(vec!["src/plugin_hooks.rs".to_string()])
+            .symbols(vec![CodeSymbol {
                 path: "src/plugin_hooks.rs".to_string(),
                 language: Some("rust".to_string()),
                 name: "run_after_config".to_string(),
@@ -3555,14 +3443,13 @@ mod tests {
                 line_start: 12,
                 line_end: Some(105),
                 signature: "pub fn run_after_config()".to_string(),
-            }],
-            vec![TestCandidate {
+            }])
+            .tests(vec![TestCandidate {
                 path: "tests/plugin_hooks.rs".to_string(),
                 reason: "repository tests directory match".to_string(),
                 score: 50,
-            }],
-            None,
-        );
+            }])
+            .build();
 
         let markdown = pack.render_markdown();
         let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
@@ -3599,12 +3486,9 @@ mod tests {
 
     #[test]
     fn long_parameter_lists_render_as_code_health_risks() {
-        let pack = ContextPack::with_sessions_symbols_tests_and_branch(
-            "refactor plugin hooks",
-            vec!["src/plugin_hooks.rs".to_string()],
-            Vec::new(),
-            Vec::new(),
-            vec![CodeSymbol {
+        let pack = ContextPack::builder("refactor plugin hooks")
+            .files(vec!["src/plugin_hooks.rs".to_string()])
+            .symbols(vec![CodeSymbol {
                 path: "src/plugin_hooks.rs".to_string(),
                 language: Some("rust".to_string()),
                 name: "configure".to_string(),
@@ -3613,10 +3497,8 @@ mod tests {
                 line_end: Some(20),
                 signature: "pub fn configure(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32)"
                     .to_string(),
-            }],
-            Vec::new(),
-            None,
-        );
+            }])
+            .build();
 
         let markdown = pack.render_markdown();
         let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
@@ -3634,12 +3516,9 @@ mod tests {
 
     #[test]
     fn short_parameter_lists_do_not_flag_health_risk() {
-        let pack = ContextPack::with_sessions_symbols_tests_and_branch(
-            "refactor plugin hooks",
-            vec!["src/plugin_hooks.rs".to_string()],
-            Vec::new(),
-            Vec::new(),
-            vec![CodeSymbol {
+        let pack = ContextPack::builder("refactor plugin hooks")
+            .files(vec!["src/plugin_hooks.rs".to_string()])
+            .symbols(vec![CodeSymbol {
                 path: "src/plugin_hooks.rs".to_string(),
                 language: Some("rust".to_string()),
                 name: "small".to_string(),
@@ -3647,10 +3526,8 @@ mod tests {
                 line_start: 12,
                 line_end: Some(14),
                 signature: "pub fn small(a: i32, b: i32)".to_string(),
-            }],
-            Vec::new(),
-            None,
-        );
+            }])
+            .build();
 
         let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
         let risk_kinds = parsed["risk_signals"]
@@ -3691,12 +3568,9 @@ pub fn tangled(input: i32) -> i32 {
 }
 ";
         let path = write_temp_source("context_complex_tangled.rs", source);
-        let pack = ContextPack::with_sessions_symbols_tests_and_branch(
-            "refactor tangled",
-            vec![path.clone()],
-            Vec::new(),
-            Vec::new(),
-            vec![CodeSymbol {
+        let pack = ContextPack::builder("refactor tangled")
+            .files(vec![path.clone()])
+            .symbols(vec![CodeSymbol {
                 path,
                 language: Some("rust".to_string()),
                 name: "tangled".to_string(),
@@ -3704,10 +3578,8 @@ pub fn tangled(input: i32) -> i32 {
                 line_start: 1,
                 line_end: Some(source.lines().count() as i64),
                 signature: "pub fn tangled(input: i32) -> i32".to_string(),
-            }],
-            Vec::new(),
-            None,
-        );
+            }])
+            .build();
 
         let markdown = pack.render_markdown();
         let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
@@ -3735,12 +3607,9 @@ pub fn small(input: i32) -> i32 {
 }
 ";
         let path = write_temp_source("context_complex_small.rs", source);
-        let pack = ContextPack::with_sessions_symbols_tests_and_branch(
-            "edit small",
-            vec![path.clone()],
-            Vec::new(),
-            Vec::new(),
-            vec![CodeSymbol {
+        let pack = ContextPack::builder("edit small")
+            .files(vec![path.clone()])
+            .symbols(vec![CodeSymbol {
                 path,
                 language: Some("rust".to_string()),
                 name: "small".to_string(),
@@ -3748,10 +3617,8 @@ pub fn small(input: i32) -> i32 {
                 line_start: 1,
                 line_end: Some(source.lines().count() as i64),
                 signature: "pub fn small(input: i32) -> i32".to_string(),
-            }],
-            Vec::new(),
-            None,
-        );
+            }])
+            .build();
 
         let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
         let risk_kinds = parsed["risk_signals"]
@@ -3767,36 +3634,26 @@ pub fn small(input: i32) -> i32 {
 
     #[test]
     fn structured_diagnostics_render_with_citations_and_risks() {
-        let pack =
-            ContextPack::with_file_candidates_sessions_symbols_tests_branch_stale_risks_and_graph(
-                "fix plugin hooks",
-                vec![FileCandidate {
-                    path: "src/plugin_hooks.rs".to_string(),
-                    score: 5,
-                    language: Some("rust".to_string()),
-                    size_bytes: Some(100),
-                }],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                None,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                vec![Diagnostic {
-                    id: "diag_1".to_string(),
-                    source: "command_stderr".to_string(),
-                    path: Some("src/plugin_hooks.rs".to_string()),
-                    line_start: Some(12),
-                    line_end: None,
-                    severity: "error".to_string(),
-                    code: Some("E0425".to_string()),
-                    message: "cannot find value hook in this scope".to_string(),
-                    command: Some("cargo test".to_string()),
-                    created_at_ms: 42,
-                }],
-            );
+        let pack = ContextPack::builder("fix plugin hooks")
+            .file_candidates(vec![FileCandidate {
+                path: "src/plugin_hooks.rs".to_string(),
+                score: 5,
+                language: Some("rust".to_string()),
+                size_bytes: Some(100),
+            }])
+            .diagnostics(vec![Diagnostic {
+                id: "diag_1".to_string(),
+                source: "command_stderr".to_string(),
+                path: Some("src/plugin_hooks.rs".to_string()),
+                line_start: Some(12),
+                line_end: None,
+                severity: "error".to_string(),
+                code: Some("E0425".to_string()),
+                message: "cannot find value hook in this scope".to_string(),
+                command: Some("cargo test".to_string()),
+                created_at_ms: 42,
+            }])
+            .build();
 
         let markdown = pack.render_markdown();
         let parsed = serde_json::from_str::<serde_json::Value>(&pack.render_json()).unwrap();
@@ -3828,9 +3685,8 @@ pub fn small(input: i32) -> i32 {
 
     #[test]
     fn evidence_ranking_orders_files_and_renders_scores() {
-        let pack = ContextPack::with_file_candidates_sessions_symbols_tests_branch_and_stale_risks(
-            "plugin hooks",
-            vec![
+        let pack = ContextPack::builder("plugin hooks")
+            .file_candidates(vec![
                 FileCandidate {
                     path: "docs/hooks.md".to_string(),
                     score: 1,
@@ -3843,14 +3699,8 @@ pub fn small(input: i32) -> i32 {
                     language: Some("rust".to_string()),
                     size_bytes: Some(10),
                 },
-            ],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            None,
-            Vec::new(),
-        );
+            ])
+            .build();
 
         assert_eq!(pack.relevant_files[0].path, "src/plugin_hooks.rs");
         assert!(pack.relevant_files[0].evidence_score > pack.relevant_files[1].evidence_score);
@@ -3865,21 +3715,14 @@ pub fn small(input: i32) -> i32 {
 
     #[test]
     fn semantic_file_candidates_render_source_embedding_evidence() {
-        let pack = ContextPack::with_file_candidates_sessions_symbols_tests_branch_and_stale_risks(
-            "invoice ledger",
-            vec![FileCandidate {
+        let pack = ContextPack::builder("invoice ledger")
+            .file_candidates(vec![FileCandidate {
                 path: "src/payments.rs".to_string(),
                 score: source_embedding_score(2),
                 language: Some("rust".to_string()),
                 size_bytes: Some(64),
-            }],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            None,
-            Vec::new(),
-        );
+            }])
+            .build();
 
         assert_eq!(pack.relevant_files[0].path, "src/payments.rs");
         assert_eq!(
@@ -3891,7 +3734,7 @@ pub fn small(input: i32) -> i32 {
 
     #[test]
     fn json_renderer_escapes_strings() {
-        let pack = ContextPack::new("quote \"and\" newline\n", Vec::new(), Vec::new());
+        let pack = ContextPack::builder("quote \"and\" newline\n").build();
         let json = pack.render_json();
 
         assert!(json.contains("\"task\":\"quote \\\"and\\\" newline\\n\""));
@@ -3900,14 +3743,8 @@ pub fn small(input: i32) -> i32 {
 
     #[test]
     fn markdown_and_json_include_branch_state() {
-        let pack = ContextPack::with_sessions_symbols_tests_and_branch(
-            "add plugin hooks",
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Some(WorktreeState {
+        let pack = ContextPack::builder("add plugin hooks")
+            .branch_state(WorktreeState {
                 inside_worktree: true,
                 root_path: Some("/repo".to_string()),
                 branch: Some("feature".to_string()),
@@ -3920,8 +3757,8 @@ pub fn small(input: i32) -> i32 {
                     staged_status: None,
                     unstaged_status: Some("modified".to_string()),
                 }],
-            }),
-        );
+            })
+            .build();
 
         let markdown = pack.render_markdown();
         let json = pack.render_json();
@@ -3936,20 +3773,16 @@ pub fn small(input: i32) -> i32 {
 
     #[test]
     fn markdown_and_json_include_risk_signals() {
-        let pack = ContextPack::with_sessions_symbols_tests_and_branch(
-            "add plugin hooks",
-            vec!["src/plugin_hooks.rs".to_string()],
-            Vec::new(),
-            vec![SessionFact {
+        let pack = ContextPack::builder("add plugin hooks")
+            .files(vec!["src/plugin_hooks.rs".to_string()])
+            .sessions(vec![SessionFact {
                 session_id: "ses_1".to_string(),
                 kind: "test".to_string(),
                 detail: "cargo test failed; stderr_tail: error[E0425]: cannot find value hook"
                     .to_string(),
                 created_at_ms: 30,
-            }],
-            Vec::new(),
-            Vec::new(),
-            Some(WorktreeState {
+            }])
+            .branch_state(WorktreeState {
                 inside_worktree: true,
                 root_path: Some("/repo".to_string()),
                 branch: Some("feature".to_string()),
@@ -3962,8 +3795,8 @@ pub fn small(input: i32) -> i32 {
                     staged_status: None,
                     unstaged_status: Some("modified".to_string()),
                 }],
-            }),
-        );
+            })
+            .build();
 
         let markdown = pack.render_markdown();
         let json = pack.render_json();
@@ -3986,13 +3819,12 @@ pub fn small(input: i32) -> i32 {
 
     #[test]
     fn token_budget_reports_truncation_and_rebuilds_citations() {
-        let mut pack = ContextPack::new(
-            "tiny budget",
-            vec![
+        let mut pack = ContextPack::builder("tiny budget")
+            .files(vec![
                 "src/first_large_file.rs".to_string(),
                 "src/second_large_file.rs".to_string(),
-            ],
-            vec![
+            ])
+            .memories(vec![
                 Memory {
                     id: "mem_1".to_string(),
                     created_at_ms: 10,
@@ -4007,8 +3839,8 @@ pub fn small(input: i32) -> i32 {
                     text: "plugin hooks now run before configuration is loaded".to_string(),
                     structured_payload: None,
                 },
-            ],
-        );
+            ])
+            .build();
 
         pack.apply_token_budget(1);
 
@@ -4045,10 +3877,8 @@ pub fn small(input: i32) -> i32 {
 
     #[test]
     fn markdown_and_json_include_stale_memory_risks() {
-        let pack = ContextPack::with_sessions_symbols_tests_branch_and_stale_risks(
-            "add plugin hooks",
-            Vec::new(),
-            vec![
+        let pack = ContextPack::builder("add plugin hooks")
+            .memories(vec![
                 Memory {
                     id: "mem_new".to_string(),
                     created_at_ms: 20,
@@ -4063,12 +3893,8 @@ pub fn small(input: i32) -> i32 {
                     text: "plugin hooks run after configuration is loaded".to_string(),
                     structured_payload: None,
                 },
-            ],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            None,
-            vec![StaleMemoryCandidate {
+            ])
+            .stale_candidates(vec![StaleMemoryCandidate {
                 reason: "opposing_terms".to_string(),
                 signal: "after_vs_before".to_string(),
                 shared_terms: vec!["hooks".to_string(), "plugin".to_string(), "run".to_string()],
@@ -4086,8 +3912,8 @@ pub fn small(input: i32) -> i32 {
                     text: "plugin hooks run after configuration is loaded".to_string(),
                     structured_payload: None,
                 },
-            }],
-        );
+            }])
+            .build();
 
         let markdown = pack.render_markdown();
         let json = pack.render_json();
