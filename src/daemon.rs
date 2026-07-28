@@ -60,7 +60,16 @@ pub(crate) async fn serve(config: DaemonConfig) -> Result<(), String> {
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, peer_addr) = accepted.map_err(|error| error.to_string())?;
+                // A single failed accept (descriptor exhaustion, a client that
+                // vanished mid-handshake) must not take the daemon down: file
+                // watching, indexing, and the maintenance jobs keep running.
+                let (stream, peer_addr) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        eprintln!("daemon failed to accept connection: {error}");
+                        continue;
+                    }
+                };
                 let state = state.clone();
                 tokio::spawn(async move {
                     if let Err(error) = handle_client(stream, peer_addr, state).await {
