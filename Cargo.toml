@@ -2,7 +2,7 @@
 name = "hugr"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 description = "Project memory and intelligence system for coding agents: semantic code graph, temporal memory, and a context compiler"
 repository = "https://github.com/arcbjorn/hugr"

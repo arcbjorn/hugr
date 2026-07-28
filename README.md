@@ -94,7 +94,7 @@ Output is Markdown for humans or JSON (`--json`) for agents.
 ## Quick Start
 
 ```bash
-# Build and install (Rust 1.85+ / edition 2024)
+# Build and install (Rust 1.88+ / edition 2024)
 git clone https://github.com/arcbjorn/hugr && cd hugr
 cargo install --path .
 
