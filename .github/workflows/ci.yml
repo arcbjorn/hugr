@@ -54,6 +54,26 @@ jobs:
       - name: Lint with default features
         run: cargo clippy --all-targets -- -D warnings
 
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Cargo.toml advertises rust-version 1.88, so it has to keep building
+      # there; nothing else in CI would notice a newly stabilised API or
+      # language feature landing in the codebase.
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build against the declared MSRV
+        run: cargo check --all-targets
+
   context-eval:
     name: Context eval baseline
     runs-on: ubuntu-latest
