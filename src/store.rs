@@ -5884,6 +5884,13 @@ fn get_hugr_api_json(config: &StorageConfig, path: &str) -> Result<String> {
     request_hugr_api_json(config, "GET", path, None)
 }
 
+/// Seconds allowed for the TCP connection to a hosted Hugr API.
+const HUGR_API_CONNECT_TIMEOUT_SECONDS: u32 = 10;
+/// Seconds allowed for a whole Hugr API request. `curl` applies no timeout of
+/// its own, so without this an endpoint that accepts the connection and then
+/// stalls blocks the calling command — or the daemon's sync job — forever.
+const HUGR_API_REQUEST_TIMEOUT_SECONDS: u32 = 120;
+
 fn request_hugr_api_json(
     config: &StorageConfig,
     method: &str,
@@ -5903,6 +5910,10 @@ fn request_hugr_api_json(
         .ok_or_else(|| Error::msg("HUGR_SYNC_BACKEND=hugr_api requires HUGR_API_TOKEN"))?;
     let mut args = vec![
         "-fsS".to_string(),
+        "--connect-timeout".to_string(),
+        HUGR_API_CONNECT_TIMEOUT_SECONDS.to_string(),
+        "--max-time".to_string(),
+        HUGR_API_REQUEST_TIMEOUT_SECONDS.to_string(),
         "-X".to_string(),
         method.to_string(),
         url,

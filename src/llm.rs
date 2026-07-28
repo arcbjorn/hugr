@@ -151,9 +151,22 @@ fn parse_chat_response(response: &str) -> Result<String> {
     Ok(content.to_string())
 }
 
-fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String> {
+/// Seconds allowed for the TCP connection to be established.
+const CONNECT_TIMEOUT_SECONDS: u32 = 10;
+/// Seconds allowed for the whole request. `curl` applies no timeout of its
+/// own, so without this a provider that stalls blocks the caller forever.
+/// Generous because a local model on CPU can take minutes to synthesise a
+/// session summary; the point is that the wait is bounded, not that it is
+/// short.
+const REQUEST_TIMEOUT_SECONDS: u32 = 300;
+
+fn curl_args(url: &str, api_key: &str) -> Vec<String> {
     let mut args = vec![
         "-fsS".to_string(),
+        "--connect-timeout".to_string(),
+        CONNECT_TIMEOUT_SECONDS.to_string(),
+        "--max-time".to_string(),
+        REQUEST_TIMEOUT_SECONDS.to_string(),
         "-X".to_string(),
         "POST".to_string(),
         url.to_string(),
@@ -166,6 +179,11 @@ fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String>
     }
     args.push("--data-binary".to_string());
     args.push("@-".to_string());
+    args
+}
+
+fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String> {
+    let args = curl_args(url, api_key);
 
     let mut child = ProcessCommand::new("curl")
         .args(&args)
@@ -211,6 +229,7 @@ fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String>
 
 #[cfg(test)]
 mod tests {
+    use super::curl_args;
     use super::{ChatSynthesizer, parse_chat_response, synthesis_prompt};
 
     fn env_lookup<'a>(values: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
@@ -294,5 +313,24 @@ mod tests {
         assert!(parse_chat_response(empty).is_err());
 
         assert!(parse_chat_response("not json").is_err());
+    }
+
+    /// `curl` has no default timeout, so a stalled provider would hang the
+    /// caller forever. These flags are the only thing preventing that.
+    #[test]
+    fn curl_args_bound_the_request() {
+        let args = curl_args("https://api.example/v1/embeddings", "secret");
+
+        assert!(args.contains(&"--connect-timeout".to_string()));
+        assert!(args.contains(&"--max-time".to_string()));
+        assert!(args.contains(&"Authorization: Bearer secret".to_string()));
+    }
+
+    #[test]
+    fn curl_args_omit_authorization_without_a_key() {
+        let args = curl_args("http://localhost:11434/api/embeddings", "");
+
+        assert!(args.contains(&"--max-time".to_string()));
+        assert!(!args.iter().any(|arg| arg.starts_with("Authorization:")));
     }
 }

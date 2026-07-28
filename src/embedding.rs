@@ -451,9 +451,20 @@ fn openai_embedding_request(model: &str, text: &str) -> Value {
     })
 }
 
-fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String> {
+/// Seconds allowed for the TCP connection to be established.
+const CONNECT_TIMEOUT_SECONDS: u32 = 10;
+/// Seconds allowed for the whole request. `curl` applies no timeout of its
+/// own, so without this a provider that accepts the connection and then
+/// stalls blocks the calling command — or a daemon background job — forever.
+const REQUEST_TIMEOUT_SECONDS: u32 = 60;
+
+fn curl_args(url: &str, api_key: &str) -> Vec<String> {
     let mut args = vec![
         "-fsS".to_string(),
+        "--connect-timeout".to_string(),
+        CONNECT_TIMEOUT_SECONDS.to_string(),
+        "--max-time".to_string(),
+        REQUEST_TIMEOUT_SECONDS.to_string(),
         "-X".to_string(),
         "POST".to_string(),
         url.to_string(),
@@ -466,6 +477,11 @@ fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String>
     }
     args.push("--data-binary".to_string());
     args.push("@-".to_string());
+    args
+}
+
+fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String> {
+    let args = curl_args(url, api_key);
 
     let mut child = ProcessCommand::new("curl")
         .args(&args)
@@ -600,6 +616,7 @@ fn normalize(vector: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
+    use super::curl_args;
     use super::{
         DEFAULT_EMBEDDING_DIMENSIONS, DETERMINISTIC_MODEL, DeterministicEmbeddingProvider,
         EmbeddingProvider, EmbeddingProviderConfig, STORAGE_EMBEDDING_DIMENSIONS,
@@ -930,5 +947,24 @@ mod tests {
             .collect::<HashMap<_, _>>();
 
         move |key| values.get(key).cloned()
+    }
+
+    /// `curl` has no default timeout, so a stalled provider would hang the
+    /// caller forever. These flags are the only thing preventing that.
+    #[test]
+    fn curl_args_bound_the_request() {
+        let args = curl_args("https://api.example/v1/embeddings", "secret");
+
+        assert!(args.contains(&"--connect-timeout".to_string()));
+        assert!(args.contains(&"--max-time".to_string()));
+        assert!(args.contains(&"Authorization: Bearer secret".to_string()));
+    }
+
+    #[test]
+    fn curl_args_omit_authorization_without_a_key() {
+        let args = curl_args("http://localhost:11434/api/embeddings", "");
+
+        assert!(args.contains(&"--max-time".to_string()));
+        assert!(!args.iter().any(|arg| arg.starts_with("Authorization:")));
     }
 }
