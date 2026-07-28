@@ -11,6 +11,7 @@ mod eval;
 mod impact;
 mod indexer;
 mod install;
+mod json;
 mod llm;
 mod mcp;
 mod migrations;

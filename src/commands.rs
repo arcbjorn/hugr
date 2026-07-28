@@ -9,6 +9,7 @@ use crate::eval;
 use crate::impact as impact_analysis;
 use crate::indexer;
 use crate::install;
+use crate::json;
 use crate::llm;
 use crate::mcp;
 use crate::store::{
@@ -18,6 +19,7 @@ use crate::store::{
     SyncPushResult, SyncRunHistory, SyncTableResult,
 };
 use crate::worktree;
+use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::io::{self, Write as IoWrite};
@@ -1212,39 +1214,20 @@ async fn doctor() -> Result<()> {
     Ok(())
 }
 
-fn render_recall_json(query: &str, memories: &[Memory]) -> String {
-    let mut rendered = String::new();
-
-    rendered.push('{');
-    let _ = write!(rendered, "\"query\":{},\"memories\":[", json_string(query));
-    for (index, memory) in memories.iter().enumerate() {
-        if index > 0 {
-            rendered.push(',');
-        }
-        rendered.push_str(&render_memory_json(memory));
-    }
-    rendered.push_str("]}");
-
-    rendered
+/// The `recall --json` envelope. A struct rather than `serde_json::json!`
+/// because `Map` sorts its keys and this output puts `query` first.
+#[derive(Serialize)]
+struct RecallJson<'a> {
+    query: &'a str,
+    memories: &'a [Memory],
 }
 
 fn render_memory_json(memory: &Memory) -> String {
-    format!(
-        "{{\"id\":{},\"created_at_ms\":{},\"kind\":{},\"text\":{},\"structured_payload\":{}}}",
-        json_string(&memory.id),
-        memory.created_at_ms,
-        json_string(&memory.kind),
-        json_string(&memory.text),
-        render_optional_json_payload(memory.structured_payload.as_deref())
-    )
+    json::render(memory)
 }
 
-fn render_optional_json_payload(payload: Option<&str>) -> String {
-    match payload {
-        Some(payload) => serde_json::from_str::<serde_json::Value>(payload)
-            .map_or_else(|_| json_string(payload), |value| value.to_string()),
-        None => "null".to_string(),
-    }
+fn render_recall_json(query: &str, memories: &[Memory]) -> String {
+    json::render(&RecallJson { query, memories })
 }
 
 fn render_memory_list_json(memories: &[Memory]) -> String {
@@ -1281,26 +1264,16 @@ fn render_symbols_text(query: &str, symbols: &[CodeSymbol]) -> String {
     rendered
 }
 
+/// The `symbols --json` envelope; see [`RecallJson`] for why this is a
+/// struct and not a `json!` map.
+#[derive(Serialize)]
+struct SymbolsJson<'a> {
+    query: &'a str,
+    symbols: &'a [CodeSymbol],
+}
+
 fn render_symbols_json(query: &str, symbols: &[CodeSymbol]) -> String {
-    let mut rendered = format!("{{\"query\":{},\"symbols\":[", json_string(query));
-    for (index, symbol) in symbols.iter().enumerate() {
-        if index > 0 {
-            rendered.push(',');
-        }
-        let _ = write!(
-            rendered,
-            "{{\"path\":{},\"language\":{},\"name\":{},\"kind\":{},\"line_start\":{},\"line_end\":{},\"signature\":{}}}",
-            json_string(&symbol.path),
-            render_optional_json_string(symbol.language.as_deref()),
-            json_string(&symbol.name),
-            json_string(&symbol.kind),
-            symbol.line_start,
-            render_optional_i64(symbol.line_end),
-            json_string(&symbol.signature)
-        );
-    }
-    rendered.push_str("]}");
-    rendered
+    json::render(&SymbolsJson { query, symbols })
 }
 
 fn code_symbol_location(symbol: &CodeSymbol) -> String {
@@ -1310,14 +1283,6 @@ fn code_symbol_location(symbol: &CodeSymbol) -> String {
         }
         _ => format!("{}:{}", symbol.path, symbol.line_start),
     }
-}
-
-fn render_optional_json_string(value: Option<&str>) -> String {
-    value.map_or_else(|| "null".to_string(), json_string)
-}
-
-fn render_optional_i64(value: Option<i64>) -> String {
-    value.map_or_else(|| "null".to_string(), |value| value.to_string())
 }
 
 fn render_session_promotion_text(result: &SessionPromotionResult) -> String {
@@ -2263,4 +2228,75 @@ mod tests {
         assert!(json.contains("\"operation\":\"pull\""));
         assert!(json.contains("\"conflict_count\":1"));
     }
+
+    /// Fixtures covering both `Some` and `None` for every optional field, a
+    /// payload that parses as JSON, one that does not, and text that needs
+    /// escaping.
+    fn snapshot_memories() -> Vec<Memory> {
+        vec![
+            Memory {
+                id: "mem_1".to_string(),
+                created_at_ms: 10,
+                kind: "fact".to_string(),
+                text: "quote \" backslash \\ newline \n tab \t unicode ✓".to_string(),
+                structured_payload: Some(r#"{"source":{"type":"session"}}"#.to_string()),
+            },
+            Memory {
+                id: "mem_2".to_string(),
+                created_at_ms: 20,
+                kind: "note".to_string(),
+                text: String::new(),
+                structured_payload: None,
+            },
+            Memory {
+                id: "mem_3".to_string(),
+                created_at_ms: 30,
+                kind: "fact".to_string(),
+                text: "plain".to_string(),
+                structured_payload: Some("not json at all".to_string()),
+            },
+        ]
+    }
+
+    fn snapshot_symbols() -> Vec<CodeSymbol> {
+        vec![
+            CodeSymbol {
+                path: "src/plugin_hooks.rs".to_string(),
+                language: Some("rust".to_string()),
+                name: "run_after_config".to_string(),
+                kind: "function".to_string(),
+                line_start: 12,
+                line_end: Some(40),
+                signature: "pub fn run_after_config()".to_string(),
+            },
+            CodeSymbol {
+                path: "src/other.rs".to_string(),
+                language: None,
+                name: "helper".to_string(),
+                kind: "function".to_string(),
+                line_start: 1,
+                line_end: None,
+                signature: String::new(),
+            },
+        ]
+    }
+
+    /// Pins the bytes of the `--json` output for `recall` and `symbols`.
+    /// These are a CLI contract that agents parse, so a reorder or an
+    /// escaping change should fail here rather than downstream.
+    #[test]
+    fn renders_stable_recall_and_symbol_json() {
+        assert_eq!(
+            render_recall_json("plugin \"hooks\"", &snapshot_memories()),
+            RECALL_SNAPSHOT
+        );
+        assert_eq!(
+            render_symbols_json("PluginHooks", &snapshot_symbols()),
+            SYMBOLS_SNAPSHOT
+        );
+    }
+
+    const RECALL_SNAPSHOT: &str = r#"{"query":"plugin \"hooks\"","memories":[{"id":"mem_1","created_at_ms":10,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":{"source":{"type":"session"}}},{"id":"mem_2","created_at_ms":20,"kind":"note","text":"","structured_payload":null},{"id":"mem_3","created_at_ms":30,"kind":"fact","text":"plain","structured_payload":"not json at all"}]}"#;
+
+    const SYMBOLS_SNAPSHOT: &str = r#"{"query":"PluginHooks","symbols":[{"path":"src/plugin_hooks.rs","language":"rust","name":"run_after_config","kind":"function","line_start":12,"line_end":40,"signature":"pub fn run_after_config()"},{"path":"src/other.rs","language":null,"name":"helper","kind":"function","line_start":1,"line_end":null,"signature":""}]}"#;
 }

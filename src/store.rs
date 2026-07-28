@@ -6,6 +6,7 @@ use crate::migrations;
 use crate::redact;
 use crate::testmap::{self, TestCandidate};
 use libsql::{Builder, Connection, Row, params};
+use serde::Serialize;
 use serde_json::json;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -178,12 +179,13 @@ impl PruneSummary {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Memory {
     pub id: String,
     pub created_at_ms: i64,
     pub kind: String,
     pub text: String,
+    #[serde(serialize_with = "crate::json::serialize_embedded_json")]
     pub structured_payload: Option<String>,
 }
 

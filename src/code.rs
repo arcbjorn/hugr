@@ -1,5 +1,6 @@
 use crate::discovery::FileCandidate;
 use crate::error::{Error, Result};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -8,7 +9,7 @@ use tree_sitter::{Node, Parser};
 const MAX_INDEX_BYTES: u64 = 1_000_000;
 const MAX_SIGNATURE_CHARS: usize = 180;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CodeSymbol {
     pub path: String,
     pub language: Option<String>,

@@ -5,7 +5,7 @@ use crate::store::{
 };
 use crate::testmap::TestCandidate;
 use crate::worktree::WorktreeState;
-use serde::{Serialize, Serializer};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::fs;
@@ -105,7 +105,7 @@ pub(crate) struct ContextMemory {
     pub created_at_ms: i64,
     pub kind: String,
     pub text: String,
-    #[serde(serialize_with = "serialize_embedded_json")]
+    #[serde(serialize_with = "crate::json::serialize_embedded_json")]
     pub structured_payload: Option<String>,
     pub citation_id: String,
     pub evidence_score: usize,
@@ -783,9 +783,6 @@ impl ContextPack {
     /// Field order follows the struct declarations, which is what the
     /// snapshot test pins; adding a field here is a wire change.
     pub(crate) fn render_json(&self) -> String {
-        // Serialising these types cannot fail: every field is a string,
-        // integer, option, or vector of the same, and the one custom
-        // serialiser falls back to a string rather than erroring.
         serde_json::to_string(self)
             .unwrap_or_else(|error| unreachable!("context pack serialisation cannot fail: {error}"))
     }
@@ -924,24 +921,6 @@ fn graph_neighbor_citation_id(neighbor: &GraphNeighbor) -> String {
         "graph:{}:{}{}:{}{}",
         neighbor.kind, anchor, line, target, target_qualifier
     )
-}
-
-/// Serialises a memory's `structured_payload`, which already holds serialised
-/// JSON. Splicing the parsed value in keeps consumers able to walk into it
-/// (`structured_payload.source.type`) instead of handing them a quoted blob.
-/// Payloads that do not parse fall back to a plain string so a malformed row
-/// can never produce malformed output.
-fn serialize_embedded_json<S>(payload: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    match payload {
-        Some(payload) => match serde_json::from_str::<serde_json::Value>(payload) {
-            Ok(value) => value.serialize(serializer),
-            Err(_) => serializer.serialize_str(payload),
-        },
-        None => serializer.serialize_none(),
-    }
 }
 
 fn file_evidence(candidate: &FileCandidate, terms: &[String]) -> (usize, String) {
