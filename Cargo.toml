@@ -27,6 +27,28 @@ missing_debug_implementations = "warn"
 # every other clippy warning.
 too_many_arguments = "allow"
 
+# Picked out of `clippy::pedantic` rather than enabling the group wholesale:
+# these each flagged something worth changing here. The group's remaining
+# lints were reviewed and left off deliberately — `float_cmp` only fires on
+# test assertions over exactly representable values, and
+# `case_sensitive_file_extension_comparisons` fires on paths the caller has
+# already lowercased.
+bool_to_int_with_if = "warn"
+doc_markdown = "warn"
+explicit_iter_loop = "warn"
+implicit_clone = "warn"
+inefficient_to_string = "warn"
+manual_let_else = "warn"
+map_unwrap_or = "warn"
+match_same_arms = "warn"
+needless_raw_string_hashes = "warn"
+redundant_closure_for_method_calls = "warn"
+redundant_else = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+unnested_or_patterns = "warn"
+unreadable_literal = "warn"
+
 [features]
 default = ["local-embeddings"]
 # In-process ONNX text embeddings (fastembed). Disable for a slim binary:
