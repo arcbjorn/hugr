@@ -20,7 +20,7 @@ pub(crate) struct CodeSymbol {
     pub signature: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CodeReference {
     pub path: String,
     pub language: Option<String>,

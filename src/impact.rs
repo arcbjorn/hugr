@@ -1,12 +1,12 @@
 use crate::code::{CodeReference, CodeSymbol};
-use crate::context::json_string;
 use crate::error::Result;
 use crate::store::Store;
 use crate::testmap::TestCandidate;
+use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ImpactReport {
     pub target: String,
     pub matched_symbols: Vec<CodeSymbol>,
@@ -173,114 +173,11 @@ impl ImpactReport {
         rendered
     }
 
+    /// Renders the report as compact JSON. Field order follows the struct
+    /// declarations, which the snapshot test pins.
     pub(crate) fn render_json(&self) -> String {
-        let mut rendered = String::new();
-
-        rendered.push('{');
-        let _ = write!(rendered, "\"target\":{},", json_string(&self.target));
-
-        rendered.push_str("\"matched_symbols\":[");
-        for (index, symbol) in self.matched_symbols.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            let _ = write!(
-                rendered,
-                "{{\"path\":{},\"language\":{},\"name\":{},\"kind\":{},\"line_start\":{},\"line_end\":{},\"signature\":{}}}",
-                json_string(&symbol.path),
-                json_option_string(symbol.language.as_deref()),
-                json_string(&symbol.name),
-                json_string(&symbol.kind),
-                symbol.line_start,
-                json_optional_i64(symbol.line_end),
-                json_string(&symbol.signature)
-            );
-        }
-        rendered.push_str("],");
-
-        rendered.push_str("\"references\":[");
-        for (index, reference) in self.references.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            let _ = write!(
-                rendered,
-                "{{\"path\":{},\"language\":{},\"target_path\":{},\"target_name\":{},\"target_kind\":{},\"kind\":{},\"line_start\":{},\"excerpt\":{}}}",
-                json_string(&reference.path),
-                json_option_string(reference.language.as_deref()),
-                json_string(&reference.target_path),
-                json_string(&reference.target_name),
-                json_string(&reference.target_kind),
-                json_string(&reference.kind),
-                reference.line_start,
-                json_string(&reference.excerpt)
-            );
-        }
-        rendered.push_str("],");
-
-        rendered.push_str("\"outbound_references\":[");
-        for (index, reference) in self.outbound_references.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            let _ = write!(
-                rendered,
-                "{{\"path\":{},\"language\":{},\"target_path\":{},\"target_name\":{},\"target_kind\":{},\"kind\":{},\"line_start\":{},\"excerpt\":{}}}",
-                json_string(&reference.path),
-                json_option_string(reference.language.as_deref()),
-                json_string(&reference.target_path),
-                json_string(&reference.target_name),
-                json_string(&reference.target_kind),
-                json_string(&reference.kind),
-                reference.line_start,
-                json_string(&reference.excerpt)
-            );
-        }
-        rendered.push_str("],");
-
-        rendered.push_str("\"affected_files\":[");
-        for (index, file) in self.affected_files.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            rendered.push_str(&json_string(file));
-        }
-        rendered.push_str("],");
-
-        rendered.push_str("\"likely_tests\":[");
-        for (index, test) in self.likely_tests.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            let _ = write!(
-                rendered,
-                "{{\"path\":{},\"reason\":{},\"score\":{}}}",
-                json_string(&test.path),
-                json_string(&test.reason),
-                test.score
-            );
-        }
-        rendered.push_str("],");
-
-        rendered.push_str("\"notes\":[");
-        for (index, note) in self.notes.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            rendered.push_str(&json_string(note));
-        }
-        rendered.push_str("]}");
-
-        rendered
+        crate::json::render(self)
     }
-}
-
-fn json_option_string(value: Option<&str>) -> String {
-    value.map_or_else(|| "null".to_string(), json_string)
-}
-
-fn json_optional_i64(value: Option<i64>) -> String {
-    value.map_or_else(|| "null".to_string(), |value| value.to_string())
 }
 
 fn symbol_location(symbol: &CodeSymbol) -> String {
@@ -355,4 +252,59 @@ mod tests {
         assert!(json.contains("\"likely_tests\""));
         assert!(json.contains("\"affected_files\""));
     }
+
+    fn snapshot_report() -> ImpactReport {
+        let reference = |language: Option<&str>| CodeReference {
+            path: "src/main.rs".to_string(),
+            language: language.map(str::to_string),
+            target_path: "src/plugin_hooks.rs".to_string(),
+            target_name: "run_after_config".to_string(),
+            target_kind: "function".to_string(),
+            kind: "call".to_string(),
+            line_start: 8,
+            excerpt: "run_after_config(); // \"quoted\"\ttab".to_string(),
+        };
+
+        ImpactReport {
+            target: "run_after_config".to_string(),
+            matched_symbols: vec![
+                CodeSymbol {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    language: Some("rust".to_string()),
+                    name: "run_after_config".to_string(),
+                    kind: "function".to_string(),
+                    line_start: 12,
+                    line_end: Some(40),
+                    signature: "pub fn run_after_config()".to_string(),
+                },
+                CodeSymbol {
+                    path: "src/other.rs".to_string(),
+                    language: None,
+                    name: "helper".to_string(),
+                    kind: "function".to_string(),
+                    line_start: 1,
+                    line_end: None,
+                    signature: String::new(),
+                },
+            ],
+            references: vec![reference(Some("rust"))],
+            outbound_references: vec![reference(None)],
+            affected_files: vec!["src/main.rs".to_string()],
+            likely_tests: vec![TestCandidate {
+                path: "tests/plugin_hooks.rs".to_string(),
+                reason: "matching test filename".to_string(),
+                score: 80,
+            }],
+            notes: vec!["high fan-in".to_string()],
+        }
+    }
+
+    /// Pins the `impact --json` bytes; agents parse this to decide blast
+    /// radius before an edit.
+    #[test]
+    fn renders_a_stable_json_snapshot() {
+        assert_eq!(snapshot_report().render_json(), SNAPSHOT);
+    }
+
+    const SNAPSHOT: &str = r#"{"target":"run_after_config","matched_symbols":[{"path":"src/plugin_hooks.rs","language":"rust","name":"run_after_config","kind":"function","line_start":12,"line_end":40,"signature":"pub fn run_after_config()"},{"path":"src/other.rs","language":null,"name":"helper","kind":"function","line_start":1,"line_end":null,"signature":""}],"references":[{"path":"src/main.rs","language":"rust","target_path":"src/plugin_hooks.rs","target_name":"run_after_config","target_kind":"function","kind":"call","line_start":8,"excerpt":"run_after_config(); // \"quoted\"\ttab"}],"outbound_references":[{"path":"src/main.rs","language":null,"target_path":"src/plugin_hooks.rs","target_name":"run_after_config","target_kind":"function","kind":"call","line_start":8,"excerpt":"run_after_config(); // \"quoted\"\ttab"}],"affected_files":["src/main.rs"],"likely_tests":[{"path":"tests/plugin_hooks.rs","reason":"matching test filename","score":80}],"notes":["high fan-in"]}"#;
 }

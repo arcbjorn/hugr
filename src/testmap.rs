@@ -1,9 +1,10 @@
 use crate::code::CodeSymbol;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 const INLINE_TEST_MODULE_SCORE: usize = 70;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct TestCandidate {
     pub path: String,
     pub reason: String,
