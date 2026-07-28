@@ -2585,25 +2585,6 @@ fn estimate_tokens(value: &str) -> usize {
     word_estimate.max(char_estimate).max(1)
 }
 
-pub(crate) fn json_string(value: &str) -> String {
-    let mut escaped = String::from("\"");
-    for char in value.chars() {
-        match char {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            char if char.is_control() => {
-                let _ = write!(escaped, "\\u{:04x}", char as u32);
-            }
-            char => escaped.push(char),
-        }
-    }
-    escaped.push('"');
-    escaped
-}
-
 fn symbol_location(symbol: &ContextSymbol) -> String {
     match symbol.line_end {
         Some(line_end) if line_end > symbol.line_start => {
@@ -2642,7 +2623,7 @@ mod tests {
         Citation, ContextBranchState, ContextBudget, ContextBudgetTruncation, ContextChangedFile,
         ContextDiagnostic, ContextFile, ContextGraphNeighbor, ContextMemory, ContextPack,
         ContextRiskSignal, ContextSessionFact, ContextStaleMemoryRisk, ContextSymbol, ContextTest,
-        context_query_terms, count_signature_parameters, json_string, symbol_evidence,
+        context_query_terms, count_signature_parameters, symbol_evidence,
     };
     use crate::code::CodeSymbol;
     use crate::discovery::{FileCandidate, source_embedding_score};
@@ -3448,7 +3429,6 @@ pub fn small(input: i32) -> i32 {
         let json = pack.render_json();
 
         assert!(json.contains("\"task\":\"quote \\\"and\\\" newline\\n\""));
-        assert_eq!(json_string("tab\tbackslash\\"), "\"tab\\tbackslash\\\\\"");
     }
 
     #[test]
