@@ -6,6 +6,7 @@ use crate::redact;
 use crate::testmap::{self, TestCandidate};
 use libsql::{Builder, Connection, Row, params};
 use serde_json::json;
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -608,7 +609,7 @@ impl Store {
             .into_iter()
             .filter_map(|(normalized_text, mut memories)| {
                 (memories.len() > 1).then(|| {
-                    memories.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+                    memories.sort_by_key(|memory| Reverse(memory.created_at_ms));
                     DuplicateMemoryGroup {
                         normalized_text,
                         memories,
@@ -3617,7 +3618,7 @@ fn references_from_path_via_hugr_api(
         .into_iter()
         .filter(|reference| reference.path == path)
         .collect::<Vec<_>>();
-    references.sort_by(|left, right| left.line_start.cmp(&right.line_start));
+    references.sort_by_key(|left| left.line_start);
     references.truncate(limit);
     Ok(references)
 }
@@ -4358,7 +4359,7 @@ fn storage_edit_freshness_events_after(
             created_at_ms: event.created_at_ms,
         })
         .collect::<Vec<_>>();
-    events.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+    events.sort_by_key(|event| Reverse(event.created_at_ms));
     events.truncate(200);
     events
 }
@@ -5491,7 +5492,7 @@ fn session_promotion_facts_from_records(
             created_at_ms: event.created_at_ms,
         })
         .collect::<Vec<_>>();
-    facts.sort_by(|left, right| left.created_at_ms.cmp(&right.created_at_ms));
+    facts.sort_by_key(|left| left.created_at_ms);
     facts.truncate(12);
 
     if let Some(summary) = session
@@ -5741,7 +5742,7 @@ fn memory_maintenance_report_from_records(records: &[MemorySyncRecord]) -> Memor
         .into_iter()
         .filter_map(|(normalized_text, mut memories)| {
             (memories.len() > 1).then(|| {
-                memories.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+                memories.sort_by_key(|memory| Reverse(memory.created_at_ms));
                 DuplicateMemoryGroup {
                     normalized_text,
                     memories,

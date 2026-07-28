@@ -2441,10 +2441,8 @@ fn find_top_level_double_colon(value: &str) -> Option<Option<usize>> {
         match char {
             '{' => depth += 1,
             '}' => depth = depth.checked_sub(1)?,
-            ':' if depth == 0 => {
-                if chars.peek().is_some_and(|(_, next_char)| *next_char == ':') {
-                    return Some(Some(index));
-                }
+            ':' if depth == 0 && chars.peek().is_some_and(|(_, next_char)| *next_char == ':') => {
+                return Some(Some(index));
             }
             _ => {}
         }
