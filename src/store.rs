@@ -237,7 +237,7 @@ pub(crate) struct ForgetResult {
     pub memories: Vec<Memory>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct MemoryMaintenanceReport {
     pub active_count: usize,
     pub retired_count: usize,
@@ -245,13 +245,13 @@ pub(crate) struct MemoryMaintenanceReport {
     pub stale_candidates: Vec<StaleMemoryCandidate>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct DuplicateMemoryGroup {
     pub normalized_text: String,
     pub memories: Vec<Memory>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct StaleMemoryCandidate {
     pub reason: String,
     pub signal: String,

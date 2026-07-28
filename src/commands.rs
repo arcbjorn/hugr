@@ -1,6 +1,6 @@
 use crate::cli::{Command, MemoryWriteArgs, OutputFormat, help_text};
 use crate::code::CodeSymbol;
-use crate::context::{ContextPack, json_string};
+use crate::context::ContextPack;
 use crate::daemon;
 use crate::discovery;
 use crate::edit;
@@ -13,10 +13,10 @@ use crate::json;
 use crate::llm;
 use crate::mcp;
 use crate::store::{
-    DiagnosticInput, ForgetResult, Memory, MemoryConsolidationResult, MemoryMaintenanceReport,
-    MemorySource, MemoryWriteOptions, SessionFact, SessionPromotionResult, SessionSynthesis,
-    StaleRetirementResult, Store, SyncExecutionPlan, SyncPullResult, SyncPushResult,
-    SyncRunHistory, SyncTableResult,
+    DiagnosticInput, DuplicateMemoryGroup, ForgetResult, Memory, MemoryConsolidationResult,
+    MemoryMaintenanceReport, MemorySource, MemoryWriteOptions, SessionFact, SessionPromotionResult,
+    SessionSynthesis, StaleMemoryCandidate, StaleRetirementResult, Store, SyncExecutionPlan,
+    SyncPullResult, SyncPushResult, SyncRunHistory, SyncTableResult,
 };
 use crate::worktree;
 use serde::Serialize;
@@ -1222,16 +1222,8 @@ struct RecallJson<'a> {
     memories: &'a [Memory],
 }
 
-fn render_memory_json(memory: &Memory) -> String {
-    json::render(memory)
-}
-
 fn render_recall_json(query: &str, memories: &[Memory]) -> String {
     json::render(&RecallJson { query, memories })
-}
-
-fn render_memory_list_json(memories: &[Memory]) -> String {
-    json::render(memories)
 }
 
 fn render_symbols_text(query: &str, symbols: &[CodeSymbol]) -> String {
@@ -1358,56 +1350,7 @@ fn render_improve_text(report: &MemoryMaintenanceReport) -> String {
 }
 
 fn render_improve_json(report: &MemoryMaintenanceReport) -> String {
-    format!(
-        "{{\"active_count\":{},\"retired_count\":{},\"duplicate_groups\":{},\"stale_candidates\":{}}}",
-        report.active_count,
-        report.retired_count,
-        render_duplicate_groups_json(&report.duplicate_groups),
-        render_stale_candidates_json(&report.stale_candidates)
-    )
-}
-
-fn render_duplicate_groups_json(groups: &[crate::store::DuplicateMemoryGroup]) -> String {
-    let mut rendered = String::from("[");
-    for (index, group) in groups.iter().enumerate() {
-        if index > 0 {
-            rendered.push(',');
-        }
-        let _ = write!(
-            rendered,
-            "{{\"normalized_text\":{},\"memories\":{}}}",
-            json_string(&group.normalized_text),
-            render_memory_list_json(&group.memories)
-        );
-    }
-    rendered.push(']');
-    rendered
-}
-
-fn render_stale_candidates_json(candidates: &[crate::store::StaleMemoryCandidate]) -> String {
-    let mut rendered = String::from("[");
-    for (index, candidate) in candidates.iter().enumerate() {
-        if index > 0 {
-            rendered.push(',');
-        }
-        let shared_terms = candidate
-            .shared_terms
-            .iter()
-            .map(|term| json_string(term))
-            .collect::<Vec<_>>()
-            .join(",");
-        let _ = write!(
-            rendered,
-            "{{\"reason\":{},\"signal\":{},\"shared_terms\":[{}],\"newer_memory\":{},\"older_memory\":{}}}",
-            json_string(&candidate.reason),
-            json_string(&candidate.signal),
-            shared_terms,
-            render_memory_json(&candidate.newer_memory),
-            render_memory_json(&candidate.older_memory)
-        );
-    }
-    rendered.push(']');
-    rendered
+    json::render(report)
 }
 
 fn render_consolidation_text(result: &MemoryConsolidationResult) -> String {
@@ -1437,14 +1380,25 @@ fn render_consolidation_text(result: &MemoryConsolidationResult) -> String {
     rendered
 }
 
+/// The `improve --duplicates --execute` envelope. `action` is a literal the
+/// result struct does not carry, so the wire shape is spelled out here.
+#[derive(Serialize)]
+struct ConsolidationJson<'a> {
+    action: &'static str,
+    executed_at: &'a str,
+    duplicate_groups: &'a [DuplicateMemoryGroup],
+    kept_memories: &'a [Memory],
+    retired_memories: &'a [Memory],
+}
+
 fn render_consolidation_json(result: &MemoryConsolidationResult) -> String {
-    format!(
-        "{{\"action\":\"duplicates\",\"executed_at\":{},\"duplicate_groups\":{},\"kept_memories\":{},\"retired_memories\":{}}}",
-        json_string(&result.executed_at),
-        render_duplicate_groups_json(&result.duplicate_groups),
-        render_memory_list_json(&result.kept_memories),
-        render_memory_list_json(&result.retired_memories)
-    )
+    json::render(&ConsolidationJson {
+        action: "duplicates",
+        executed_at: &result.executed_at,
+        duplicate_groups: &result.duplicate_groups,
+        kept_memories: &result.kept_memories,
+        retired_memories: &result.retired_memories,
+    })
 }
 
 fn render_stale_retirement_text(result: &StaleRetirementResult) -> String {
@@ -1474,14 +1428,24 @@ fn render_stale_retirement_text(result: &StaleRetirementResult) -> String {
     rendered
 }
 
+/// The `improve --stale --execute` envelope; see [`ConsolidationJson`].
+#[derive(Serialize)]
+struct StaleRetirementJson<'a> {
+    action: &'static str,
+    executed_at: &'a str,
+    stale_candidates: &'a [StaleMemoryCandidate],
+    kept_memories: &'a [Memory],
+    retired_memories: &'a [Memory],
+}
+
 fn render_stale_retirement_json(result: &StaleRetirementResult) -> String {
-    format!(
-        "{{\"action\":\"stale\",\"executed_at\":{},\"stale_candidates\":{},\"kept_memories\":{},\"retired_memories\":{}}}",
-        json_string(&result.executed_at),
-        render_stale_candidates_json(&result.stale_candidates),
-        render_memory_list_json(&result.kept_memories),
-        render_memory_list_json(&result.retired_memories)
-    )
+    json::render(&StaleRetirementJson {
+        action: "stale",
+        executed_at: &result.executed_at,
+        stale_candidates: &result.stale_candidates,
+        kept_memories: &result.kept_memories,
+        retired_memories: &result.retired_memories,
+    })
 }
 
 fn render_sync_status_text(plan: &SyncExecutionPlan) -> String {
@@ -1521,39 +1485,42 @@ fn render_sync_status_text(plan: &SyncExecutionPlan) -> String {
     )
 }
 
+/// The `sync status --json` shape. Written out rather than derived from
+/// [`SyncExecutionPlan`] because the wire order puts `status` third while the
+/// struct declares it last; deriving would silently move it.
+#[derive(Serialize)]
+struct SyncStatusJson<'a> {
+    storage_mode: &'a str,
+    backend: &'a str,
+    status: &'a str,
+    local_writes_enabled: bool,
+    remote_configured: bool,
+    remote_auth_configured: bool,
+    remote_reads_enabled: bool,
+    remote_writes_enabled: bool,
+    remote_endpoint: Option<&'a str>,
+    api_contract_version: Option<&'a str>,
+    api_routes: &'a [String],
+    sync_classes: &'a [String],
+    explicit_opt_in_classes: &'a [String],
+}
+
 fn render_sync_status_json(plan: &SyncExecutionPlan) -> String {
-    format!(
-        "{{\"storage_mode\":{},\"backend\":{},\"status\":{},\"local_writes_enabled\":{},\"remote_configured\":{},\"remote_auth_configured\":{},\"remote_reads_enabled\":{},\"remote_writes_enabled\":{},\"remote_endpoint\":{},\"api_contract_version\":{},\"api_routes\":{},\"sync_classes\":{},\"explicit_opt_in_classes\":{}}}",
-        json_string(&plan.storage_mode),
-        json_string(&plan.backend),
-        json_string(&plan.status),
-        plan.local_writes_enabled,
-        plan.remote_configured,
-        plan.remote_auth_configured,
-        plan.remote_reads_enabled,
-        plan.remote_writes_enabled,
-        render_optional_string_json(plan.remote_endpoint.as_deref()),
-        render_optional_string_json(plan.api_contract_version.as_deref()),
-        render_string_array_json(&plan.api_routes),
-        render_string_array_json(&plan.sync_classes),
-        render_string_array_json(&plan.explicit_opt_in_classes)
-    )
-}
-
-fn render_optional_string_json(value: Option<&str>) -> String {
-    value.map_or_else(|| "null".to_string(), json_string)
-}
-
-fn render_string_array_json(values: &[String]) -> String {
-    let mut rendered = String::from("[");
-    for (index, value) in values.iter().enumerate() {
-        if index > 0 {
-            rendered.push(',');
-        }
-        rendered.push_str(&json_string(value));
-    }
-    rendered.push(']');
-    rendered
+    json::render(&SyncStatusJson {
+        storage_mode: &plan.storage_mode,
+        backend: &plan.backend,
+        status: &plan.status,
+        local_writes_enabled: plan.local_writes_enabled,
+        remote_configured: plan.remote_configured,
+        remote_auth_configured: plan.remote_auth_configured,
+        remote_reads_enabled: plan.remote_reads_enabled,
+        remote_writes_enabled: plan.remote_writes_enabled,
+        remote_endpoint: plan.remote_endpoint.as_deref(),
+        api_contract_version: plan.api_contract_version.as_deref(),
+        api_routes: &plan.api_routes,
+        sync_classes: &plan.sync_classes,
+        explicit_opt_in_classes: &plan.explicit_opt_in_classes,
+    })
 }
 
 fn render_sync_table_text(rendered: &mut String, table: &SyncTableResult, action: &str) {
@@ -2282,4 +2249,84 @@ mod tests {
     const HISTORY_SNAPSHOT: &str = r#"{"runs":[{"id":"run_1","operation":"push","backend":"direct_libsql","status":"executed","started_at_ms":10,"ended_at_ms":20,"tables":[{"class":"memories","table":"memories","row_count":2,"inserted_count":1,"updated_count":0,"skipped_count":1,"conflict_count":1,"executed":true,"conflicts":[{"reason":"local_row_preserved","count":1}]},{"class":"embeddings","table":"memory_embeddings","row_count":0,"inserted_count":0,"updated_count":0,"skipped_count":0,"conflict_count":0,"executed":false,"conflicts":[]}]}]}"#;
 
     const FORGET_SNAPSHOT: &str = r#"{"query":"plugin \"hooks\"","forgotten_count":1,"forgotten_at":"2026-01-01T00:00:00Z","memories":[{"id":"mem_1","created_at_ms":10,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":{"source":{"type":"session"}}},{"id":"mem_2","created_at_ms":20,"kind":"note","text":"","structured_payload":null},{"id":"mem_3","created_at_ms":30,"kind":"fact","text":"plain","structured_payload":"not json at all"}]}"#;
+
+    fn snapshot_duplicate_groups() -> Vec<DuplicateMemoryGroup> {
+        vec![DuplicateMemoryGroup {
+            normalized_text: "plugin hooks run before config".to_string(),
+            memories: snapshot_memories(),
+        }]
+    }
+
+    fn snapshot_stale_candidates() -> Vec<StaleMemoryCandidate> {
+        vec![StaleMemoryCandidate {
+            reason: "contradicted".to_string(),
+            signal: "before/after".to_string(),
+            shared_terms: vec!["plugin".to_string(), "hooks \"quoted\"".to_string()],
+            newer_memory: snapshot_memories()[0].clone(),
+            older_memory: snapshot_memories()[1].clone(),
+        }]
+    }
+
+    fn snapshot_plan() -> SyncExecutionPlan {
+        SyncExecutionPlan {
+            storage_mode: "hybrid".to_string(),
+            backend: "hugr_api".to_string(),
+            local_writes_enabled: true,
+            remote_configured: true,
+            remote_auth_configured: false,
+            remote_reads_enabled: true,
+            remote_writes_enabled: false,
+            remote_endpoint: Some("https://api.example".to_string()),
+            api_contract_version: None,
+            api_routes: vec!["GET /v1/sync/status".to_string()],
+            sync_classes: vec!["memories".to_string(), "full_source".to_string()],
+            explicit_opt_in_classes: Vec::new(),
+            status: "ready".to_string(),
+        }
+    }
+
+    /// Pins the `improve` and `sync status` `--json` output. Two of these
+    /// shapes do not match their struct: the consolidation and retirement
+    /// envelopes lead with a literal `action`, and `sync status` emits
+    /// `status` third while the struct declares it last.
+    #[test]
+    fn renders_stable_improve_and_status_json() {
+        let report = MemoryMaintenanceReport {
+            active_count: 3,
+            retired_count: 1,
+            duplicate_groups: snapshot_duplicate_groups(),
+            stale_candidates: snapshot_stale_candidates(),
+        };
+        let consolidation = MemoryConsolidationResult {
+            executed_at: "2026-01-01T00:00:00Z".to_string(),
+            duplicate_groups: snapshot_duplicate_groups(),
+            kept_memories: snapshot_memories(),
+            retired_memories: Vec::new(),
+        };
+        let retirement = StaleRetirementResult {
+            executed_at: "2026-01-02T00:00:00Z".to_string(),
+            stale_candidates: snapshot_stale_candidates(),
+            kept_memories: Vec::new(),
+            retired_memories: snapshot_memories(),
+        };
+
+        assert_eq!(render_improve_json(&report), IMPROVE_SNAPSHOT);
+        assert_eq!(
+            render_consolidation_json(&consolidation),
+            CONSOLIDATION_SNAPSHOT
+        );
+        assert_eq!(
+            render_stale_retirement_json(&retirement),
+            RETIREMENT_SNAPSHOT
+        );
+        assert_eq!(render_sync_status_json(&snapshot_plan()), STATUS_SNAPSHOT);
+    }
+
+    const IMPROVE_SNAPSHOT: &str = r#"{"active_count":3,"retired_count":1,"duplicate_groups":[{"normalized_text":"plugin hooks run before config","memories":[{"id":"mem_1","created_at_ms":10,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":{"source":{"type":"session"}}},{"id":"mem_2","created_at_ms":20,"kind":"note","text":"","structured_payload":null},{"id":"mem_3","created_at_ms":30,"kind":"fact","text":"plain","structured_payload":"not json at all"}]}],"stale_candidates":[{"reason":"contradicted","signal":"before/after","shared_terms":["plugin","hooks \"quoted\""],"newer_memory":{"id":"mem_1","created_at_ms":10,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":{"source":{"type":"session"}}},"older_memory":{"id":"mem_2","created_at_ms":20,"kind":"note","text":"","structured_payload":null}}]}"#;
+
+    const CONSOLIDATION_SNAPSHOT: &str = r#"{"action":"duplicates","executed_at":"2026-01-01T00:00:00Z","duplicate_groups":[{"normalized_text":"plugin hooks run before config","memories":[{"id":"mem_1","created_at_ms":10,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":{"source":{"type":"session"}}},{"id":"mem_2","created_at_ms":20,"kind":"note","text":"","structured_payload":null},{"id":"mem_3","created_at_ms":30,"kind":"fact","text":"plain","structured_payload":"not json at all"}]}],"kept_memories":[{"id":"mem_1","created_at_ms":10,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":{"source":{"type":"session"}}},{"id":"mem_2","created_at_ms":20,"kind":"note","text":"","structured_payload":null},{"id":"mem_3","created_at_ms":30,"kind":"fact","text":"plain","structured_payload":"not json at all"}],"retired_memories":[]}"#;
+
+    const RETIREMENT_SNAPSHOT: &str = r#"{"action":"stale","executed_at":"2026-01-02T00:00:00Z","stale_candidates":[{"reason":"contradicted","signal":"before/after","shared_terms":["plugin","hooks \"quoted\""],"newer_memory":{"id":"mem_1","created_at_ms":10,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":{"source":{"type":"session"}}},"older_memory":{"id":"mem_2","created_at_ms":20,"kind":"note","text":"","structured_payload":null}}],"kept_memories":[],"retired_memories":[{"id":"mem_1","created_at_ms":10,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":{"source":{"type":"session"}}},{"id":"mem_2","created_at_ms":20,"kind":"note","text":"","structured_payload":null},{"id":"mem_3","created_at_ms":30,"kind":"fact","text":"plain","structured_payload":"not json at all"}]}"#;
+
+    const STATUS_SNAPSHOT: &str = r#"{"storage_mode":"hybrid","backend":"hugr_api","status":"ready","local_writes_enabled":true,"remote_configured":true,"remote_auth_configured":false,"remote_reads_enabled":true,"remote_writes_enabled":false,"remote_endpoint":"https://api.example","api_contract_version":null,"api_routes":["GET /v1/sync/status"],"sync_classes":["memories","full_source"],"explicit_opt_in_classes":[]}"#;
 }
