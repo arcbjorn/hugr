@@ -1,5 +1,6 @@
 use crate::code::{self, CodeSymbol};
 use crate::discovery::{self, FileCandidate};
+use crate::error::Result;
 use crate::store::{PruneSummary, Store};
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -21,7 +22,7 @@ pub(crate) struct IndexClassification {
     pub count: usize,
 }
 
-pub(crate) async fn index_project(limit: usize) -> Result<IndexSummary, String> {
+pub(crate) async fn index_project(limit: usize) -> Result<IndexSummary> {
     let store = Store::open_current();
     let root = Path::new(".");
     let files = discovery::discover_project_files(root, limit)?;
@@ -47,7 +48,7 @@ pub(crate) async fn index_candidates(
     store: &Store,
     root: &Path,
     files: &[FileCandidate],
-) -> Result<Vec<CodeSymbol>, String> {
+) -> Result<Vec<CodeSymbol>> {
     store.record_discovered_files(files).await?;
     let symbols = code::index_files(root, files)?;
 
@@ -96,7 +97,7 @@ pub(crate) struct RefreshSummary {
 pub(crate) async fn refresh_paths(
     limit: usize,
     changed_paths: &[String],
-) -> Result<RefreshSummary, String> {
+) -> Result<RefreshSummary> {
     let store = Store::open_current();
     let root = Path::new(".");
 

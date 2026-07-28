@@ -1,3 +1,4 @@
+use crate::error::{Error, Result};
 use libsql::{Connection, params};
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,7 +29,7 @@ const TEST_MAPPINGS_NAME: &str = "test_mappings";
 const SOURCE_EMBEDDINGS_VERSION: i64 = 12;
 const SOURCE_EMBEDDINGS_NAME: &str = "source_embeddings";
 
-pub(crate) async fn migrate(conn: &Connection) -> Result<(), String> {
+pub(crate) async fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -38,98 +39,74 @@ pub(crate) async fn migrate(conn: &Connection) -> Result<(), String> {
         );
         ",
     )
-    .await
-    .map_err(|error| error.to_string())?;
+    .await?;
 
     let applied = applied_migrations(conn).await?;
     if !applied.contains(&INITIAL_SCHEMA_VERSION) {
-        conn.execute_batch(&initial_schema_sql())
-            .await
-            .map_err(|error| error.to_string())?;
+        conn.execute_batch(&initial_schema_sql()).await?;
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![INITIAL_SCHEMA_VERSION, INITIAL_SCHEMA_NAME, now_ms()?],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     }
 
     if !applied.contains(&PROJECT_REGISTRY_VERSION) {
-        conn.execute_batch(project_registry_sql())
-            .await
-            .map_err(|error| error.to_string())?;
+        conn.execute_batch(project_registry_sql()).await?;
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![PROJECT_REGISTRY_VERSION, PROJECT_REGISTRY_NAME, now_ms()?],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     }
 
     if !applied.contains(&FILE_DISCOVERY_VERSION) {
-        conn.execute_batch(file_discovery_sql())
-            .await
-            .map_err(|error| error.to_string())?;
+        conn.execute_batch(file_discovery_sql()).await?;
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![FILE_DISCOVERY_VERSION, FILE_DISCOVERY_NAME, now_ms()?],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     }
 
     if !applied.contains(&SESSIONS_VERSION) {
-        conn.execute_batch(sessions_sql())
-            .await
-            .map_err(|error| error.to_string())?;
+        conn.execute_batch(sessions_sql()).await?;
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![SESSIONS_VERSION, SESSIONS_NAME, now_ms()?],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     }
 
     if !applied.contains(&CODE_SYMBOLS_VERSION) {
-        conn.execute_batch(code_symbols_sql())
-            .await
-            .map_err(|error| error.to_string())?;
+        conn.execute_batch(code_symbols_sql()).await?;
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![CODE_SYMBOLS_VERSION, CODE_SYMBOLS_NAME, now_ms()?],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     }
 
     if !applied.contains(&CODE_REFERENCES_VERSION) {
-        conn.execute_batch(code_references_sql())
-            .await
-            .map_err(|error| error.to_string())?;
+        conn.execute_batch(code_references_sql()).await?;
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![CODE_REFERENCES_VERSION, CODE_REFERENCES_NAME, now_ms()?],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     }
 
     if !applied.contains(&SYNC_HISTORY_VERSION) {
-        conn.execute_batch(sync_history_sql())
-            .await
-            .map_err(|error| error.to_string())?;
+        conn.execute_batch(sync_history_sql()).await?;
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![SYNC_HISTORY_VERSION, SYNC_HISTORY_NAME, now_ms()?],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     }
 
     if !applied.contains(&SESSION_PROMOTIONS_VERSION) {
-        conn.execute_batch(session_promotions_sql())
-            .await
-            .map_err(|error| error.to_string())?;
+        conn.execute_batch(session_promotions_sql()).await?;
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![
@@ -138,70 +115,56 @@ pub(crate) async fn migrate(conn: &Connection) -> Result<(), String> {
                 now_ms()?
             ],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     }
 
     if !applied.contains(&CONTEXT_PACKS_VERSION) {
-        conn.execute_batch(context_packs_sql())
-            .await
-            .map_err(|error| error.to_string())?;
+        conn.execute_batch(context_packs_sql()).await?;
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![CONTEXT_PACKS_VERSION, CONTEXT_PACKS_NAME, now_ms()?],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     }
 
     if !applied.contains(&DIAGNOSTICS_VERSION) {
-        conn.execute_batch(diagnostics_sql())
-            .await
-            .map_err(|error| error.to_string())?;
+        conn.execute_batch(diagnostics_sql()).await?;
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![DIAGNOSTICS_VERSION, DIAGNOSTICS_NAME, now_ms()?],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     }
 
     if !applied.contains(&TEST_MAPPINGS_VERSION) {
-        conn.execute_batch(test_mappings_sql())
-            .await
-            .map_err(|error| error.to_string())?;
+        conn.execute_batch(test_mappings_sql()).await?;
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![TEST_MAPPINGS_VERSION, TEST_MAPPINGS_NAME, now_ms()?],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     }
 
     if !applied.contains(&SOURCE_EMBEDDINGS_VERSION) {
-        conn.execute_batch(&source_embeddings_sql())
-            .await
-            .map_err(|error| error.to_string())?;
+        conn.execute_batch(&source_embeddings_sql()).await?;
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
             params![SOURCE_EMBEDDINGS_VERSION, SOURCE_EMBEDDINGS_NAME, now_ms()?],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     }
 
     Ok(())
 }
 
-async fn applied_migrations(conn: &Connection) -> Result<HashSet<i64>, String> {
+async fn applied_migrations(conn: &Connection) -> Result<HashSet<i64>> {
     let mut rows = conn
         .query("SELECT version FROM schema_migrations", ())
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut applied = HashSet::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        applied.insert(row.get::<i64>(0).map_err(|error| error.to_string())?);
+    while let Some(row) = rows.next().await? {
+        applied.insert(row.get::<i64>(0)?);
     }
 
     Ok(applied)
@@ -538,10 +501,9 @@ fn sync_history_sql() -> &'static str {
     "
 }
 
-fn now_ms() -> Result<i64, String> {
+fn now_ms() -> Result<i64> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .map_err(|error| error.to_string())?;
-    i64::try_from(millis).map_err(|error| error.to_string())
+        .map(|duration| duration.as_millis())?;
+    i64::try_from(millis).map_err(Error::from)
 }

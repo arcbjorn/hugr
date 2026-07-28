@@ -6,6 +6,7 @@ mod daemon;
 mod discovery;
 mod edit;
 mod embedding;
+mod error;
 mod eval;
 mod impact;
 mod indexer;
@@ -18,9 +19,11 @@ mod store;
 mod testmap;
 mod worktree;
 
+pub use error::{Error, Result};
+
 use cli::Command;
 
-pub async fn run(args: Vec<String>) -> Result<(), String> {
+pub async fn run(args: Vec<String>) -> Result<()> {
     let command = Command::parse(&args)?;
     commands::execute(command).await
 }

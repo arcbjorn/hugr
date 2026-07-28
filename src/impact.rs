@@ -1,5 +1,6 @@
 use crate::code::{CodeReference, CodeSymbol};
 use crate::context::json_string;
+use crate::error::Result;
 use crate::store::Store;
 use crate::testmap::TestCandidate;
 use std::collections::BTreeSet;
@@ -16,11 +17,7 @@ pub(crate) struct ImpactReport {
     pub notes: Vec<String>,
 }
 
-pub(crate) async fn analyze(
-    store: &Store,
-    target: &str,
-    limit: usize,
-) -> Result<ImpactReport, String> {
+pub(crate) async fn analyze(store: &Store, target: &str, limit: usize) -> Result<ImpactReport> {
     let matched_symbols = store.symbols_for_target(target, limit).await?;
     let references = store.references_to_symbols(&matched_symbols, limit).await?;
     let outbound_references = if is_file_target(target, &matched_symbols) {

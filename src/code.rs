@@ -1,4 +1,5 @@
 use crate::discovery::FileCandidate;
+use crate::error::{Error, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -40,7 +41,7 @@ pub(crate) fn symbols_in_source(
     path: &str,
     language: Option<&str>,
     contents: &str,
-) -> Result<Vec<CodeSymbol>, String> {
+) -> Result<Vec<CodeSymbol>> {
     extract_symbols(path, language, contents)
 }
 
@@ -49,18 +50,12 @@ pub(crate) fn symbols_in_source(
 /// languages are not blocked. Structural edit validation uses this so a syntactically
 /// broken replacement body is refused rather than silently accepted by the fallback
 /// symbol scanner.
-pub(crate) fn parses_cleanly(
-    path: &str,
-    language: Option<&str>,
-    contents: &str,
-) -> Result<bool, String> {
+pub(crate) fn parses_cleanly(path: &str, language: Option<&str>, contents: &str) -> Result<bool> {
     let Some(grammar) = grammar_for(path, language) else {
         return Ok(true);
     };
     let mut parser = Parser::new();
-    parser
-        .set_language(&grammar)
-        .map_err(|error| error.to_string())?;
+    parser.set_language(&grammar)?;
     let Some(tree) = parser.parse(contents, None) else {
         return Ok(false);
     };
@@ -83,7 +78,7 @@ fn grammar_for(path: &str, language: Option<&str>) -> Option<tree_sitter::Langua
     Some(grammar)
 }
 
-pub(crate) fn index_files(root: &Path, files: &[FileCandidate]) -> Result<Vec<CodeSymbol>, String> {
+pub(crate) fn index_files(root: &Path, files: &[FileCandidate]) -> Result<Vec<CodeSymbol>> {
     let mut symbols = Vec::new();
     let mut seen = HashSet::new();
 
@@ -124,7 +119,7 @@ pub(crate) fn extract_references(
     root: &Path,
     files: &[FileCandidate],
     symbols: &[CodeSymbol],
-) -> Result<Vec<CodeReference>, String> {
+) -> Result<Vec<CodeReference>> {
     let targets = reference_targets(symbols);
     if targets.is_empty() {
         return Ok(Vec::new());
@@ -157,7 +152,7 @@ pub(crate) fn extract_references(
         let resolutions = ambiguous_resolutions(&file.path, &contents, &targets, &ambiguous_groups);
 
         for (index, line) in contents.lines().enumerate() {
-            let line_number = i64::try_from(index + 1).map_err(|error| error.to_string())?;
+            let line_number = i64::try_from(index + 1)?;
             let trimmed = line.trim();
             if trimmed.is_empty() || is_comment_line(trimmed) {
                 continue;
@@ -211,11 +206,7 @@ pub(crate) fn extract_references(
     Ok(references)
 }
 
-fn extract_symbols(
-    path: &str,
-    language: Option<&str>,
-    contents: &str,
-) -> Result<Vec<CodeSymbol>, String> {
+fn extract_symbols(path: &str, language: Option<&str>, contents: &str) -> Result<Vec<CodeSymbol>> {
     if matches!(language, Some("rust")) {
         let symbols = extract_rust_symbols_with_tree_sitter(path, contents)?;
         if !symbols.is_empty() {
@@ -272,12 +263,12 @@ fn extract_symbols_from_lines(
     path: &str,
     language: Option<&str>,
     contents: &str,
-) -> Result<Vec<CodeSymbol>, String> {
+) -> Result<Vec<CodeSymbol>> {
     let mut symbols = Vec::new();
-    let line_count = i64::try_from(contents.lines().count()).map_err(|error| error.to_string())?;
+    let line_count = i64::try_from(contents.lines().count())?;
 
     for (index, line) in contents.lines().enumerate() {
-        let line_number = i64::try_from(index + 1).map_err(|error| error.to_string())?;
+        let line_number = i64::try_from(index + 1)?;
         let trimmed = line.trim();
         if trimmed.is_empty() || is_comment_line(trimmed) {
             continue;
@@ -309,14 +300,9 @@ fn extract_symbols_from_lines(
     Ok(symbols)
 }
 
-fn extract_rust_symbols_with_tree_sitter(
-    path: &str,
-    contents: &str,
-) -> Result<Vec<CodeSymbol>, String> {
+fn extract_rust_symbols_with_tree_sitter(path: &str, contents: &str) -> Result<Vec<CodeSymbol>> {
     let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .map_err(|error| error.to_string())?;
+    parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
     let Some(tree) = parser.parse(contents, None) else {
         return Ok(Vec::new());
     };
@@ -340,7 +326,7 @@ fn collect_rust_symbols(
     contents: &str,
     node: Node<'_>,
     symbols: &mut Vec<CodeSymbol>,
-) -> Result<(), String> {
+) -> Result<()> {
     if let Some(symbol) = rust_symbol_from_node(path, contents, node)? {
         symbols.push(symbol);
     }
@@ -353,11 +339,7 @@ fn collect_rust_symbols(
     Ok(())
 }
 
-fn rust_symbol_from_node(
-    path: &str,
-    contents: &str,
-    node: Node<'_>,
-) -> Result<Option<CodeSymbol>, String> {
+fn rust_symbol_from_node(path: &str, contents: &str, node: Node<'_>) -> Result<Option<CodeSymbol>> {
     let (kind, name_node) = match node.kind() {
         "function_item" => ("function", node.child_by_field_name("name")),
         "struct_item" => ("struct", node.child_by_field_name("name")),
@@ -404,25 +386,20 @@ fn rust_signature(node: Node<'_>, contents: &str) -> String {
     clean_signature(&contents[start..end])
 }
 
-fn node_text(node: Node<'_>, contents: &str) -> Result<String, String> {
+fn node_text(node: Node<'_>, contents: &str) -> Result<String> {
     node.utf8_text(contents.as_bytes())
         .map(str::trim)
         .map(str::to_string)
-        .map_err(|error| error.to_string())
+        .map_err(Error::from)
 }
 
 fn line_number(row: usize) -> i64 {
     i64::try_from(row + 1).unwrap_or(i64::MAX)
 }
 
-fn extract_python_symbols_with_tree_sitter(
-    path: &str,
-    contents: &str,
-) -> Result<Vec<CodeSymbol>, String> {
+fn extract_python_symbols_with_tree_sitter(path: &str, contents: &str) -> Result<Vec<CodeSymbol>> {
     let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_python::LANGUAGE.into())
-        .map_err(|error| error.to_string())?;
+    parser.set_language(&tree_sitter_python::LANGUAGE.into())?;
     let Some(tree) = parser.parse(contents, None) else {
         return Ok(Vec::new());
     };
@@ -446,7 +423,7 @@ fn collect_python_symbols(
     contents: &str,
     node: Node<'_>,
     symbols: &mut Vec<CodeSymbol>,
-) -> Result<(), String> {
+) -> Result<()> {
     if let Some(symbol) = python_symbol_from_node(path, contents, node)? {
         symbols.push(symbol);
     }
@@ -463,7 +440,7 @@ fn python_symbol_from_node(
     path: &str,
     contents: &str,
     node: Node<'_>,
-) -> Result<Option<CodeSymbol>, String> {
+) -> Result<Option<CodeSymbol>> {
     let (kind, name_node) = match node.kind() {
         "function_definition" => ("function", node.child_by_field_name("name")),
         "class_definition" => ("class", node.child_by_field_name("name")),
@@ -495,16 +472,12 @@ fn python_signature(node: Node<'_>, contents: &str) -> String {
 fn extract_typescript_symbols_with_tree_sitter(
     path: &str,
     contents: &str,
-) -> Result<Vec<CodeSymbol>, String> {
+) -> Result<Vec<CodeSymbol>> {
     let mut parser = Parser::new();
     if path.ends_with(".tsx") {
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
-            .map_err(|error| error.to_string())?;
+        parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())?;
     } else {
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .map_err(|error| error.to_string())?;
+        parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())?;
     }
     let Some(tree) = parser.parse(contents, None) else {
         return Ok(Vec::new());
@@ -529,7 +502,7 @@ fn collect_typescript_symbols(
     contents: &str,
     node: Node<'_>,
     symbols: &mut Vec<CodeSymbol>,
-) -> Result<(), String> {
+) -> Result<()> {
     if let Some(symbol) = typescript_symbol_from_node(path, contents, node)? {
         symbols.push(symbol);
     }
@@ -546,7 +519,7 @@ fn typescript_symbol_from_node(
     path: &str,
     contents: &str,
     node: Node<'_>,
-) -> Result<Option<CodeSymbol>, String> {
+) -> Result<Option<CodeSymbol>> {
     let (kind, name_node) = match node.kind() {
         "abstract_class_declaration" | "class_declaration" => {
             ("class", node.child_by_field_name("name"))
@@ -604,11 +577,9 @@ fn line_signature(node: Node<'_>, contents: &str) -> String {
 fn extract_javascript_symbols_with_tree_sitter(
     path: &str,
     contents: &str,
-) -> Result<Vec<CodeSymbol>, String> {
+) -> Result<Vec<CodeSymbol>> {
     let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
-        .map_err(|error| error.to_string())?;
+    parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())?;
     let Some(tree) = parser.parse(contents, None) else {
         return Ok(Vec::new());
     };
@@ -631,12 +602,12 @@ fn extract_javascript_symbols_with_tree_sitter(
     Ok(symbols)
 }
 
-fn extract_commonjs_export_symbols(path: &str, contents: &str) -> Result<Vec<CodeSymbol>, String> {
+fn extract_commonjs_export_symbols(path: &str, contents: &str) -> Result<Vec<CodeSymbol>> {
     let mut symbols = Vec::new();
-    let line_count = i64::try_from(contents.lines().count()).map_err(|error| error.to_string())?;
+    let line_count = i64::try_from(contents.lines().count())?;
 
     for (index, line) in contents.lines().enumerate() {
-        let line_number = i64::try_from(index + 1).map_err(|error| error.to_string())?;
+        let line_number = i64::try_from(index + 1)?;
         let trimmed = line.trim();
         if trimmed.is_empty() || is_comment_line(trimmed) {
             continue;
@@ -720,14 +691,9 @@ fn commonjs_object_export_names(line: &str) -> Vec<String> {
         .collect()
 }
 
-fn extract_go_symbols_with_tree_sitter(
-    path: &str,
-    contents: &str,
-) -> Result<Vec<CodeSymbol>, String> {
+fn extract_go_symbols_with_tree_sitter(path: &str, contents: &str) -> Result<Vec<CodeSymbol>> {
     let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_go::LANGUAGE.into())
-        .map_err(|error| error.to_string())?;
+    parser.set_language(&tree_sitter_go::LANGUAGE.into())?;
     let Some(tree) = parser.parse(contents, None) else {
         return Ok(Vec::new());
     };
@@ -751,7 +717,7 @@ fn collect_go_symbols(
     contents: &str,
     node: Node<'_>,
     symbols: &mut Vec<CodeSymbol>,
-) -> Result<(), String> {
+) -> Result<()> {
     if let Some(symbol) = go_symbol_from_node(path, contents, node)? {
         symbols.push(symbol);
     }
@@ -764,11 +730,7 @@ fn collect_go_symbols(
     Ok(())
 }
 
-fn go_symbol_from_node(
-    path: &str,
-    contents: &str,
-    node: Node<'_>,
-) -> Result<Option<CodeSymbol>, String> {
+fn go_symbol_from_node(path: &str, contents: &str, node: Node<'_>) -> Result<Option<CodeSymbol>> {
     let (kind, name_node) = match node.kind() {
         "function_declaration" | "method_declaration" => {
             ("function", node.child_by_field_name("name"))
@@ -801,14 +763,9 @@ fn go_type_spec_kind(node: Node<'_>) -> &'static str {
     }
 }
 
-fn extract_java_symbols_with_tree_sitter(
-    path: &str,
-    contents: &str,
-) -> Result<Vec<CodeSymbol>, String> {
+fn extract_java_symbols_with_tree_sitter(path: &str, contents: &str) -> Result<Vec<CodeSymbol>> {
     let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_java::LANGUAGE.into())
-        .map_err(|error| error.to_string())?;
+    parser.set_language(&tree_sitter_java::LANGUAGE.into())?;
     let Some(tree) = parser.parse(contents, None) else {
         return Ok(Vec::new());
     };
@@ -832,7 +789,7 @@ fn collect_java_symbols(
     contents: &str,
     node: Node<'_>,
     symbols: &mut Vec<CodeSymbol>,
-) -> Result<(), String> {
+) -> Result<()> {
     if let Some(symbol) = java_symbol_from_node(path, contents, node)? {
         symbols.push(symbol);
     }
@@ -845,11 +802,7 @@ fn collect_java_symbols(
     Ok(())
 }
 
-fn java_symbol_from_node(
-    path: &str,
-    contents: &str,
-    node: Node<'_>,
-) -> Result<Option<CodeSymbol>, String> {
+fn java_symbol_from_node(path: &str, contents: &str, node: Node<'_>) -> Result<Option<CodeSymbol>> {
     let (kind, name_node) = match node.kind() {
         "annotation_type_declaration" => ("annotation", node.child_by_field_name("name")),
         "class_declaration" => ("class", node.child_by_field_name("name")),
@@ -877,14 +830,9 @@ fn java_symbol_from_node(
     }))
 }
 
-fn extract_kotlin_symbols_with_tree_sitter(
-    path: &str,
-    contents: &str,
-) -> Result<Vec<CodeSymbol>, String> {
+fn extract_kotlin_symbols_with_tree_sitter(path: &str, contents: &str) -> Result<Vec<CodeSymbol>> {
     let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
-        .map_err(|error| error.to_string())?;
+    parser.set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())?;
     let Some(tree) = parser.parse(contents, None) else {
         return Ok(Vec::new());
     };
@@ -908,7 +856,7 @@ fn collect_kotlin_symbols(
     contents: &str,
     node: Node<'_>,
     symbols: &mut Vec<CodeSymbol>,
-) -> Result<(), String> {
+) -> Result<()> {
     if let Some(symbol) = kotlin_symbol_from_node(path, contents, node)? {
         symbols.push(symbol);
     }
@@ -925,7 +873,7 @@ fn kotlin_symbol_from_node(
     path: &str,
     contents: &str,
     node: Node<'_>,
-) -> Result<Option<CodeSymbol>, String> {
+) -> Result<Option<CodeSymbol>> {
     let (kind, name) = match node.kind() {
         "class_declaration" => {
             let Some(name_node) = node.child_by_field_name("name") else {
@@ -1001,14 +949,9 @@ fn kotlin_class_declaration_kind(node: Node<'_>, contents: &str) -> &'static str
     }
 }
 
-fn extract_swift_symbols_with_tree_sitter(
-    path: &str,
-    contents: &str,
-) -> Result<Vec<CodeSymbol>, String> {
+fn extract_swift_symbols_with_tree_sitter(path: &str, contents: &str) -> Result<Vec<CodeSymbol>> {
     let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_swift::LANGUAGE.into())
-        .map_err(|error| error.to_string())?;
+    parser.set_language(&tree_sitter_swift::LANGUAGE.into())?;
     let Some(tree) = parser.parse(contents, None) else {
         return Ok(Vec::new());
     };
@@ -1032,7 +975,7 @@ fn collect_swift_symbols(
     contents: &str,
     node: Node<'_>,
     symbols: &mut Vec<CodeSymbol>,
-) -> Result<(), String> {
+) -> Result<()> {
     if let Some(symbol) = swift_symbol_from_node(path, contents, node)? {
         symbols.push(symbol);
     }
@@ -1049,7 +992,7 @@ fn swift_symbol_from_node(
     path: &str,
     contents: &str,
     node: Node<'_>,
-) -> Result<Option<CodeSymbol>, String> {
+) -> Result<Option<CodeSymbol>> {
     let (kind, name) = match node.kind() {
         "associatedtype_declaration" | "typealias_declaration" => {
             let Some(name_node) = node.child_by_field_name("name") else {

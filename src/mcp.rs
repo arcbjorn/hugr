@@ -1,6 +1,7 @@
 use crate::code::CodeSymbol;
 use crate::context::ContextPack;
 use crate::edit;
+use crate::error::{Error, Result};
 use crate::impact;
 use crate::indexer;
 use crate::store::{
@@ -12,20 +13,20 @@ use std::io::{self, BufRead, Write};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
-pub(crate) async fn serve_stdio() -> Result<(), String> {
+pub(crate) async fn serve_stdio() -> Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
     for line in stdin.lock().lines() {
-        let line = line.map_err(|error| error.to_string())?;
+        let line = line?;
         if line.trim().is_empty() {
             continue;
         }
 
         let response = handle_line(&line).await;
         if let Some(response) = response {
-            writeln!(stdout, "{response}").map_err(|error| error.to_string())?;
-            stdout.flush().map_err(|error| error.to_string())?;
+            writeln!(stdout, "{response}")?;
+            stdout.flush()?;
         }
     }
 
@@ -79,7 +80,7 @@ async fn handle_request(request: Value) -> Result<Option<Value>, Value> {
             let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
             let result = handle_tool_call(params)
                 .await
-                .map_err(|error| json_error(id.clone(), -32603, &error))?;
+                .map_err(|error| json_error(id.clone(), -32603, &error.to_string()))?;
             Ok(Some(json_response(id, result)))
         }
         unknown => Err(json_error(
@@ -90,7 +91,7 @@ async fn handle_request(request: Value) -> Result<Option<Value>, Value> {
     }
 }
 
-async fn handle_tool_call(params: Value) -> Result<Value, String> {
+async fn handle_tool_call(params: Value) -> Result<Value> {
     let name = required_string(&params, "name")?;
     let arguments = params
         .get("arguments")
@@ -112,11 +113,11 @@ async fn handle_tool_call(params: Value) -> Result<Value, String> {
         "hugr_rename_symbol" => tool_rename_symbol(&arguments).await,
         "hugr_move_symbol" => tool_move_symbol(&arguments).await,
         "hugr_forget" => tool_forget(&arguments).await,
-        unknown => Err(format!("unknown tool '{unknown}'")),
+        unknown => Err(Error::msg(format!("unknown tool '{unknown}'"))),
     }
 }
 
-async fn tool_context(arguments: &Value) -> Result<Value, String> {
+async fn tool_context(arguments: &Value) -> Result<Value> {
     let task = required_string(arguments, "task")?;
     let budget = optional_budget(arguments)?;
     let pack = crate::commands::compile_context_pack_with_file_candidates(&task, budget)
@@ -127,7 +128,7 @@ async fn tool_context(arguments: &Value) -> Result<Value, String> {
     Ok(tool_result(pack.render_markdown(), structured))
 }
 
-fn optional_budget(arguments: &Value) -> Result<Option<usize>, String> {
+fn optional_budget(arguments: &Value) -> Result<Option<usize>> {
     let Some(value) = arguments.get("budget") else {
         return Ok(None);
     };
@@ -139,10 +140,10 @@ fn optional_budget(arguments: &Value) -> Result<Option<usize>, String> {
         .map(|budget| budget as usize)
         .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
         .map(Some)
-        .ok_or_else(|| "budget must be a positive integer".to_string())
+        .ok_or_else(|| Error::msg("budget must be a positive integer".to_string()))
 }
 
-async fn tool_remember(arguments: &Value) -> Result<Value, String> {
+async fn tool_remember(arguments: &Value) -> Result<Value> {
     let text = required_string(arguments, "text")?;
     let options = optional_memory_write_options(arguments)?;
     let memory = Store::open_current()
@@ -154,7 +155,7 @@ async fn tool_remember(arguments: &Value) -> Result<Value, String> {
     ))
 }
 
-async fn tool_recall(arguments: &Value) -> Result<Value, String> {
+async fn tool_recall(arguments: &Value) -> Result<Value> {
     let query = required_string(arguments, "query")?;
     let limit = optional_limit(arguments, 10)?;
     let memories = Store::open_current().recall(&query, limit).await?;
@@ -165,7 +166,7 @@ async fn tool_recall(arguments: &Value) -> Result<Value, String> {
     Ok(tool_result(structured.to_string(), structured))
 }
 
-async fn tool_forget(arguments: &Value) -> Result<Value, String> {
+async fn tool_forget(arguments: &Value) -> Result<Value> {
     let query = required_string(arguments, "query")?;
     let limit = optional_bounded_usize(arguments, "limit", 25, 100)?;
     let result = Store::open_current().forget(&query, limit).await?;
@@ -182,7 +183,7 @@ async fn tool_forget(arguments: &Value) -> Result<Value, String> {
     ))
 }
 
-async fn tool_project_status() -> Result<Value, String> {
+async fn tool_project_status() -> Result<Value> {
     let store = Store::open_current();
     let project = store.sync_current_project().await?;
     Ok(tool_result(
@@ -191,7 +192,7 @@ async fn tool_project_status() -> Result<Value, String> {
     ))
 }
 
-async fn tool_session_start(arguments: &Value) -> Result<Value, String> {
+async fn tool_session_start(arguments: &Value) -> Result<Value> {
     let task = required_string(arguments, "task")?;
     let session = Store::open_current().start_session(&task).await?;
     Ok(tool_result(
@@ -200,7 +201,7 @@ async fn tool_session_start(arguments: &Value) -> Result<Value, String> {
     ))
 }
 
-async fn tool_session_event(arguments: &Value) -> Result<Value, String> {
+async fn tool_session_event(arguments: &Value) -> Result<Value> {
     let kind = required_string(arguments, "kind")?;
     let detail = required_string(arguments, "detail")?;
     let event = Store::open_current()
@@ -212,7 +213,7 @@ async fn tool_session_event(arguments: &Value) -> Result<Value, String> {
     ))
 }
 
-async fn tool_session_end(arguments: &Value) -> Result<Value, String> {
+async fn tool_session_end(arguments: &Value) -> Result<Value> {
     let summary = arguments.get("summary").and_then(Value::as_str);
     let session = Store::open_current().end_session(summary).await?;
     Ok(tool_result(
@@ -221,7 +222,7 @@ async fn tool_session_end(arguments: &Value) -> Result<Value, String> {
     ))
 }
 
-async fn tool_index(arguments: &Value) -> Result<Value, String> {
+async fn tool_index(arguments: &Value) -> Result<Value> {
     let limit = optional_bounded_usize(arguments, "limit", 5000, 50000)?;
     let summary = indexer::index_project(limit).await?;
     Ok(tool_result(
@@ -239,7 +240,7 @@ async fn tool_index(arguments: &Value) -> Result<Value, String> {
     ))
 }
 
-async fn tool_symbols(arguments: &Value) -> Result<Value, String> {
+async fn tool_symbols(arguments: &Value) -> Result<Value> {
     let query = required_string(arguments, "query")?;
     let limit = optional_bounded_usize(arguments, "limit", 25, 100)?;
     indexer::index_project(5000).await?;
@@ -254,7 +255,7 @@ async fn tool_symbols(arguments: &Value) -> Result<Value, String> {
     Ok(tool_result(structured.to_string(), structured))
 }
 
-async fn tool_impact(arguments: &Value) -> Result<Value, String> {
+async fn tool_impact(arguments: &Value) -> Result<Value> {
     let target = required_string(arguments, "target")?;
     let limit = optional_bounded_usize(arguments, "limit", 50, 500)?;
     indexer::index_project(5000).await?;
@@ -265,7 +266,7 @@ async fn tool_impact(arguments: &Value) -> Result<Value, String> {
     Ok(tool_result(report.render_markdown(), structured))
 }
 
-async fn tool_replace_symbol(arguments: &Value) -> Result<Value, String> {
+async fn tool_replace_symbol(arguments: &Value) -> Result<Value> {
     let path = required_string(arguments, "path")?;
     let name = required_string(arguments, "name")?;
     let kind = optional_string(arguments, "kind")?;
@@ -273,18 +274,24 @@ async fn tool_replace_symbol(arguments: &Value) -> Result<Value, String> {
 
     let store = Store::open_current();
     if !store.supports_local_source_edits()? {
-        return Err(
-            "hugr_replace_symbol edits the local working tree and is not available in remote Hugr API mode"
-                .to_string(),
-        );
+        return Err(Error::msg("hugr_replace_symbol edits the local working tree and is not available in remote Hugr API mode"
+                .to_string()));
     }
 
-    let contents = std::fs::read_to_string(&path)
-        .map_err(|error| format!("hugr_replace_symbol cannot read {path}: {error}"))?;
+    let contents = std::fs::read_to_string(&path).map_err(|error| {
+        Error::with_source(
+            format!("hugr_replace_symbol cannot read {path}: {error}"),
+            error,
+        )
+    })?;
     let planned = edit::plan_replacement(&path, &contents, &name, kind.as_deref(), &body)?;
 
-    std::fs::write(&path, &planned.contents)
-        .map_err(|error| format!("hugr_replace_symbol cannot write {path}: {error}"))?;
+    std::fs::write(&path, &planned.contents).map_err(|error| {
+        Error::with_source(
+            format!("hugr_replace_symbol cannot write {path}: {error}"),
+            error,
+        )
+    })?;
     indexer::index_project(5000).await?;
 
     let summary = &planned.summary;
@@ -307,7 +314,7 @@ async fn tool_replace_symbol(arguments: &Value) -> Result<Value, String> {
     Ok(tool_result(summary.render_markdown(), structured))
 }
 
-async fn tool_rename_symbol(arguments: &Value) -> Result<Value, String> {
+async fn tool_rename_symbol(arguments: &Value) -> Result<Value> {
     let path = required_string(arguments, "path")?;
     let name = required_string(arguments, "name")?;
     let new_name = required_string(arguments, "new_name")?;
@@ -315,16 +322,18 @@ async fn tool_rename_symbol(arguments: &Value) -> Result<Value, String> {
 
     let store = Store::open_current();
     if !store.supports_local_source_edits()? {
-        return Err(
-            "hugr_rename_symbol edits the local working tree and is not available in remote Hugr API mode"
-                .to_string(),
-        );
+        return Err(Error::msg("hugr_rename_symbol edits the local working tree and is not available in remote Hugr API mode"
+                .to_string()));
     }
 
     indexer::index_project(5000).await?;
 
-    let contents = std::fs::read_to_string(&path)
-        .map_err(|error| format!("hugr_rename_symbol cannot read {path}: {error}"))?;
+    let contents = std::fs::read_to_string(&path).map_err(|error| {
+        Error::with_source(
+            format!("hugr_rename_symbol cannot read {path}: {error}"),
+            error,
+        )
+    })?;
     let target =
         edit::resolve_symbol_in_source(&path, &contents, &name, kind.as_deref(), "rename")?;
     let references = store
@@ -341,15 +350,23 @@ async fn tool_rename_symbol(arguments: &Value) -> Result<Value, String> {
 
     let mut files = Vec::new();
     for path in paths {
-        let contents = std::fs::read_to_string(&path)
-            .map_err(|error| format!("hugr_rename_symbol cannot read {path}: {error}"))?;
+        let contents = std::fs::read_to_string(&path).map_err(|error| {
+            Error::with_source(
+                format!("hugr_rename_symbol cannot read {path}: {error}"),
+                error,
+            )
+        })?;
         files.push((path, contents));
     }
 
     let planned = edit::plan_rename(&target, &references, files, &new_name)?;
     for file in &planned.files {
-        std::fs::write(&file.path, &file.contents)
-            .map_err(|error| format!("hugr_rename_symbol cannot write {}: {error}", file.path))?;
+        std::fs::write(&file.path, &file.contents).map_err(|error| {
+            Error::with_source(
+                format!("hugr_rename_symbol cannot write {}: {error}", file.path),
+                error,
+            )
+        })?;
     }
 
     indexer::index_project(5000).await?;
@@ -379,7 +396,7 @@ async fn tool_rename_symbol(arguments: &Value) -> Result<Value, String> {
     Ok(tool_result(summary.render_markdown(), structured))
 }
 
-async fn tool_move_symbol(arguments: &Value) -> Result<Value, String> {
+async fn tool_move_symbol(arguments: &Value) -> Result<Value> {
     let source_path = required_string(arguments, "source_path")?;
     let name = required_string(arguments, "name")?;
     let destination_path = required_string(arguments, "destination_path")?;
@@ -388,16 +405,18 @@ async fn tool_move_symbol(arguments: &Value) -> Result<Value, String> {
 
     let store = Store::open_current();
     if !store.supports_local_source_edits()? {
-        return Err(
-            "hugr_move_symbol edits the local working tree and is not available in remote Hugr API mode"
-                .to_string(),
-        );
+        return Err(Error::msg("hugr_move_symbol edits the local working tree and is not available in remote Hugr API mode"
+                .to_string()));
     }
 
     indexer::index_project(5000).await?;
 
-    let source_contents = std::fs::read_to_string(&source_path)
-        .map_err(|error| format!("hugr_move_symbol cannot read {source_path}: {error}"))?;
+    let source_contents = std::fs::read_to_string(&source_path).map_err(|error| {
+        Error::with_source(
+            format!("hugr_move_symbol cannot read {source_path}: {error}"),
+            error,
+        )
+    })?;
     let destination_contents = read_optional_destination(&destination_path, "hugr_move_symbol")?;
     let target = edit::resolve_symbol_in_source(
         &source_path,
@@ -430,8 +449,12 @@ async fn tool_move_symbol(arguments: &Value) -> Result<Value, String> {
     )?;
 
     for file in &planned.files {
-        std::fs::write(&file.path, &file.contents)
-            .map_err(|error| format!("hugr_move_symbol cannot write {}: {error}", file.path))?;
+        std::fs::write(&file.path, &file.contents).map_err(|error| {
+            Error::with_source(
+                format!("hugr_move_symbol cannot write {}: {error}", file.path),
+                error,
+            )
+        })?;
     }
 
     indexer::index_project(5000).await?;
@@ -454,11 +477,11 @@ async fn tool_move_symbol(arguments: &Value) -> Result<Value, String> {
     Ok(tool_result(summary.render_markdown(), structured))
 }
 
-fn read_optional_destination(path: &str, command: &str) -> Result<String, String> {
+fn read_optional_destination(path: &str, command: &str) -> Result<String> {
     match std::fs::read_to_string(path) {
         Ok(contents) => Ok(contents),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(format!("{command} cannot read {path}: {error}")),
+        Err(error) => Err(Error::msg(format!("{command} cannot read {path}: {error}"))),
     }
 }
 
@@ -467,7 +490,7 @@ fn read_reference_files(
     source_path: &str,
     destination_path: &str,
     command: &str,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(String, String)>> {
     let mut paths = references
         .iter()
         .map(|reference| reference.path.clone())
@@ -482,7 +505,9 @@ fn read_reference_files(
         .map(|path| {
             std::fs::read_to_string(&path)
                 .map(|contents| (path.clone(), contents))
-                .map_err(|error| format!("{command} cannot read {path}: {error}"))
+                .map_err(|error| {
+                    Error::with_source(format!("{command} cannot read {path}: {error}"), error)
+                })
         })
         .collect()
 }
@@ -691,17 +716,17 @@ fn tool_schema(name: &str, description: &str, properties: &[(&str, &str)]) -> Va
     })
 }
 
-fn required_string(arguments: &Value, key: &str) -> Result<String, String> {
+fn required_string(arguments: &Value, key: &str) -> Result<String> {
     arguments
         .get(key)
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| format!("missing required string argument '{key}'"))
+        .ok_or_else(|| Error::msg(format!("missing required string argument '{key}'")))
 }
 
-fn optional_limit(arguments: &Value, default: usize) -> Result<usize, String> {
+fn optional_limit(arguments: &Value, default: usize) -> Result<usize> {
     optional_bounded_usize(arguments, "limit", default, 50)
 }
 
@@ -710,19 +735,19 @@ fn optional_bounded_usize(
     key: &str,
     default: usize,
     maximum: usize,
-) -> Result<usize, String> {
+) -> Result<usize> {
     let Some(value) = arguments.get(key) else {
         return Ok(default);
     };
     let Some(limit) = value.as_u64() else {
-        return Err(format!("{key} must be an integer"));
+        return Err(Error::msg(format!("{key} must be an integer")));
     };
     usize::try_from(limit)
         .map(|limit| limit.clamp(1, maximum))
-        .map_err(|error| error.to_string())
+        .map_err(Error::from)
 }
 
-fn optional_memory_write_options(arguments: &Value) -> Result<MemoryWriteOptions, String> {
+fn optional_memory_write_options(arguments: &Value) -> Result<MemoryWriteOptions> {
     Ok(MemoryWriteOptions {
         source: optional_memory_source(arguments)?,
         confidence: optional_f64(arguments, "confidence")?,
@@ -732,28 +757,28 @@ fn optional_memory_write_options(arguments: &Value) -> Result<MemoryWriteOptions
     })
 }
 
-fn optional_memory_source(arguments: &Value) -> Result<Option<MemorySource>, String> {
+fn optional_memory_source(arguments: &Value) -> Result<Option<MemorySource>> {
     match arguments.get("source") {
         Some(source) if source.is_object() => Ok(Some(MemorySource {
             kind: required_string(source, "kind")?,
             locator: required_string(source, "locator")?,
         })),
-        Some(_) => Err("source must be an object".to_string()),
+        Some(_) => Err(Error::msg("source must be an object".to_string())),
         None => Ok(None),
     }
 }
 
-fn optional_f64(arguments: &Value, key: &str) -> Result<Option<f64>, String> {
+fn optional_f64(arguments: &Value, key: &str) -> Result<Option<f64>> {
     let Some(value) = arguments.get(key) else {
         return Ok(None);
     };
     value
         .as_f64()
         .map(Some)
-        .ok_or_else(|| format!("{key} must be a number"))
+        .ok_or_else(|| Error::msg(format!("{key} must be a number")))
 }
 
-fn optional_string(arguments: &Value, key: &str) -> Result<Option<String>, String> {
+fn optional_string(arguments: &Value, key: &str) -> Result<Option<String>> {
     let Some(value) = arguments.get(key) else {
         return Ok(None);
     };
@@ -763,16 +788,16 @@ fn optional_string(arguments: &Value, key: &str) -> Result<Option<String>, Strin
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .map(Some)
-        .ok_or_else(|| format!("{key} must be a non-empty string"))
+        .ok_or_else(|| Error::msg(format!("{key} must be a non-empty string")))
 }
 
-fn optional_bool(arguments: &Value, key: &str) -> Result<bool, String> {
+fn optional_bool(arguments: &Value, key: &str) -> Result<bool> {
     let Some(value) = arguments.get(key) else {
         return Ok(false);
     };
     value
         .as_bool()
-        .ok_or_else(|| format!("{key} must be a boolean"))
+        .ok_or_else(|| Error::msg(format!("{key} must be a boolean")))
 }
 
 fn tool_result(text: String, structured: Value) -> Value {

@@ -13,6 +13,7 @@
 use crate::cli::OutputFormat;
 use crate::commands;
 use crate::context;
+use crate::error::{Error, Result};
 use crate::store::Store;
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
@@ -96,10 +97,10 @@ impl EvalReport {
     }
 }
 
-pub(crate) async fn run(options: EvalOptions) -> Result<(), String> {
+pub(crate) async fn run(options: EvalOptions) -> Result<()> {
     let store = Store::open_current();
     if store.is_remote_only()? {
-        return Err("hugr eval requires local storage".to_string());
+        return Err(Error::msg("hugr eval requires local storage".to_string()));
     }
     ensure_git_repository()?;
 
@@ -147,31 +148,34 @@ pub(crate) async fn run(options: EvalOptions) -> Result<(), String> {
 
     if let Some(min_hit_rate) = options.min_hit_rate {
         if report.scores.is_empty() {
-            return Err("no commits were evaluated; cannot enforce --min-hit-rate".to_string());
+            return Err(Error::msg(
+                "no commits were evaluated; cannot enforce --min-hit-rate".to_string(),
+            ));
         }
         let hit_rate = report.hit_rate();
         if hit_rate < min_hit_rate {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "hit rate {hit_rate:.3} is below --min-hit-rate {min_hit_rate:.3}"
-            ));
+            )));
         }
     }
 
     Ok(())
 }
 
-fn ensure_git_repository() -> Result<(), String> {
+fn ensure_git_repository() -> Result<()> {
     let output = ProcessCommand::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
-        .map_err(|error| error.to_string())?;
+        .output()?;
     if !output.status.success() {
-        return Err("hugr eval requires a git repository".to_string());
+        return Err(Error::msg(
+            "hugr eval requires a git repository".to_string(),
+        ));
     }
     Ok(())
 }
 
-fn collect_commit_cases(limit: usize) -> Result<Vec<CommitCase>, String> {
+fn collect_commit_cases(limit: usize) -> Result<Vec<CommitCase>> {
     let output = ProcessCommand::new("git")
         .args([
             "log",
@@ -181,13 +185,12 @@ fn collect_commit_cases(limit: usize) -> Result<Vec<CommitCase>, String> {
             "--pretty=format:%H\u{1f}%s",
             "--name-only",
         ])
-        .output()
-        .map_err(|error| error.to_string())?;
+        .output()?;
     if !output.status.success() {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "git log failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        )));
     }
     Ok(parse_git_log(&String::from_utf8_lossy(&output.stdout)))
 }
@@ -439,24 +442,30 @@ mod tests {
         let exists = |_: &str| true;
 
         assert_eq!(
-            prepare_case(&commit("fix: typo", &["src/a.rs"]), 8, &exists),
-            Err("short_subject")
+            prepare_case(&commit("fix: typo", &["src/a.rs"]), 8, &exists)
+                .unwrap_err()
+                .to_string(),
+            "short_subject"
         );
         assert_eq!(
             prepare_case(
                 &commit("docs(plan): update the roadmap", &["docs/DEV_PLAN.md"]),
                 8,
                 &exists
-            ),
-            Err("no_source_files")
+            )
+            .unwrap_err()
+            .to_string(),
+            "no_source_files"
         );
         assert_eq!(
             prepare_case(
                 &commit("feat(core): huge refactor", &["src/a.rs", "src/b.rs"]),
                 1,
                 &exists
-            ),
-            Err("too_many_files")
+            )
+            .unwrap_err()
+            .to_string(),
+            "too_many_files"
         );
     }
 

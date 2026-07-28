@@ -4,6 +4,7 @@ use crate::context::{ContextPack, json_string};
 use crate::daemon;
 use crate::discovery;
 use crate::edit;
+use crate::error::{Error, Result};
 use crate::eval;
 use crate::impact as impact_analysis;
 use crate::indexer;
@@ -23,7 +24,7 @@ use std::io::{self, Write as IoWrite};
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 
-pub(crate) async fn execute(command: Command) -> Result<(), String> {
+pub(crate) async fn execute(command: Command) -> Result<()> {
     match command {
         Command::Init => init().await,
         Command::Status => status().await,
@@ -130,14 +131,14 @@ pub(crate) async fn execute(command: Command) -> Result<(), String> {
     }
 }
 
-async fn init() -> Result<(), String> {
+async fn init() -> Result<()> {
     let store = Store::open_current();
     store.init().await?;
     println!("initialized Hugr at {}", store.root().display());
     Ok(())
 }
 
-async fn status() -> Result<(), String> {
+async fn status() -> Result<()> {
     let store = Store::open_current();
     let memories = store.memories().await?;
     let project = if store.exists() {
@@ -161,7 +162,7 @@ async fn status() -> Result<(), String> {
     Ok(())
 }
 
-async fn remember(text: &str, options: &MemoryWriteArgs, global: bool) -> Result<(), String> {
+async fn remember(text: &str, options: &MemoryWriteArgs, global: bool) -> Result<()> {
     let store = store_for_scope(global)?;
     let write_options = memory_write_options_from_args(options)?;
     let memory = if write_options == MemoryWriteOptions::default() && !global {
@@ -177,7 +178,7 @@ async fn remember(text: &str, options: &MemoryWriteArgs, global: bool) -> Result
     Ok(())
 }
 
-fn store_for_scope(global: bool) -> Result<Store, String> {
+fn store_for_scope(global: bool) -> Result<Store> {
     if global {
         Store::open_global()
     } else {
@@ -185,7 +186,7 @@ fn store_for_scope(global: bool) -> Result<Store, String> {
     }
 }
 
-fn memory_write_options_from_args(args: &MemoryWriteArgs) -> Result<MemoryWriteOptions, String> {
+fn memory_write_options_from_args(args: &MemoryWriteArgs) -> Result<MemoryWriteOptions> {
     Ok(MemoryWriteOptions {
         source: args.source.as_ref().map(|source| MemorySource {
             kind: source.kind.clone(),
@@ -202,21 +203,25 @@ fn memory_write_options_from_args(args: &MemoryWriteArgs) -> Result<MemoryWriteO
     })
 }
 
-fn parse_min_hit_rate(value: &str) -> Result<f64, String> {
+fn parse_min_hit_rate(value: &str) -> Result<f64> {
     value
         .parse::<f64>()
         .ok()
         .filter(|parsed| (0.0..=1.0).contains(parsed))
-        .ok_or_else(|| format!("--min-hit-rate must be a number between 0 and 1, got '{value}'"))
+        .ok_or_else(|| {
+            Error::msg(format!(
+                "--min-hit-rate must be a number between 0 and 1, got '{value}'"
+            ))
+        })
 }
 
-fn parse_memory_confidence(value: &str) -> Result<f64, String> {
+fn parse_memory_confidence(value: &str) -> Result<f64> {
     value
         .parse::<f64>()
-        .map_err(|_| "memory confidence must be a number".to_string())
+        .map_err(|_| Error::msg("memory confidence must be a number".to_string()))
 }
 
-async fn recall(query: &str, format: OutputFormat, global: bool) -> Result<(), String> {
+async fn recall(query: &str, format: OutputFormat, global: bool) -> Result<()> {
     let matches = store_for_scope(global)?.recall(query, 10).await?;
 
     if format == OutputFormat::Json {
@@ -236,7 +241,7 @@ async fn recall(query: &str, format: OutputFormat, global: bool) -> Result<(), S
     Ok(())
 }
 
-async fn context(task: &str, format: OutputFormat, budget: Option<usize>) -> Result<(), String> {
+async fn context(task: &str, format: OutputFormat, budget: Option<usize>) -> Result<()> {
     let pack = compile_context_pack_with_file_candidates(task, budget)
         .await?
         .0;
@@ -259,7 +264,7 @@ const MIN_CONTEXT_TOKEN_BUDGET: usize = 500;
 pub(crate) fn resolve_context_token_budget(
     explicit: Option<usize>,
     env_lookup: impl Fn(&str) -> Option<String>,
-) -> Result<usize, String> {
+) -> Result<usize> {
     let budget = match explicit {
         Some(value) => value,
         None => match env_lookup("HUGR_CONTEXT_TOKEN_BUDGET") {
@@ -270,9 +275,9 @@ pub(crate) fn resolve_context_token_budget(
         },
     };
     if budget < MIN_CONTEXT_TOKEN_BUDGET {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "context token budget must be at least {MIN_CONTEXT_TOKEN_BUDGET}, got {budget}"
-        ));
+        )));
     }
     Ok(budget)
 }
@@ -283,7 +288,7 @@ pub(crate) fn resolve_context_token_budget(
 pub(crate) async fn compile_context_pack_with_file_candidates(
     task: &str,
     budget: Option<usize>,
-) -> Result<(ContextPack, Vec<String>), String> {
+) -> Result<(ContextPack, Vec<String>)> {
     let token_budget = resolve_context_token_budget(budget, |name| std::env::var(name).ok())?;
     let store = Store::open_current();
     let mut memories = store.recall(task, 5).await?;
@@ -357,7 +362,7 @@ pub(crate) async fn compile_context_pack_with_file_candidates(
     Ok((pack, files))
 }
 
-async fn index(paths: &[String]) -> Result<(), String> {
+async fn index(paths: &[String]) -> Result<()> {
     if !paths.is_empty() {
         return index_incremental(paths).await;
     }
@@ -387,7 +392,7 @@ async fn index(paths: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-async fn index_incremental(paths: &[String]) -> Result<(), String> {
+async fn index_incremental(paths: &[String]) -> Result<()> {
     let summary = indexer::refresh_paths(5000, paths).await?;
 
     println!("reparsed {} files", summary.reparsed_files);
@@ -402,7 +407,7 @@ async fn index_incremental(paths: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-async fn symbols(query: &str, format: OutputFormat) -> Result<(), String> {
+async fn symbols(query: &str, format: OutputFormat) -> Result<()> {
     indexer::index_project(5000).await?;
     let store = Store::open_current();
     let symbols = store.symbols_for_target(query, 25).await?;
@@ -416,7 +421,7 @@ async fn symbols(query: &str, format: OutputFormat) -> Result<(), String> {
     Ok(())
 }
 
-async fn impact(target: &str, format: OutputFormat) -> Result<(), String> {
+async fn impact(target: &str, format: OutputFormat) -> Result<()> {
     indexer::index_project(5000).await?;
     let store = Store::open_current();
     let report = impact_analysis::analyze(&store, target, 50).await?;
@@ -436,21 +441,27 @@ async fn replace_symbol(
     kind: Option<&str>,
     body: &str,
     format: OutputFormat,
-) -> Result<(), String> {
+) -> Result<()> {
     let store = Store::open_current();
     if !store.supports_local_source_edits()? {
-        return Err(
-            "hugr replace-symbol edits the local working tree and is not available in remote Hugr API mode"
-                .to_string(),
-        );
+        return Err(Error::msg("hugr replace-symbol edits the local working tree and is not available in remote Hugr API mode"
+                .to_string()));
     }
 
-    let contents = std::fs::read_to_string(path)
-        .map_err(|error| format!("hugr replace-symbol cannot read {path}: {error}"))?;
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        Error::with_source(
+            format!("hugr replace-symbol cannot read {path}: {error}"),
+            error,
+        )
+    })?;
     let planned = edit::plan_replacement(path, &contents, name, kind, body)?;
 
-    std::fs::write(path, &planned.contents)
-        .map_err(|error| format!("hugr replace-symbol cannot write {path}: {error}"))?;
+    std::fs::write(path, &planned.contents).map_err(|error| {
+        Error::with_source(
+            format!("hugr replace-symbol cannot write {path}: {error}"),
+            error,
+        )
+    })?;
 
     // Refresh the index so symbols, impact, and context reflect the edit immediately.
     indexer::index_project(5000).await?;
@@ -486,19 +497,21 @@ async fn rename_symbol(
     new_name: &str,
     kind: Option<&str>,
     format: OutputFormat,
-) -> Result<(), String> {
+) -> Result<()> {
     let store = Store::open_current();
     if !store.supports_local_source_edits()? {
-        return Err(
-            "hugr rename-symbol edits the local working tree and is not available in remote Hugr API mode"
-                .to_string(),
-        );
+        return Err(Error::msg("hugr rename-symbol edits the local working tree and is not available in remote Hugr API mode"
+                .to_string()));
     }
 
     indexer::index_project(5000).await?;
 
-    let contents = std::fs::read_to_string(path)
-        .map_err(|error| format!("hugr rename-symbol cannot read {path}: {error}"))?;
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        Error::with_source(
+            format!("hugr rename-symbol cannot read {path}: {error}"),
+            error,
+        )
+    })?;
     let target = edit::resolve_symbol_in_source(path, &contents, name, kind, "rename")?;
     let references = store
         .references_to_symbols(std::slice::from_ref(&target), 2000)
@@ -514,15 +527,23 @@ async fn rename_symbol(
 
     let mut files = Vec::new();
     for path in paths {
-        let contents = std::fs::read_to_string(&path)
-            .map_err(|error| format!("hugr rename-symbol cannot read {path}: {error}"))?;
+        let contents = std::fs::read_to_string(&path).map_err(|error| {
+            Error::with_source(
+                format!("hugr rename-symbol cannot read {path}: {error}"),
+                error,
+            )
+        })?;
         files.push((path, contents));
     }
 
     let planned = edit::plan_rename(&target, &references, files, new_name)?;
     for file in &planned.files {
-        std::fs::write(&file.path, &file.contents)
-            .map_err(|error| format!("hugr rename-symbol cannot write {}: {error}", file.path))?;
+        std::fs::write(&file.path, &file.contents).map_err(|error| {
+            Error::with_source(
+                format!("hugr rename-symbol cannot write {}: {error}", file.path),
+                error,
+            )
+        })?;
     }
 
     indexer::index_project(5000).await?;
@@ -564,19 +585,21 @@ async fn move_symbol(
     kind: Option<&str>,
     rewrite_references: bool,
     format: OutputFormat,
-) -> Result<(), String> {
+) -> Result<()> {
     let store = Store::open_current();
     if !store.supports_local_source_edits()? {
-        return Err(
-            "hugr move-symbol edits the local working tree and is not available in remote Hugr API mode"
-                .to_string(),
-        );
+        return Err(Error::msg("hugr move-symbol edits the local working tree and is not available in remote Hugr API mode"
+                .to_string()));
     }
 
     indexer::index_project(5000).await?;
 
-    let source_contents = std::fs::read_to_string(source_path)
-        .map_err(|error| format!("hugr move-symbol cannot read {source_path}: {error}"))?;
+    let source_contents = std::fs::read_to_string(source_path).map_err(|error| {
+        Error::with_source(
+            format!("hugr move-symbol cannot read {source_path}: {error}"),
+            error,
+        )
+    })?;
     let destination_contents = read_optional_destination(destination_path, "hugr move-symbol")?;
     let target = edit::resolve_symbol_in_source(source_path, &source_contents, name, kind, "move")?;
     let references = store
@@ -603,8 +626,12 @@ async fn move_symbol(
     )?;
 
     for file in &planned.files {
-        std::fs::write(&file.path, &file.contents)
-            .map_err(|error| format!("hugr move-symbol cannot write {}: {error}", file.path))?;
+        std::fs::write(&file.path, &file.contents).map_err(|error| {
+            Error::with_source(
+                format!("hugr move-symbol cannot write {}: {error}", file.path),
+                error,
+            )
+        })?;
     }
 
     indexer::index_project(5000).await?;
@@ -632,11 +659,11 @@ async fn move_symbol(
     Ok(())
 }
 
-fn read_optional_destination(path: &str, command: &str) -> Result<String, String> {
+fn read_optional_destination(path: &str, command: &str) -> Result<String> {
     match std::fs::read_to_string(path) {
         Ok(contents) => Ok(contents),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(format!("{command} cannot read {path}: {error}")),
+        Err(error) => Err(Error::msg(format!("{command} cannot read {path}: {error}"))),
     }
 }
 
@@ -645,7 +672,7 @@ fn read_reference_files(
     source_path: &str,
     destination_path: &str,
     command: &str,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(String, String)>> {
     let mut paths = references
         .iter()
         .map(|reference| reference.path.clone())
@@ -660,12 +687,14 @@ fn read_reference_files(
         .map(|path| {
             std::fs::read_to_string(&path)
                 .map(|contents| (path.clone(), contents))
-                .map_err(|error| format!("{command} cannot read {path}: {error}"))
+                .map_err(|error| {
+                    Error::with_source(format!("{command} cannot read {path}: {error}"), error)
+                })
         })
         .collect()
 }
 
-async fn project_status() -> Result<(), String> {
+async fn project_status() -> Result<()> {
     let store = Store::open_current();
     let project = store.sync_current_project().await?;
 
@@ -687,7 +716,7 @@ async fn project_status() -> Result<(), String> {
     Ok(())
 }
 
-async fn session_start(task: &str) -> Result<(), String> {
+async fn session_start(task: &str) -> Result<()> {
     let session = Store::open_current().start_session(task).await?;
 
     println!("started session {}", session.id);
@@ -699,7 +728,7 @@ async fn session_start(task: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn session_event(kind: &str, detail: &str) -> Result<(), String> {
+async fn session_event(kind: &str, detail: &str) -> Result<()> {
     let event = Store::open_current()
         .record_session_event(kind, detail)
         .await?;
@@ -711,7 +740,7 @@ async fn session_event(kind: &str, detail: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn session_end(summary: Option<&str>) -> Result<(), String> {
+async fn session_end(summary: Option<&str>) -> Result<()> {
     let session = Store::open_current().end_session(summary).await?;
 
     println!("ended session {}", session.id);
@@ -721,11 +750,11 @@ async fn session_end(summary: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-async fn session_promote(format: OutputFormat, llm: bool) -> Result<(), String> {
+async fn session_promote(format: OutputFormat, llm: bool) -> Result<()> {
     let store = Store::open_current();
     let result = if llm {
         let synthesizer = llm::ChatSynthesizer::from_env()?;
-        let synthesize = |task: &str, facts: &[SessionFact]| -> Result<SessionSynthesis, String> {
+        let synthesize = |task: &str, facts: &[SessionFact]| -> Result<SessionSynthesis> {
             let lines = facts
                 .iter()
                 .map(|fact| format!("{}: {}", fact.kind, fact.detail))
@@ -753,22 +782,23 @@ async fn session_promote(format: OutputFormat, llm: bool) -> Result<(), String> 
     Ok(())
 }
 
-async fn run_observed_command(command: &[String]) -> Result<(), String> {
+async fn run_observed_command(command: &[String]) -> Result<()> {
     let Some(program) = command.first() else {
-        return Err("hugr run requires a command".to_string());
+        return Err(Error::msg("hugr run requires a command".to_string()));
     };
 
     let output = ProcessCommand::new(program)
         .args(command.iter().skip(1))
         .output()
-        .map_err(|error| format!("failed to run '{}': {error}", command.join(" ")))?;
+        .map_err(|error| {
+            Error::with_source(
+                format!("failed to run '{}': {error}", command.join(" ")),
+                error,
+            )
+        })?;
 
-    io::stdout()
-        .write_all(&output.stdout)
-        .map_err(|error| error.to_string())?;
-    io::stderr()
-        .write_all(&output.stderr)
-        .map_err(|error| error.to_string())?;
+    io::stdout().write_all(&output.stdout)?;
+    io::stderr().write_all(&output.stderr)?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -785,19 +815,21 @@ async fn run_observed_command(command: &[String]) -> Result<(), String> {
     if output.status.success() {
         Ok(())
     } else {
-        Err(format!(
+        Err(Error::msg(format!(
             "observed command exited with status {}",
             output
                 .status
                 .code()
                 .map_or_else(|| "signal".to_string(), |code| code.to_string())
-        ))
+        )))
     }
 }
 
-async fn observe_shell_command(status: i32, command: &[String]) -> Result<(), String> {
+async fn observe_shell_command(status: i32, command: &[String]) -> Result<()> {
     if command.is_empty() {
-        return Err("hugr observe command requires a command".to_string());
+        return Err(Error::msg(
+            "hugr observe command requires a command".to_string(),
+        ));
     }
 
     let detail = command_observation_detail(command, Some(status), "", "");
@@ -807,16 +839,18 @@ async fn observe_shell_command(status: i32, command: &[String]) -> Result<(), St
     Ok(())
 }
 
-fn shell_hook(shell: &str) -> Result<(), String> {
+fn shell_hook(shell: &str) -> Result<()> {
     print!("{}", shell_hook_text(shell)?);
     Ok(())
 }
 
-fn shell_hook_text(shell: &str) -> Result<&'static str, String> {
+fn shell_hook_text(shell: &str) -> Result<&'static str> {
     match shell {
         "zsh" => Ok(ZSH_SHELL_HOOK),
         "bash" => Ok(BASH_SHELL_HOOK),
-        _ => Err("hugr shell-hook supports bash or zsh".to_string()),
+        _ => Err(Error::msg(
+            "hugr shell-hook supports bash or zsh".to_string(),
+        )),
     }
 }
 
@@ -1065,7 +1099,7 @@ fn dedupe_diagnostics(diagnostics: Vec<DiagnosticInput>) -> Vec<DiagnosticInput>
         .collect()
 }
 
-async fn sync_status(format: OutputFormat) -> Result<(), String> {
+async fn sync_status(format: OutputFormat) -> Result<()> {
     let plan = Store::open_current().sync_execution_plan()?;
 
     if format == OutputFormat::Json {
@@ -1077,7 +1111,7 @@ async fn sync_status(format: OutputFormat) -> Result<(), String> {
     Ok(())
 }
 
-async fn sync_push(dry_run: bool, format: OutputFormat) -> Result<(), String> {
+async fn sync_push(dry_run: bool, format: OutputFormat) -> Result<()> {
     let result = Store::open_current().sync_push(dry_run).await?;
 
     if format == OutputFormat::Json {
@@ -1089,7 +1123,7 @@ async fn sync_push(dry_run: bool, format: OutputFormat) -> Result<(), String> {
     Ok(())
 }
 
-async fn sync_pull(dry_run: bool, format: OutputFormat) -> Result<(), String> {
+async fn sync_pull(dry_run: bool, format: OutputFormat) -> Result<()> {
     let result = Store::open_current().sync_pull(dry_run).await?;
 
     if format == OutputFormat::Json {
@@ -1101,7 +1135,7 @@ async fn sync_pull(dry_run: bool, format: OutputFormat) -> Result<(), String> {
     Ok(())
 }
 
-async fn sync_history(format: OutputFormat) -> Result<(), String> {
+async fn sync_history(format: OutputFormat) -> Result<()> {
     let history = Store::open_current().sync_history(10).await?;
 
     if format == OutputFormat::Json {
@@ -1113,18 +1147,13 @@ async fn sync_history(format: OutputFormat) -> Result<(), String> {
     Ok(())
 }
 
-async fn improve(
-    execute: bool,
-    duplicates: bool,
-    stale: bool,
-    format: OutputFormat,
-) -> Result<(), String> {
+async fn improve(execute: bool, duplicates: bool, stale: bool, format: OutputFormat) -> Result<()> {
     if execute {
         if duplicates == stale {
-            return Err(
+            return Err(Error::msg(
                 "hugr improve --execute requires exactly one of --duplicates or --stale"
                     .to_string(),
-            );
+            ));
         }
         if duplicates {
             let result = Store::open_current()
@@ -1156,7 +1185,7 @@ async fn improve(
     Ok(())
 }
 
-async fn forget(query: &str, format: OutputFormat, global: bool) -> Result<(), String> {
+async fn forget(query: &str, format: OutputFormat, global: bool) -> Result<()> {
     let result = store_for_scope(global)?.forget(query, 25).await?;
 
     if format == OutputFormat::Json {
@@ -1168,15 +1197,10 @@ async fn forget(query: &str, format: OutputFormat, global: bool) -> Result<(), S
     Ok(())
 }
 
-async fn doctor() -> Result<(), String> {
+async fn doctor() -> Result<()> {
     let store = Store::open_current();
     println!("Hugr doctor");
-    println!(
-        "  current_dir: {}",
-        std::env::current_dir()
-            .map_err(|error| error.to_string())?
-            .display()
-    );
+    println!("  current_dir: {}", std::env::current_dir()?.display());
     println!("  store_exists: {}", store.exists());
     println!("  store_root: {}", store.root().display());
     println!("  storage: {}", store.storage_summary());
@@ -1794,17 +1818,20 @@ mod tests {
         let env_8000 = |name: &str| (name == "HUGR_CONTEXT_TOKEN_BUDGET").then(|| "8000".into());
         let env_bad = |name: &str| (name == "HUGR_CONTEXT_TOKEN_BUDGET").then(|| "lots".into());
 
-        assert_eq!(resolve_context_token_budget(Some(16000), no_env), Ok(16000));
-        assert_eq!(resolve_context_token_budget(None, env_8000), Ok(8000));
         assert_eq!(
-            resolve_context_token_budget(None, no_env),
-            Ok(crate::context::DEFAULT_CONTEXT_TOKEN_BUDGET)
+            resolve_context_token_budget(Some(16000), no_env).unwrap(),
+            16000
+        );
+        assert_eq!(resolve_context_token_budget(None, env_8000).unwrap(), 8000);
+        assert_eq!(
+            resolve_context_token_budget(None, no_env).unwrap(),
+            crate::context::DEFAULT_CONTEXT_TOKEN_BUDGET
         );
         assert!(resolve_context_token_budget(Some(100), no_env).is_err());
         assert!(resolve_context_token_budget(None, env_bad).is_err());
         assert_eq!(
-            resolve_context_token_budget(Some(16000), env_8000),
-            Ok(16000),
+            resolve_context_token_budget(Some(16000), env_8000).unwrap(),
+            16000,
             "explicit budget wins over the environment"
         );
     }

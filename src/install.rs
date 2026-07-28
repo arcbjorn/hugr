@@ -7,27 +7,28 @@
 //! malformed existing files abort the install instead of being overwritten.
 //! Re-running an install is a no-op.
 
+use crate::error::{Error, Result};
 use crate::store::Store;
 use serde_json::{Map, Value, json};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
 
-pub(crate) fn install(agent: &str, shared: bool) -> Result<(), String> {
+pub(crate) fn install(agent: &str, shared: bool) -> Result<()> {
     install_at(Path::new("."), agent, shared, &hugr_executable())
 }
 
-fn install_at(root: &Path, agent: &str, shared: bool, executable: &str) -> Result<(), String> {
+fn install_at(root: &Path, agent: &str, shared: bool, executable: &str) -> Result<()> {
     match agent {
         "claude-code" => install_claude_code(root, shared, executable),
         "cursor" => install_cursor(root, executable),
-        unknown => Err(format!(
+        unknown => Err(Error::msg(format!(
             "unsupported agent '{unknown}'; supported agents: claude-code, cursor"
-        )),
+        ))),
     }
 }
 
-fn install_claude_code(root: &Path, shared: bool, executable: &str) -> Result<(), String> {
+fn install_claude_code(root: &Path, shared: bool, executable: &str) -> Result<()> {
     let mcp_path = root.join(".mcp.json");
     let mcp_changed = merge_mcp_server(&mcp_path, executable)?;
 
@@ -45,7 +46,7 @@ fn install_claude_code(root: &Path, shared: bool, executable: &str) -> Result<()
     Ok(())
 }
 
-fn install_cursor(root: &Path, executable: &str) -> Result<(), String> {
+fn install_cursor(root: &Path, executable: &str) -> Result<()> {
     let mcp_path = root.join(".cursor").join("mcp.json");
     let changed = merge_mcp_server(&mcp_path, executable)?;
 
@@ -62,7 +63,7 @@ fn report_file(path: &Path, changed: bool) {
     }
 }
 
-fn merge_mcp_server(path: &Path, executable: &str) -> Result<bool, String> {
+fn merge_mcp_server(path: &Path, executable: &str) -> Result<bool> {
     let mut config = read_json_object(path)?;
     let servers = config
         .entry("mcpServers".to_string())
@@ -84,7 +85,7 @@ fn merge_mcp_server(path: &Path, executable: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-fn merge_claude_hooks(path: &Path, executable: &str) -> Result<bool, String> {
+fn merge_claude_hooks(path: &Path, executable: &str) -> Result<bool> {
     let mut settings = read_json_object(path)?;
     let hooks = settings
         .entry("hooks".to_string())
@@ -167,11 +168,11 @@ fn entry_contains_command(entry: &Value, command: &str) -> bool {
         })
 }
 
-fn read_json_object(path: &Path) -> Result<Map<String, Value>, String> {
+fn read_json_object(path: &Path) -> Result<Map<String, Value>> {
     if !path.exists() {
         return Ok(Map::new());
     }
-    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let text = fs::read_to_string(path)?;
     if text.trim().is_empty() {
         return Ok(Map::new());
     }
@@ -183,18 +184,17 @@ fn read_json_object(path: &Path) -> Result<Map<String, Value>, String> {
     }
 }
 
-fn write_json_object(path: &Path, map: &Map<String, Value>) -> Result<(), String> {
+fn write_json_object(path: &Path, map: &Map<String, Value>) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        fs::create_dir_all(parent)?;
     }
-    let mut rendered = serde_json::to_string_pretty(&Value::Object(map.clone()))
-        .map_err(|error| error.to_string())?;
+    let mut rendered = serde_json::to_string_pretty(&Value::Object(map.clone()))?;
     rendered.push('\n');
-    fs::write(path, rendered).map_err(|error| error.to_string())
+    fs::write(path, rendered).map_err(Error::from)
 }
 
-fn refusal(path: &Path, reason: &str) -> String {
-    format!("refusing to modify {}: {reason}", path.display())
+fn refusal(path: &Path, reason: &str) -> Error {
+    Error::msg(format!("refusing to modify {}: {reason}", path.display()))
 }
 
 fn hugr_executable() -> String {
@@ -220,7 +220,7 @@ fn shell_quoted(value: &str) -> String {
 /// Entry point for agent hooks. Hooks must never break the agent session, so
 /// every failure is reported on stderr and the process still exits 0; stdout
 /// stays silent because Claude Code parses hook stdout as JSON.
-pub(crate) async fn hook(agent: &str, event: &str) -> Result<(), String> {
+pub(crate) async fn hook(agent: &str, event: &str) -> Result<()> {
     if agent != "claude-code" {
         eprintln!("hugr hook: unsupported agent '{agent}'");
         return Ok(());
@@ -236,7 +236,7 @@ pub(crate) async fn hook(agent: &str, event: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn apply_hook_event(event: &str, payload: &Value) -> Result<(), String> {
+async fn apply_hook_event(event: &str, payload: &Value) -> Result<()> {
     match event {
         "session-start" => {
             let source = payload
@@ -263,7 +263,7 @@ async fn apply_hook_event(event: &str, payload: &Value) -> Result<(), String> {
             store.promote_latest_session().await?;
             Ok(())
         }
-        unknown => Err(format!("unsupported hook event '{unknown}'")),
+        unknown => Err(Error::msg(format!("unsupported hook event '{unknown}'"))),
     }
 }
 
@@ -399,7 +399,8 @@ mod tests {
         fs::write(temp.root.join(".mcp.json"), "{not json").unwrap();
 
         let error = install_at(&temp.root, "claude-code", false, "hugr")
-            .expect_err("malformed JSON must refuse");
+            .expect_err("malformed JSON must refuse")
+            .to_string();
 
         assert!(
             error.contains(".mcp.json"),
@@ -437,7 +438,9 @@ mod tests {
     fn rejects_unknown_agents() {
         let temp = TempRoot::new("unknown");
 
-        let error = install_at(&temp.root, "windsurf", false, "hugr").expect_err("unknown agent");
+        let error = install_at(&temp.root, "windsurf", false, "hugr")
+            .expect_err("unknown agent")
+            .to_string();
 
         assert!(error.contains("unsupported agent"));
     }

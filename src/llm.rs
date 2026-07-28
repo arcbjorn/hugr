@@ -5,6 +5,7 @@
 //! the LLM never sits between an agent and its context. Facts reach this
 //! module already secret-redacted by the storage layer.
 
+use crate::error::{Error, Result};
 use serde_json::{Value, json};
 use std::env;
 use std::io::Write as _;
@@ -29,11 +30,11 @@ pub(crate) struct ChatSynthesizer {
 }
 
 impl ChatSynthesizer {
-    pub(crate) fn from_env() -> Result<Self, String> {
+    pub(crate) fn from_env() -> Result<Self> {
         Self::from_lookup(|key| env::var(key).ok())
     }
 
-    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let provider = lookup("HUGR_LLM_PROVIDER")
             .unwrap_or_else(|| "ollama".to_string())
             .trim()
@@ -62,9 +63,9 @@ impl ChatSynthesizer {
                 model: trimmed_or(lookup("HUGR_OLLAMA_CHAT_MODEL"), DEFAULT_OLLAMA_CHAT_MODEL),
                 url: trimmed_or(lookup("HUGR_OLLAMA_CHAT_URL"), DEFAULT_OLLAMA_CHAT_URL),
             }),
-            unknown => Err(format!(
+            unknown => Err(Error::msg(format!(
                 "unknown llm provider '{unknown}'; expected openai or ollama"
-            )),
+            ))),
         }
     }
 
@@ -76,7 +77,7 @@ impl ChatSynthesizer {
         &self.model
     }
 
-    pub(crate) fn synthesize(&self, task: &str, facts: &[String]) -> Result<String, String> {
+    pub(crate) fn synthesize(&self, task: &str, facts: &[String]) -> Result<String> {
         let prompt = synthesis_prompt(task, facts);
         let body = chat_request(&self.model, &prompt);
         let response = post_json_with_curl(&self.url, &self.api_key, &body)?;
@@ -118,14 +119,14 @@ fn chat_request(model: &str, prompt: &str) -> Value {
     })
 }
 
-fn parse_chat_response(response: &str) -> Result<String, String> {
-    let value = serde_json::from_str::<Value>(response).map_err(|error| error.to_string())?;
+fn parse_chat_response(response: &str) -> Result<String> {
+    let value = serde_json::from_str::<Value>(response)?;
     if let Some(message) = value
         .get("error")
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
     {
-        return Err(format!("llm request failed: {message}"));
+        return Err(Error::msg(format!("llm request failed: {message}")));
     }
 
     let content = value
@@ -137,7 +138,9 @@ fn parse_chat_response(response: &str) -> Result<String, String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|content| !content.is_empty())
-        .ok_or_else(|| "llm response did not include choices[0].message.content".to_string())?;
+        .ok_or_else(|| {
+            Error::msg("llm response did not include choices[0].message.content".to_string())
+        })?;
 
     if content.chars().count() > MAX_SYNTHESIS_CHARS {
         let mut truncated = content
@@ -150,7 +153,7 @@ fn parse_chat_response(response: &str) -> Result<String, String> {
     Ok(content.to_string())
 }
 
-fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String, String> {
+fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String> {
     let mut args = vec![
         "-fsS".to_string(),
         "-X".to_string(),
@@ -172,30 +175,40 @@ fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String,
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("failed to execute curl for llm request: {error}"))?;
+        .map_err(|error| {
+            Error::with_source(
+                format!("failed to execute curl for llm request: {error}"),
+                error,
+            )
+        })?;
 
     {
         let stdin = child
             .stdin
             .as_mut()
-            .ok_or_else(|| "failed to open curl stdin".to_string())?;
+            .ok_or_else(|| Error::msg("failed to open curl stdin".to_string()))?;
         stdin
             .write_all(body.to_string().as_bytes())
-            .map_err(|error| format!("failed to write llm request: {error}"))?;
+            .map_err(|error| {
+                Error::with_source(format!("failed to write llm request: {error}"), error)
+            })?;
     }
 
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("failed to read llm response: {error}"))?;
+    let output = child.wait_with_output().map_err(|error| {
+        Error::with_source(format!("failed to read llm response: {error}"), error)
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if stderr.is_empty() {
-            return Err(format!("llm request failed with status {}", output.status));
+            return Err(Error::msg(format!(
+                "llm request failed with status {}",
+                output.status
+            )));
         }
-        return Err(format!("llm request failed: {stderr}"));
+        return Err(Error::msg(format!("llm request failed: {stderr}")));
     }
 
-    String::from_utf8(output.stdout).map_err(|error| error.to_string())
+    String::from_utf8(output.stdout).map_err(Error::from)
 }
 
 #[cfg(test)]
@@ -275,6 +288,7 @@ mod tests {
         assert!(
             parse_chat_response(error)
                 .unwrap_err()
+                .to_string()
                 .contains("model overloaded")
         );
 

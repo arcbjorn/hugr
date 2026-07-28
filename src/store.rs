@@ -1,6 +1,7 @@
 use crate::code::{self, CodeReference, CodeSymbol};
 use crate::discovery::FileCandidate;
 use crate::embedding::{Embedding, EmbeddingProvider, SelectedEmbeddingProvider};
+use crate::error::{Error, Result};
 use crate::migrations;
 use crate::redact;
 use crate::testmap::{self, TestCandidate};
@@ -224,7 +225,7 @@ pub(crate) struct SessionSynthesis {
 /// falls back to the deterministic digest so promotion never fails because a
 /// model was unreachable.
 pub(crate) type SessionSynthesizerFn<'a> =
-    &'a (dyn Fn(&str, &[SessionFact]) -> Result<SessionSynthesis, String> + Send + Sync);
+    &'a (dyn Fn(&str, &[SessionFact]) -> Result<SessionSynthesis> + Send + Sync);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ForgetResult {
@@ -275,8 +276,8 @@ pub(crate) struct StaleRetirementResult {
 
 pub(crate) struct Store {
     root: PathBuf,
-    embedding_provider: Result<SelectedEmbeddingProvider, String>,
-    storage_config: Result<StorageConfig, String>,
+    embedding_provider: Result<SelectedEmbeddingProvider>,
+    storage_config: Result<StorageConfig>,
     /// True for the user-level store under ~/.hugr: no project registration,
     /// always local storage, memories tagged with global scope provenance.
     global: bool,
@@ -391,7 +392,7 @@ impl Store {
     /// Opens the user-level memory store shared across projects. Global
     /// memory is deliberately device-local: it ignores remote storage modes
     /// and is never part of project sync classes.
-    pub(crate) fn open_global() -> Result<Self, String> {
+    pub(crate) fn open_global() -> Result<Self> {
         Ok(Self {
             root: global_root(|name| env::var(name).ok())?,
             embedding_provider: SelectedEmbeddingProvider::from_env(),
@@ -418,11 +419,11 @@ impl Store {
         }
     }
 
-    pub(crate) async fn init(&self) -> Result<(), String> {
+    pub(crate) async fn init(&self) -> Result<()> {
         let storage_config = self.storage_config()?;
         if !matches!(storage_config.mode, StorageMode::Remote) {
-            fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
-            fs::create_dir_all(self.root.join("sessions")).map_err(|error| error.to_string())?;
+            fs::create_dir_all(&self.root)?;
+            fs::create_dir_all(self.root.join("sessions"))?;
         }
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
@@ -433,11 +434,11 @@ impl Store {
         Ok(())
     }
 
-    async fn connect_migrated_without_project_upsert(&self) -> Result<Connection, String> {
+    async fn connect_migrated_without_project_upsert(&self) -> Result<Connection> {
         let storage_config = self.storage_config()?;
         if !matches!(storage_config.mode, StorageMode::Remote) {
-            fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
-            fs::create_dir_all(self.root.join("sessions")).map_err(|error| error.to_string())?;
+            fs::create_dir_all(&self.root)?;
+            fs::create_dir_all(self.root.join("sessions"))?;
         }
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
@@ -448,7 +449,7 @@ impl Store {
         self.db_path().exists()
     }
 
-    pub(crate) async fn remember(&self, text: &str) -> Result<Memory, String> {
+    pub(crate) async fn remember(&self, text: &str) -> Result<Memory> {
         self.remember_with_source(text, None).await
     }
 
@@ -456,7 +457,7 @@ impl Store {
         &self,
         text: &str,
         source: Option<MemorySource>,
-    ) -> Result<Memory, String> {
+    ) -> Result<Memory> {
         self.remember_with_options(
             text,
             MemoryWriteOptions {
@@ -471,7 +472,7 @@ impl Store {
         &self,
         text: &str,
         options: MemoryWriteOptions,
-    ) -> Result<Memory, String> {
+    ) -> Result<Memory> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return self.remember_via_hugr_api(&storage_config, text, options);
@@ -500,7 +501,7 @@ impl Store {
         .await
     }
 
-    pub(crate) async fn memories(&self) -> Result<Vec<Memory>, String> {
+    pub(crate) async fn memories(&self) -> Result<Vec<Memory>> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return hugr_api_active_memories(&storage_config);
@@ -515,14 +516,16 @@ impl Store {
         active_memories(&conn).await
     }
 
-    pub(crate) async fn forget(&self, query: &str, limit: usize) -> Result<ForgetResult, String> {
+    pub(crate) async fn forget(&self, query: &str, limit: usize) -> Result<ForgetResult> {
         let query = query.trim();
         if query.is_empty() {
-            return Err("hugr forget requires a query".to_string());
+            return Err(Error::msg("hugr forget requires a query".to_string()));
         }
         let terms = query_terms(query);
         if terms.is_empty() {
-            return Err("hugr forget requires at least one searchable term".to_string());
+            return Err(Error::msg(
+                "hugr forget requires at least one searchable term".to_string(),
+            ));
         }
 
         let storage_config = self.storage_config()?.clone();
@@ -565,8 +568,7 @@ impl Store {
                 ",
                 params![forgotten_at.clone(), memory.id.clone()],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         }
 
         Ok(ForgetResult {
@@ -577,9 +579,7 @@ impl Store {
         })
     }
 
-    pub(crate) async fn memory_maintenance_report(
-        &self,
-    ) -> Result<MemoryMaintenanceReport, String> {
+    pub(crate) async fn memory_maintenance_report(&self) -> Result<MemoryMaintenanceReport> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return memory_maintenance_report_via_hugr_api(&storage_config);
@@ -635,9 +635,7 @@ impl Store {
         })
     }
 
-    pub(crate) async fn consolidate_duplicate_memories(
-        &self,
-    ) -> Result<MemoryConsolidationResult, String> {
+    pub(crate) async fn consolidate_duplicate_memories(&self) -> Result<MemoryConsolidationResult> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return consolidate_duplicate_memories_via_hugr_api(&storage_config);
@@ -666,8 +664,7 @@ impl Store {
                     ",
                     params![executed_at.clone(), kept.id.clone(), memory.id.clone()],
                 )
-                .await
-                .map_err(|error| error.to_string())?;
+                .await?;
                 retired_memories.push(memory.clone());
             }
         }
@@ -680,7 +677,7 @@ impl Store {
         })
     }
 
-    pub(crate) async fn retire_stale_memories(&self) -> Result<StaleRetirementResult, String> {
+    pub(crate) async fn retire_stale_memories(&self) -> Result<StaleRetirementResult> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return retire_stale_memories_via_hugr_api(&storage_config);
@@ -717,8 +714,7 @@ impl Store {
                     candidate.older_memory.id.clone()
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
             retired_memories.push(candidate.older_memory.clone());
         }
 
@@ -730,7 +726,7 @@ impl Store {
         })
     }
 
-    pub(crate) async fn sync_current_project(&self) -> Result<Project, String> {
+    pub(crate) async fn sync_current_project(&self) -> Result<Project> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return sync_current_project_via_hugr_api(&storage_config);
@@ -739,10 +735,10 @@ impl Store {
         self.init().await?;
         self.project()
             .await?
-            .ok_or_else(|| "project registry is empty after initialization".to_string())
+            .ok_or_else(|| Error::msg("project registry is empty after initialization".to_string()))
     }
 
-    pub(crate) async fn project(&self) -> Result<Option<Project>, String> {
+    pub(crate) async fn project(&self) -> Result<Option<Project>> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return project_via_hugr_api(&storage_config);
@@ -757,10 +753,7 @@ impl Store {
         project_from_conn(&conn).await
     }
 
-    pub(crate) async fn record_discovered_files(
-        &self,
-        files: &[FileCandidate],
-    ) -> Result<(), String> {
+    pub(crate) async fn record_discovered_files(&self, files: &[FileCandidate]) -> Result<()> {
         if files.is_empty() {
             return Ok(());
         }
@@ -775,11 +768,7 @@ impl Store {
         let now = now_ms()?;
 
         for file in files {
-            let size_bytes = file
-                .size_bytes
-                .map(i64::try_from)
-                .transpose()
-                .map_err(|error| error.to_string())?;
+            let size_bytes = file.size_bytes.map(i64::try_from).transpose()?;
             conn.execute(
                 "
                 INSERT INTO discovered_files (
@@ -804,8 +793,7 @@ impl Store {
                     now
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         }
 
         Ok(())
@@ -816,7 +804,7 @@ impl Store {
         files: &[FileCandidate],
         symbols: &[CodeSymbol],
         references: &[CodeReference],
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         if files.is_empty() {
             return Ok(());
         }
@@ -848,8 +836,7 @@ impl Store {
                 ",
                 params![LOCAL_PROJECT_ID, path.clone()],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
             conn.execute(
                 "
                 DELETE FROM code_references
@@ -857,8 +844,7 @@ impl Store {
                 ",
                 params![LOCAL_PROJECT_ID, path.clone()],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         }
 
         for symbol in symbols {
@@ -880,10 +866,7 @@ impl Store {
     /// after a file is deleted or renamed. Paths are resolved against `root`;
     /// a row is pruned only when its file is genuinely missing, so files merely
     /// truncated out of a ranked discovery pass are left untouched.
-    pub(crate) async fn prune_missing_index_rows(
-        &self,
-        root: &Path,
-    ) -> Result<PruneSummary, String> {
+    pub(crate) async fn prune_missing_index_rows(&self, root: &Path) -> Result<PruneSummary> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) || !self.exists() {
             return Ok(PruneSummary::default());
@@ -918,36 +901,33 @@ impl Store {
                     "DELETE FROM discovered_files WHERE project_id = ?1 AND path = ?2",
                     params![LOCAL_PROJECT_ID, path.clone()],
                 )
-                .await
-                .map_err(|error| error.to_string())?;
+                .await?;
             summary.symbols += conn
                 .execute(
                     "DELETE FROM code_symbols WHERE project_id = ?1 AND path = ?2",
                     params![LOCAL_PROJECT_ID, path.clone()],
                 )
-                .await
-                .map_err(|error| error.to_string())?;
+                .await?;
             summary.references += conn
                 .execute(
                     "DELETE FROM code_references WHERE project_id = ?1 AND (path = ?2 OR target_path = ?2)",
                     params![LOCAL_PROJECT_ID, path.clone()],
                 )
                 .await
-                .map_err(|error| error.to_string())?;
+                ?;
             summary.test_mappings += conn
                 .execute(
                     "DELETE FROM test_mappings WHERE project_id = ?1 AND (source_path = ?2 OR test_path = ?2)",
                     params![LOCAL_PROJECT_ID, path.clone()],
                 )
                 .await
-                .map_err(|error| error.to_string())?;
+                ?;
             summary.source_embeddings += conn
                 .execute(
                     "DELETE FROM source_embeddings WHERE project_id = ?1 AND path = ?2",
                     params![LOCAL_PROJECT_ID, path.clone()],
                 )
-                .await
-                .map_err(|error| error.to_string())?;
+                .await?;
         }
 
         summary.missing_paths = missing_paths.len();
@@ -957,7 +937,7 @@ impl Store {
     /// Reads every indexed symbol back from local storage. Partial re-index uses
     /// this to keep the full target set available when only a few files are
     /// re-parsed, so cross-file references stay resolvable.
-    pub(crate) async fn stored_code_symbols(&self) -> Result<Vec<CodeSymbol>, String> {
+    pub(crate) async fn stored_code_symbols(&self) -> Result<Vec<CodeSymbol>> {
         if !self.exists() {
             return Ok(Vec::new());
         }
@@ -971,10 +951,9 @@ impl Store {
                 ",
                 params![LOCAL_PROJECT_ID],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         let mut symbols = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        while let Some(row) = rows.next().await? {
             symbols.push(code_symbol_from_row(&row)?);
         }
         Ok(symbols)
@@ -987,7 +966,7 @@ impl Store {
     pub(crate) async fn reference_sources_targeting(
         &self,
         target_paths: &[String],
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<String>> {
         if target_paths.is_empty() || !self.exists() {
             return Ok(Vec::new());
         }
@@ -1002,12 +981,11 @@ impl Store {
                 ",
                 params![LOCAL_PROJECT_ID],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         let mut sources = HashSet::new();
-        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-            let path = row.get::<String>(0).map_err(|error| error.to_string())?;
-            let target_path = row.get::<String>(1).map_err(|error| error.to_string())?;
+        while let Some(row) = rows.next().await? {
+            let path = row.get::<String>(0)?;
+            let target_path = row.get::<String>(1)?;
             if target_set.contains(&target_path) {
                 sources.insert(path);
             }
@@ -1026,7 +1004,7 @@ impl Store {
         reference_paths: &HashSet<String>,
         symbols: &[CodeSymbol],
         references: &[CodeReference],
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         self.init().await?;
         let conn = self.connect().await?;
         let now = now_ms()?;
@@ -1036,16 +1014,14 @@ impl Store {
                 "DELETE FROM code_symbols WHERE project_id = ?1 AND path = ?2",
                 params![LOCAL_PROJECT_ID, path.clone()],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         }
         for path in reference_paths {
             conn.execute(
                 "DELETE FROM code_references WHERE project_id = ?1 AND path = ?2",
                 params![LOCAL_PROJECT_ID, path.clone()],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         }
 
         for symbol in symbols {
@@ -1071,7 +1047,7 @@ impl Store {
         &self,
         target: &str,
         limit: usize,
-    ) -> Result<Vec<CodeSymbol>, String> {
+    ) -> Result<Vec<CodeSymbol>> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return symbols_for_target_via_hugr_api(&storage_config, target, limit);
@@ -1088,7 +1064,7 @@ impl Store {
 
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
-        let candidate_limit = i64::try_from(limit.max(50)).map_err(|error| error.to_string())?;
+        let candidate_limit = i64::try_from(limit.max(50))?;
         let mut rows = conn
             .query(
                 "
@@ -1106,11 +1082,10 @@ impl Store {
                     candidate_limit
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         let mut symbols = Vec::new();
 
-        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        while let Some(row) = rows.next().await? {
             symbols.push(code_symbol_from_row(&row)?);
         }
 
@@ -1126,7 +1101,7 @@ impl Store {
         &self,
         symbols: &[CodeSymbol],
         limit: usize,
-    ) -> Result<Vec<CodeReference>, String> {
+    ) -> Result<Vec<CodeReference>> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return references_to_symbols_via_hugr_api(&storage_config, symbols, limit);
@@ -1157,15 +1132,14 @@ impl Store {
                 ",
                 params![LOCAL_PROJECT_ID],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         let targets = symbols
             .iter()
             .map(|symbol| (symbol.path.as_str(), symbol.name.as_str()))
             .collect::<HashSet<_>>();
         let mut references = Vec::new();
 
-        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        while let Some(row) = rows.next().await? {
             let reference = code_reference_from_row(&row)?;
             if targets.contains(&(
                 reference.target_path.as_str(),
@@ -1183,7 +1157,7 @@ impl Store {
         &self,
         symbols: &[CodeSymbol],
         limit: usize,
-    ) -> Result<Vec<CodeReference>, String> {
+    ) -> Result<Vec<CodeReference>> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return references_from_symbols_via_hugr_api(&storage_config, symbols, limit);
@@ -1214,11 +1188,10 @@ impl Store {
                 ",
                 params![LOCAL_PROJECT_ID],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         let mut references = Vec::new();
 
-        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        while let Some(row) = rows.next().await? {
             let reference = code_reference_from_row(&row)?;
             if symbols
                 .iter()
@@ -1236,7 +1209,7 @@ impl Store {
         &self,
         path: &str,
         limit: usize,
-    ) -> Result<Vec<CodeReference>, String> {
+    ) -> Result<Vec<CodeReference>> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return references_from_path_via_hugr_api(&storage_config, path, limit);
@@ -1253,7 +1226,7 @@ impl Store {
 
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
-        let candidate_limit = i64::try_from(limit.max(50)).map_err(|error| error.to_string())?;
+        let candidate_limit = i64::try_from(limit.max(50))?;
         let mut rows = conn
             .query(
                 "
@@ -1273,11 +1246,10 @@ impl Store {
                 ",
                 params![LOCAL_PROJECT_ID, path, candidate_limit],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         let mut references = Vec::new();
 
-        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        while let Some(row) = rows.next().await? {
             references.push(code_reference_from_row(&row)?);
         }
 
@@ -1291,7 +1263,7 @@ impl Store {
         files: &[String],
         symbols: &[CodeSymbol],
         limit: usize,
-    ) -> Result<Vec<GraphNeighbor>, String> {
+    ) -> Result<Vec<GraphNeighbor>> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return context_graph_neighbors_via_hugr_api(
@@ -1365,7 +1337,7 @@ impl Store {
         files: &[String],
         symbols: &[CodeSymbol],
         limit: usize,
-    ) -> Result<Vec<FreshnessSignal>, String> {
+    ) -> Result<Vec<FreshnessSignal>> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return context_freshness_signals_via_hugr_api(&storage_config, files, symbols, limit);
@@ -1418,7 +1390,7 @@ impl Store {
     pub(crate) async fn record_diagnostics(
         &self,
         diagnostics: &[DiagnosticInput],
-    ) -> Result<Vec<Diagnostic>, String> {
+    ) -> Result<Vec<Diagnostic>> {
         if diagnostics.is_empty() {
             return Ok(Vec::new());
         }
@@ -1454,7 +1426,7 @@ impl Store {
         files: &[String],
         symbols: &[CodeSymbol],
         limit: usize,
-    ) -> Result<Vec<Diagnostic>, String> {
+    ) -> Result<Vec<Diagnostic>> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return recent_diagnostics_via_hugr_api(&storage_config, query, files, symbols, limit);
@@ -1474,7 +1446,7 @@ impl Store {
         &self,
         files: &[String],
         limit: usize,
-    ) -> Result<Vec<TestCandidate>, String> {
+    ) -> Result<Vec<TestCandidate>> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return likely_tests_for_files_via_hugr_api(&storage_config, files, limit);
@@ -1500,7 +1472,7 @@ impl Store {
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<FileCandidate>, String> {
+    ) -> Result<Vec<FileCandidate>> {
         if limit == 0 || query.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -1529,7 +1501,7 @@ impl Store {
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<CodeSymbol>, String> {
+    ) -> Result<Vec<CodeSymbol>> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return recall_symbols_via_hugr_api(&storage_config, query, limit);
@@ -1547,25 +1519,18 @@ impl Store {
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
         let (sql, args) = symbol_recall_query(&terms);
-        let mut rows = conn
-            .query(&sql, args)
-            .await
-            .map_err(|error| error.to_string())?;
+        let mut rows = conn.query(&sql, args).await?;
         let mut matches = Vec::new();
 
-        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        while let Some(row) = rows.next().await? {
             let symbol = CodeSymbol {
-                path: row.get::<String>(0).map_err(|error| error.to_string())?,
-                language: row
-                    .get::<Option<String>>(1)
-                    .map_err(|error| error.to_string())?,
-                name: row.get::<String>(2).map_err(|error| error.to_string())?,
-                kind: row.get::<String>(3).map_err(|error| error.to_string())?,
-                line_start: row.get::<i64>(4).map_err(|error| error.to_string())?,
-                line_end: row
-                    .get::<Option<i64>>(5)
-                    .map_err(|error| error.to_string())?,
-                signature: row.get::<String>(6).map_err(|error| error.to_string())?,
+                path: row.get::<String>(0)?,
+                language: row.get::<Option<String>>(1)?,
+                name: row.get::<String>(2)?,
+                kind: row.get::<String>(3)?,
+                line_start: row.get::<i64>(4)?,
+                line_end: row.get::<Option<i64>>(5)?,
+                signature: row.get::<String>(6)?,
             };
             let score = code_symbol_score(&symbol, &terms, query);
             if score > 0 {
@@ -1584,7 +1549,7 @@ impl Store {
         Ok(matches.into_iter().map(|(_, symbol)| symbol).collect())
     }
 
-    pub(crate) async fn start_session(&self, task: &str) -> Result<Session, String> {
+    pub(crate) async fn start_session(&self, task: &str) -> Result<Session> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return start_session_via_hugr_api(&storage_config, task);
@@ -1615,8 +1580,7 @@ impl Store {
                 session.started_at_ms
             ],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
         Ok(session)
     }
@@ -1625,7 +1589,7 @@ impl Store {
         &self,
         kind: &str,
         detail: &str,
-    ) -> Result<SessionEvent, String> {
+    ) -> Result<SessionEvent> {
         let detail = redact::redact_secrets(detail);
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
@@ -1642,7 +1606,7 @@ impl Store {
         &self,
         kind: &str,
         detail: &str,
-    ) -> Result<Option<SessionEvent>, String> {
+    ) -> Result<Option<SessionEvent>> {
         let detail = redact::redact_secrets(detail);
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
@@ -1662,7 +1626,7 @@ impl Store {
             .map(Some)
     }
 
-    pub(crate) async fn end_session(&self, summary: Option<&str>) -> Result<Session, String> {
+    pub(crate) async fn end_session(&self, summary: Option<&str>) -> Result<Session> {
         let summary = summary.map(redact::redact_secrets);
         let summary = summary.as_deref();
         let storage_config = self.storage_config()?.clone();
@@ -1687,22 +1651,21 @@ impl Store {
             ",
             params![ended_at_ms, summary.clone(), session_id.clone()],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
         session_by_id(&conn, &session_id)
             .await?
-            .ok_or_else(|| "ended session was not found".to_string())
+            .ok_or_else(|| Error::msg("ended session was not found".to_string()))
     }
 
-    pub(crate) async fn promote_latest_session(&self) -> Result<SessionPromotionResult, String> {
+    pub(crate) async fn promote_latest_session(&self) -> Result<SessionPromotionResult> {
         self.promote_latest_session_with_synthesis(None).await
     }
 
     pub(crate) async fn promote_latest_session_with_synthesis(
         &self,
         synthesizer: Option<SessionSynthesizerFn<'_>>,
-    ) -> Result<SessionPromotionResult, String> {
+    ) -> Result<SessionPromotionResult> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return promote_latest_session_via_hugr_api(
@@ -1713,20 +1676,20 @@ impl Store {
         }
 
         if !self.exists() {
-            return Err("no session available to promote".to_string());
+            return Err(Error::msg("no session available to promote".to_string()));
         }
 
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
         let session = latest_session(&conn)
             .await?
-            .ok_or_else(|| "no session available to promote".to_string())?;
+            .ok_or_else(|| Error::msg("no session available to promote".to_string()))?;
         self.promote_session(&conn, session, synthesizer).await
     }
 
     pub(crate) async fn promote_next_unpromoted_session(
         &self,
-    ) -> Result<Option<SessionPromotionResult>, String> {
+    ) -> Result<Option<SessionPromotionResult>> {
         if !self.exists() {
             return Ok(None);
         }
@@ -1745,10 +1708,12 @@ impl Store {
         conn: &Connection,
         session: Session,
         synthesizer: Option<SessionSynthesizerFn<'_>>,
-    ) -> Result<SessionPromotionResult, String> {
+    ) -> Result<SessionPromotionResult> {
         let facts = session_promotion_facts(conn, &session).await?;
         if facts.is_empty() {
-            return Err("latest session has no events or summary to promote".to_string());
+            return Err(Error::msg(
+                "latest session has no events or summary to promote".to_string(),
+            ));
         }
 
         if let Some(memory) = promoted_memory_for_session(conn, &session.id).await? {
@@ -1790,7 +1755,7 @@ impl Store {
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<SessionFact>, String> {
+    ) -> Result<Vec<SessionFact>> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return recent_session_facts_via_hugr_api(&storage_config, query, limit);
@@ -1827,16 +1792,15 @@ impl Store {
                 ",
                 params![LOCAL_PROJECT_ID],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         let mut facts = Vec::new();
 
-        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        while let Some(row) = rows.next().await? {
             let fact = SessionFact {
-                session_id: row.get::<String>(0).map_err(|error| error.to_string())?,
-                kind: row.get::<String>(1).map_err(|error| error.to_string())?,
-                detail: row.get::<String>(2).map_err(|error| error.to_string())?,
-                created_at_ms: row.get::<i64>(3).map_err(|error| error.to_string())?,
+                session_id: row.get::<String>(0)?,
+                kind: row.get::<String>(1)?,
+                detail: row.get::<String>(2)?,
+                created_at_ms: row.get::<i64>(3)?,
             };
             if session_fact_score(&fact, &terms) > 0 {
                 facts.push(fact);
@@ -1856,7 +1820,7 @@ impl Store {
         &self,
         task: &str,
         payload_json: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return record_context_pack_via_hugr_api(&storage_config, task, payload_json);
@@ -1868,7 +1832,7 @@ impl Store {
         insert_context_pack(&conn, task, payload_json).await
     }
 
-    pub(crate) async fn recall(&self, query: &str, limit: usize) -> Result<Vec<Memory>, String> {
+    pub(crate) async fn recall(&self, query: &str, limit: usize) -> Result<Vec<Memory>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1912,7 +1876,7 @@ impl Store {
         config: &StorageConfig,
         text: &str,
         options: MemoryWriteOptions,
-    ) -> Result<Memory, String> {
+    ) -> Result<Memory> {
         let (memory, payloads) =
             hugr_api_remember_payloads(self.embedding_provider()?, text, options)?;
         post_hugr_api_memory_payloads(config, "remember", &payloads)?;
@@ -1925,9 +1889,9 @@ impl Store {
         terms: &[String],
         query: &str,
         limit: usize,
-    ) -> Result<Vec<RankedMemory>, String> {
+    ) -> Result<Vec<RankedMemory>> {
         let search_query = fts_query(terms);
-        let candidate_limit = i64::try_from(limit.max(50)).map_err(|error| error.to_string())?;
+        let candidate_limit = i64::try_from(limit.max(50))?;
         let mut rows = conn
             .query(
                 "
@@ -1947,18 +1911,17 @@ impl Store {
                 ",
                 params![search_query, candidate_limit],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         let mut matches = Vec::new();
 
-        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        while let Some(row) = rows.next().await? {
             let memory = memory_from_row(&row)?;
             let term_score = recall_score(&memory, terms, query);
             if term_score > 0 {
                 matches.push(RankedMemory {
                     memory,
                     term_score,
-                    fts_rank: Some(row.get::<f64>(5).map_err(|error| error.to_string())?),
+                    fts_rank: Some(row.get::<f64>(5)?),
                     vector_rank: None,
                 });
             }
@@ -1972,10 +1935,10 @@ impl Store {
         conn: &Connection,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<RankedMemory>, String> {
+    ) -> Result<Vec<RankedMemory>> {
         let embedding = self.embedding_provider()?.embed(query)?;
         let query_vector = embedding.to_vector_literal();
-        let candidate_limit = i64::try_from(limit.max(50)).map_err(|error| error.to_string())?;
+        let candidate_limit = i64::try_from(limit.max(50))?;
         let mut rows = conn
             .query(
                 "
@@ -1999,16 +1962,15 @@ impl Store {
                 ",
                 params![query_vector, candidate_limit],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         let mut matches = Vec::new();
 
-        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        while let Some(row) = rows.next().await? {
             matches.push(RankedMemory {
                 memory: memory_from_row(&row)?,
                 term_score: 0,
                 fts_rank: None,
-                vector_rank: Some(row.get::<i64>(5).map_err(|error| error.to_string())?),
+                vector_rank: Some(row.get::<i64>(5)?),
             });
         }
 
@@ -2020,7 +1982,7 @@ impl Store {
         query: &str,
         terms: &[String],
         limit: usize,
-    ) -> Result<Vec<Memory>, String> {
+    ) -> Result<Vec<Memory>> {
         let mut matches = self
             .memories()
             .await?
@@ -2070,16 +2032,16 @@ impl Store {
     /// Whether structural edits against the local working tree are available. Remote-only
     /// Hugr API mode has no working tree, so source-editing commands must refuse instead
     /// of silently doing nothing.
-    pub(crate) fn supports_local_source_edits(&self) -> Result<bool, String> {
+    pub(crate) fn supports_local_source_edits(&self) -> Result<bool> {
         Ok(!uses_remote_only_hugr_api_transport(self.storage_config()?))
     }
 
-    pub(crate) fn sync_execution_plan(&self) -> Result<SyncExecutionPlan, String> {
+    pub(crate) fn sync_execution_plan(&self) -> Result<SyncExecutionPlan> {
         self.storage_config()
             .map(StorageConfig::sync_execution_plan)
     }
 
-    pub(crate) async fn sync_history(&self, limit: usize) -> Result<Vec<SyncRunHistory>, String> {
+    pub(crate) async fn sync_history(&self, limit: usize) -> Result<Vec<SyncRunHistory>> {
         let config = self.storage_config()?.clone();
         if uses_hugr_api_transport(&config) {
             return fetch_hugr_api_history(&config, limit.max(1));
@@ -2088,7 +2050,7 @@ impl Store {
         self.init().await?;
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
-        let limit = i64::try_from(limit.max(1)).map_err(|error| error.to_string())?;
+        let limit = i64::try_from(limit.max(1))?;
         let mut rows = conn
             .query(
                 "
@@ -2099,20 +2061,19 @@ impl Store {
                 ",
                 params![limit],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         let mut history = Vec::new();
 
-        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-            let id = row.get::<String>(0).map_err(|error| error.to_string())?;
+        while let Some(row) = rows.next().await? {
+            let id = row.get::<String>(0)?;
             let tables = sync_run_tables(&conn, &id).await?;
             history.push(SyncRunHistory {
                 id,
-                operation: row.get::<String>(1).map_err(|error| error.to_string())?,
-                backend: row.get::<String>(2).map_err(|error| error.to_string())?,
-                status: row.get::<String>(3).map_err(|error| error.to_string())?,
-                started_at_ms: row.get::<i64>(4).map_err(|error| error.to_string())?,
-                ended_at_ms: row.get::<i64>(5).map_err(|error| error.to_string())?,
+                operation: row.get::<String>(1)?,
+                backend: row.get::<String>(2)?,
+                status: row.get::<String>(3)?,
+                started_at_ms: row.get::<i64>(4)?,
+                ended_at_ms: row.get::<i64>(5)?,
                 tables,
             });
         }
@@ -2126,7 +2087,7 @@ impl Store {
         operation: &str,
         status: &str,
         tables: &[SyncTableResult],
-    ) -> Result<String, String> {
+    ) -> Result<String> {
         self.init().await?;
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
@@ -2139,7 +2100,7 @@ impl Store {
         &self,
         payloads: &[SyncApiTablePayload],
         dry_run: bool,
-    ) -> Result<(Option<String>, String, Vec<SyncApiTablePayload>), String> {
+    ) -> Result<(Option<String>, String, Vec<SyncApiTablePayload>)> {
         if dry_run {
             return Ok((None, "dry_run".to_string(), payloads.to_vec()));
         }
@@ -2225,7 +2186,7 @@ impl Store {
         &self,
         requested_payloads: &[SyncApiTablePayload],
         dry_run: bool,
-    ) -> Result<(Option<String>, String, Vec<SyncApiTablePayload>), String> {
+    ) -> Result<(Option<String>, String, Vec<SyncApiTablePayload>)> {
         self.init().await?;
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
@@ -2275,7 +2236,7 @@ impl Store {
         Ok((run_id, status, response_payloads))
     }
 
-    pub(crate) async fn api_memory_records(&self) -> Result<Vec<serde_json::Value>, String> {
+    pub(crate) async fn api_memory_records(&self) -> Result<Vec<serde_json::Value>> {
         self.init().await?;
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
@@ -2285,7 +2246,7 @@ impl Store {
     pub(crate) async fn apply_api_memory_storage_payloads(
         &self,
         payloads: &[SyncApiTablePayload],
-    ) -> Result<(String, Vec<SyncApiTablePayload>), String> {
+    ) -> Result<(String, Vec<SyncApiTablePayload>)> {
         self.init().await?;
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
@@ -2327,14 +2288,11 @@ impl Store {
 
     pub(crate) async fn api_storage_records(
         &self,
-    ) -> Result<
-        (
-            Vec<SyncApiTablePayload>,
-            Vec<serde_json::Value>,
-            Vec<serde_json::Value>,
-        ),
-        String,
-    > {
+    ) -> Result<(
+        Vec<SyncApiTablePayload>,
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+    )> {
         let conn = self.connect_migrated_without_project_upsert().await?;
         let table_kinds = [
             SyncTableKind::Projects,
@@ -2378,15 +2336,12 @@ impl Store {
         session_events: &[serde_json::Value],
         session_promotions: &[serde_json::Value],
         replace_code_index_paths: &[String],
-    ) -> Result<
-        (
-            String,
-            Vec<SyncApiTablePayload>,
-            SyncTableResult,
-            SyncTableResult,
-        ),
+    ) -> Result<(
         String,
-    > {
+        Vec<SyncApiTablePayload>,
+        SyncTableResult,
+        SyncTableResult,
+    )> {
         let conn = self.connect_migrated_without_project_upsert().await?;
         if !replace_code_index_paths.is_empty() {
             delete_code_index_paths(&conn, replace_code_index_paths).await?;
@@ -2467,7 +2422,7 @@ impl Store {
         ))
     }
 
-    pub(crate) async fn sync_push(&self, dry_run: bool) -> Result<SyncPushResult, String> {
+    pub(crate) async fn sync_push(&self, dry_run: bool) -> Result<SyncPushResult> {
         let config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&config) {
             return execute_hugr_api_push(&config, dry_run, &[]);
@@ -2491,16 +2446,15 @@ impl Store {
             let remote_url = config
                 .remote_url
                 .as_ref()
-                .ok_or_else(|| "remote database URL is not configured".to_string())?;
+                .ok_or_else(|| Error::msg("remote database URL is not configured".to_string()))?;
             let remote_auth_token = config
                 .remote_auth_token
                 .as_ref()
-                .ok_or_else(|| "remote auth token is not configured".to_string())?;
+                .ok_or_else(|| Error::msg("remote auth token is not configured".to_string()))?;
             let remote_db = Builder::new_remote(remote_url.clone(), remote_auth_token.clone())
                 .build()
-                .await
-                .map_err(|error| error.to_string())?;
-            let remote_conn = remote_db.connect().map_err(|error| error.to_string())?;
+                .await?;
+            let remote_conn = remote_db.connect()?;
             migrations::migrate(&remote_conn).await?;
             tables = self
                 .copy_sync_tables(&local_conn, &remote_conn, &config)
@@ -2533,7 +2487,7 @@ impl Store {
         })
     }
 
-    pub(crate) async fn sync_pull(&self, dry_run: bool) -> Result<SyncPullResult, String> {
+    pub(crate) async fn sync_pull(&self, dry_run: bool) -> Result<SyncPullResult> {
         let config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&config) {
             return execute_hugr_api_pull(&config, dry_run, &[], None).await;
@@ -2557,16 +2511,15 @@ impl Store {
             let remote_url = config
                 .remote_url
                 .as_ref()
-                .ok_or_else(|| "remote database URL is not configured".to_string())?;
+                .ok_or_else(|| Error::msg("remote database URL is not configured".to_string()))?;
             let remote_auth_token = config
                 .remote_auth_token
                 .as_ref()
-                .ok_or_else(|| "remote auth token is not configured".to_string())?;
+                .ok_or_else(|| Error::msg("remote auth token is not configured".to_string()))?;
             let remote_db = Builder::new_remote(remote_url.clone(), remote_auth_token.clone())
                 .build()
-                .await
-                .map_err(|error| error.to_string())?;
-            let remote_conn = remote_db.connect().map_err(|error| error.to_string())?;
+                .await?;
+            let remote_conn = remote_db.connect()?;
             migrations::migrate(&remote_conn).await?;
             tables = self
                 .copy_pull_tables(&remote_conn, &local_conn, &config)
@@ -2599,91 +2552,77 @@ impl Store {
         })
     }
 
-    async fn connect(&self) -> Result<Connection, String> {
+    async fn connect(&self) -> Result<Connection> {
         let storage_config = self.storage_config()?;
         if matches!(storage_config.mode, StorageMode::Remote) {
             if matches!(storage_config.backend, SyncBackend::HugrApi) {
-                return Err(
-                    "HUGR_STORAGE_MODE=remote with HUGR_SYNC_BACKEND=hugr_api requires hosted Hugr API storage operations for local database commands; use `hugr sync status --json` to inspect the sync transport"
-                        .to_string(),
-                );
+                return Err(Error::msg("HUGR_STORAGE_MODE=remote with HUGR_SYNC_BACKEND=hugr_api requires hosted Hugr API storage operations for local database commands; use `hugr sync status --json` to inspect the sync transport"
+                        .to_string()));
             }
             let remote_url = storage_config
                 .remote_url
                 .as_ref()
-                .ok_or_else(|| "remote database URL is not configured".to_string())?;
+                .ok_or_else(|| Error::msg("remote database URL is not configured".to_string()))?;
             let remote_auth_token = storage_config
                 .remote_auth_token
                 .as_ref()
-                .ok_or_else(|| "remote auth token is not configured".to_string())?;
+                .ok_or_else(|| Error::msg("remote auth token is not configured".to_string()))?;
             let db = Builder::new_remote(remote_url.clone(), remote_auth_token.clone())
                 .build()
-                .await
-                .map_err(|error| error.to_string())?;
-            let conn = db.connect().map_err(|error| error.to_string())?;
-            conn.execute_batch("PRAGMA foreign_keys = ON;")
-                .await
-                .map_err(|error| error.to_string())?;
+                .await?;
+            let conn = db.connect()?;
+            conn.execute_batch("PRAGMA foreign_keys = ON;").await?;
             return Ok(conn);
         }
 
-        let db = Builder::new_local(self.db_path())
-            .build()
-            .await
-            .map_err(|error| error.to_string())?;
-        let conn = db.connect().map_err(|error| error.to_string())?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .await
-            .map_err(|error| error.to_string())?;
+        let db = Builder::new_local(self.db_path()).build().await?;
+        let conn = db.connect()?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;").await?;
         Ok(conn)
     }
 
-    fn embedding_provider(&self) -> Result<&SelectedEmbeddingProvider, String> {
+    fn embedding_provider(&self) -> Result<&SelectedEmbeddingProvider> {
         self.embedding_provider
             .as_ref()
-            .map_err(std::clone::Clone::clone)
+            .map_err(|error| Error::msg(error.to_string()))
     }
 
-    fn storage_config(&self) -> Result<&StorageConfig, String> {
+    fn storage_config(&self) -> Result<&StorageConfig> {
         self.storage_config
             .as_ref()
-            .map_err(std::clone::Clone::clone)
+            .map_err(|error| Error::msg(error.to_string()))
     }
 
     /// True when this store routes all operations through a hosted Hugr API
     /// endpoint instead of a local database.
-    pub(crate) fn is_remote_only(&self) -> Result<bool, String> {
+    pub(crate) fn is_remote_only(&self) -> Result<bool> {
         Ok(uses_remote_only_hugr_api_transport(self.storage_config()?))
     }
 
-    fn ensure_sync_push_execution_allowed(&self, config: &StorageConfig) -> Result<(), String> {
+    fn ensure_sync_push_execution_allowed(&self, config: &StorageConfig) -> Result<()> {
         self.ensure_sync_execute_allowed(config, "push")
     }
 
-    fn ensure_sync_execute_allowed(
-        &self,
-        config: &StorageConfig,
-        operation: &str,
-    ) -> Result<(), String> {
+    fn ensure_sync_execute_allowed(&self, config: &StorageConfig, operation: &str) -> Result<()> {
         if !matches!(config.mode, StorageMode::Hybrid) {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "hugr sync {operation} --execute requires HUGR_STORAGE_MODE=hybrid"
-            ));
+            )));
         }
         if !matches!(config.backend, SyncBackend::DirectLibsql) {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "hugr sync {operation} --execute only supports direct_libsql backend"
-            ));
+            )));
         }
         if config.remote_url.is_none() {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "hugr sync {operation} --execute requires HUGR_REMOTE_DATABASE_URL"
-            ));
+            )));
         }
         if config.remote_auth_token.is_none() {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "hugr sync {operation} --execute requires HUGR_REMOTE_AUTH_TOKEN"
-            ));
+            )));
         }
         Ok(())
     }
@@ -2693,7 +2632,7 @@ impl Store {
         conn: &Connection,
         config: &StorageConfig,
         executed: bool,
-    ) -> Result<Vec<SyncTableResult>, String> {
+    ) -> Result<Vec<SyncTableResult>> {
         let mut results = Vec::new();
         for table in sync_tables_for_config(config) {
             results.push(SyncTableResult {
@@ -2709,7 +2648,7 @@ impl Store {
         conn: &Connection,
         tables: &[SyncTableResult],
         include_records: bool,
-    ) -> Result<Vec<SyncApiTablePayload>, String> {
+    ) -> Result<Vec<SyncApiTablePayload>> {
         let mut payloads = Vec::new();
 
         for table in tables {
@@ -2737,7 +2676,7 @@ impl Store {
         local_conn: &Connection,
         remote_conn: &Connection,
         config: &StorageConfig,
-    ) -> Result<Vec<SyncTableResult>, String> {
+    ) -> Result<Vec<SyncTableResult>> {
         let mut results = Vec::new();
         for table in sync_tables_for_config(config) {
             results.push(copy_sync_table(local_conn, remote_conn, table).await?);
@@ -2750,7 +2689,7 @@ impl Store {
         remote_conn: &Connection,
         local_conn: &Connection,
         config: &StorageConfig,
-    ) -> Result<Vec<SyncTableResult>, String> {
+    ) -> Result<Vec<SyncTableResult>> {
         let mut results = Vec::new();
         for table in sync_tables_for_config(config) {
             results.push(copy_pull_table(remote_conn, local_conn, table).await?);
@@ -2767,7 +2706,7 @@ impl Store {
         started_at_ms: i64,
         ended_at_ms: i64,
         tables: &[SyncTableResult],
-    ) -> Result<String, String> {
+    ) -> Result<String> {
         let id = format!("sync_{operation}_{ended_at_ms}");
         conn.execute(
             "
@@ -2783,8 +2722,7 @@ impl Store {
                 ended_at_ms
             ],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
         for table in tables {
             conn.execute(
@@ -2799,16 +2737,15 @@ impl Store {
                     id.clone(),
                     table.class.clone(),
                     table.table.clone(),
-                    i64::try_from(table.row_count).map_err(|error| error.to_string())?,
-                    i64::try_from(table.inserted_count).map_err(|error| error.to_string())?,
-                    i64::try_from(table.updated_count).map_err(|error| error.to_string())?,
-                    i64::try_from(table.skipped_count).map_err(|error| error.to_string())?,
-                    i64::try_from(table.conflict_count).map_err(|error| error.to_string())?,
+                    i64::try_from(table.row_count)?,
+                    i64::try_from(table.inserted_count)?,
+                    i64::try_from(table.updated_count)?,
+                    i64::try_from(table.skipped_count)?,
+                    i64::try_from(table.conflict_count)?,
                     i64::from(table.executed)
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
 
             for conflict in &table.conflicts {
                 conn.execute(
@@ -2820,11 +2757,10 @@ impl Store {
                         id.clone(),
                         table.table.clone(),
                         conflict.reason.clone(),
-                        i64::try_from(conflict.count).map_err(|error| error.to_string())?
+                        i64::try_from(conflict.count)?
                     ],
                 )
-                .await
-                .map_err(|error| error.to_string())?;
+                .await?;
             }
         }
 
@@ -2954,7 +2890,7 @@ fn execute_hugr_api_push(
     config: &StorageConfig,
     dry_run: bool,
     payloads: &[SyncApiTablePayload],
-) -> Result<SyncPushResult, String> {
+) -> Result<SyncPushResult> {
     let response = post_hugr_api_sync(config, "push", dry_run, payloads)?;
     let parsed = parse_hugr_api_sync_response(&response)?;
     Ok(SyncPushResult {
@@ -2971,7 +2907,7 @@ async fn execute_hugr_api_pull(
     dry_run: bool,
     payloads: &[SyncApiTablePayload],
     local_conn: Option<&Connection>,
-) -> Result<SyncPullResult, String> {
+) -> Result<SyncPullResult> {
     let response = post_hugr_api_sync(config, "pull", dry_run, payloads)?;
     let parsed = parse_hugr_api_sync_response(&response)?;
     let tables = if !dry_run {
@@ -2997,7 +2933,7 @@ fn hugr_api_remember_payloads(
     embedding_provider: &SelectedEmbeddingProvider,
     text: &str,
     options: MemoryWriteOptions,
-) -> Result<(Memory, Vec<SyncApiTablePayload>), String> {
+) -> Result<(Memory, Vec<SyncApiTablePayload>)> {
     let options = normalize_memory_write_options(options)?;
     let now = now_ms()?;
     let project = project_from_input(current_project_input()?, now);
@@ -3055,7 +2991,7 @@ fn hugr_api_session_promotion_payloads(
     facts: &[SessionFact],
     project: Option<&Project>,
     synthesis: Option<&SessionSynthesis>,
-) -> Result<(Memory, Vec<SyncApiTablePayload>, SessionPromotionSyncRecord), String> {
+) -> Result<(Memory, Vec<SyncApiTablePayload>, SessionPromotionSyncRecord)> {
     let now = now_ms()?;
     let structured_payload = Some(session_promotion_payload(
         session, facts, project, synthesis,
@@ -3126,8 +3062,8 @@ fn project_from_input(input: ProjectInput, now: i64) -> Project {
     }
 }
 
-fn embedding_dimensions_i64(embedding: &Embedding) -> Result<i64, String> {
-    i64::try_from(embedding.dimensions()).map_err(|error| error.to_string())
+fn embedding_dimensions_i64(embedding: &Embedding) -> Result<i64> {
+    i64::try_from(embedding.dimensions()).map_err(Error::from)
 }
 
 fn api_payload_for_records(
@@ -3296,7 +3232,7 @@ fn session_promotion_sync_record_value(record: &SessionPromotionSyncRecord) -> s
     })
 }
 
-fn sync_current_project_via_hugr_api(config: &StorageConfig) -> Result<Project, String> {
+fn sync_current_project_via_hugr_api(config: &StorageConfig) -> Result<Project> {
     let project = project_from_input(current_project_input()?, now_ms()?);
     post_hugr_api_storage_payloads(
         config,
@@ -3312,7 +3248,7 @@ fn sync_current_project_via_hugr_api(config: &StorageConfig) -> Result<Project, 
     Ok(project)
 }
 
-fn project_via_hugr_api(config: &StorageConfig) -> Result<Option<Project>, String> {
+fn project_via_hugr_api(config: &StorageConfig) -> Result<Option<Project>> {
     let snapshot = fetch_hugr_api_storage_snapshot(config)?;
     Ok(storage_project_records(&snapshot)?
         .into_iter()
@@ -3323,7 +3259,7 @@ fn record_context_pack_via_hugr_api(
     config: &StorageConfig,
     task: &str,
     payload_json: &str,
-) -> Result<String, String> {
+) -> Result<String> {
     let now = now_ms()?;
     let id = format!("ctx_{now}");
     let project = project_from_input(current_project_input()?, now);
@@ -3352,17 +3288,13 @@ fn record_context_pack_via_hugr_api(
 fn record_discovered_files_via_hugr_api(
     config: &StorageConfig,
     files: &[FileCandidate],
-) -> Result<(), String> {
+) -> Result<()> {
     let now = now_ms()?;
     let project = project_from_input(current_project_input()?, now);
     let records = files
         .iter()
         .map(|file| {
-            let size_bytes = file
-                .size_bytes
-                .map(i64::try_from)
-                .transpose()
-                .map_err(|error| error.to_string())?;
+            let size_bytes = file.size_bytes.map(i64::try_from).transpose()?;
             Ok(discovered_file_sync_record_value(
                 &DiscoveredFileSyncRecord {
                     project_id: LOCAL_PROJECT_ID.to_string(),
@@ -3374,7 +3306,7 @@ fn record_discovered_files_via_hugr_api(
                 },
             ))
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>>>()?;
     let payloads = vec![
         api_payload_for_records(
             SyncTableKind::Projects,
@@ -3392,7 +3324,7 @@ fn record_code_index_via_hugr_api(
     files: &[FileCandidate],
     symbols: &[CodeSymbol],
     references: &[CodeReference],
-) -> Result<(), String> {
+) -> Result<()> {
     let now = now_ms()?;
     let symbol_records = symbols
         .iter()
@@ -3462,7 +3394,7 @@ fn build_test_mapping_sync_records(
     known_files: &[String],
     inline_test_paths: &HashSet<String>,
     now: i64,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<serde_json::Value>> {
     let mut records = Vec::new();
     let mut unique_sources = source_paths.to_vec();
     unique_sources.sort();
@@ -3480,7 +3412,7 @@ fn build_test_mapping_sync_records(
                 source_path: source_path.clone(),
                 test_path: candidate.path,
                 reason: candidate.reason,
-                score: i64::try_from(candidate.score).map_err(|error| error.to_string())?,
+                score: i64::try_from(candidate.score)?,
                 updated_at_ms: now,
             }));
         }
@@ -3494,14 +3426,10 @@ fn build_source_embedding_sync_records(
     symbols: &[CodeSymbol],
     now: i64,
     embedding_provider: &SelectedEmbeddingProvider,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<serde_json::Value>> {
     let mut records = Vec::new();
     for file in files {
-        let size_bytes = file
-            .size_bytes
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|error| error.to_string())?;
+        let size_bytes = file.size_bytes.map(i64::try_from).transpose()?;
         let input = SourceEmbeddingInput {
             path: file.path.clone(),
             language: file.language.clone(),
@@ -3509,8 +3437,7 @@ fn build_source_embedding_sync_records(
         };
         let summary = source_embedding_summary(&input, symbols);
         let embedding = embedding_provider.embed(&summary)?;
-        let dimensions =
-            i64::try_from(embedding.dimensions()).map_err(|error| error.to_string())?;
+        let dimensions = i64::try_from(embedding.dimensions())?;
         let embedding_blob = embedding.to_f32_blob();
         records.push(source_embedding_sync_record_value(
             &SourceEmbeddingSyncRecord {
@@ -3531,7 +3458,7 @@ fn symbols_for_target_via_hugr_api(
     config: &StorageConfig,
     target: &str,
     limit: usize,
-) -> Result<Vec<CodeSymbol>, String> {
+) -> Result<Vec<CodeSymbol>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -3559,7 +3486,7 @@ fn references_to_symbols_via_hugr_api(
     config: &StorageConfig,
     symbols: &[CodeSymbol],
     limit: usize,
-) -> Result<Vec<CodeReference>, String> {
+) -> Result<Vec<CodeReference>> {
     if limit == 0 || symbols.is_empty() {
         return Ok(Vec::new());
     }
@@ -3589,7 +3516,7 @@ fn references_from_symbols_via_hugr_api(
     config: &StorageConfig,
     symbols: &[CodeSymbol],
     limit: usize,
-) -> Result<Vec<CodeReference>, String> {
+) -> Result<Vec<CodeReference>> {
     if limit == 0 || symbols.is_empty() {
         return Ok(Vec::new());
     }
@@ -3614,7 +3541,7 @@ fn references_from_path_via_hugr_api(
     config: &StorageConfig,
     path: &str,
     limit: usize,
-) -> Result<Vec<CodeReference>, String> {
+) -> Result<Vec<CodeReference>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -3637,7 +3564,7 @@ fn context_graph_neighbors_via_hugr_api(
     files: &[String],
     symbols: &[CodeSymbol],
     limit: usize,
-) -> Result<Vec<GraphNeighbor>, String> {
+) -> Result<Vec<GraphNeighbor>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -3698,7 +3625,7 @@ fn context_graph_neighbors_via_hugr_api(
     Ok(finalize_graph_neighbors(query, neighbors, limit))
 }
 
-async fn local_source_sync_records(conn: &Connection) -> Result<Vec<SourceSyncRecord>, String> {
+async fn local_source_sync_records(conn: &Connection) -> Result<Vec<SourceSyncRecord>> {
     let mut rows = conn
         .query(
             "
@@ -3709,23 +3636,22 @@ async fn local_source_sync_records(conn: &Connection) -> Result<Vec<SourceSyncRe
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(SourceSyncRecord {
-            id: row.get::<String>(0).map_err(|error| error.to_string())?,
-            kind: row.get::<String>(1).map_err(|error| error.to_string())?,
-            locator: row.get::<String>(2).map_err(|error| error.to_string())?,
-            created_at_ms: row.get::<i64>(3).map_err(|error| error.to_string())?,
+            id: row.get::<String>(0)?,
+            kind: row.get::<String>(1)?,
+            locator: row.get::<String>(2)?,
+            created_at_ms: row.get::<i64>(3)?,
         });
     }
 
     Ok(records)
 }
 
-async fn local_entity_sync_records(conn: &Connection) -> Result<Vec<EntitySyncRecord>, String> {
+async fn local_entity_sync_records(conn: &Connection) -> Result<Vec<EntitySyncRecord>> {
     let mut rows = conn
         .query(
             "
@@ -3736,26 +3662,23 @@ async fn local_entity_sync_records(conn: &Connection) -> Result<Vec<EntitySyncRe
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(EntitySyncRecord {
-            id: row.get::<String>(0).map_err(|error| error.to_string())?,
-            kind: row.get::<String>(1).map_err(|error| error.to_string())?,
-            name: row.get::<String>(2).map_err(|error| error.to_string())?,
-            locator: row
-                .get::<Option<String>>(3)
-                .map_err(|error| error.to_string())?,
-            created_at_ms: row.get::<i64>(4).map_err(|error| error.to_string())?,
+            id: row.get::<String>(0)?,
+            kind: row.get::<String>(1)?,
+            name: row.get::<String>(2)?,
+            locator: row.get::<Option<String>>(3)?,
+            created_at_ms: row.get::<i64>(4)?,
         });
     }
 
     Ok(records)
 }
 
-async fn local_edge_sync_records(conn: &Connection) -> Result<Vec<EdgeSyncRecord>, String> {
+async fn local_edge_sync_records(conn: &Connection) -> Result<Vec<EdgeSyncRecord>> {
     let mut rows = conn
         .query(
             "
@@ -3766,17 +3689,16 @@ async fn local_edge_sync_records(conn: &Connection) -> Result<Vec<EdgeSyncRecord
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(EdgeSyncRecord {
-            id: row.get::<String>(0).map_err(|error| error.to_string())?,
-            from_id: row.get::<String>(1).map_err(|error| error.to_string())?,
-            to_id: row.get::<String>(2).map_err(|error| error.to_string())?,
-            kind: row.get::<String>(3).map_err(|error| error.to_string())?,
-            created_at_ms: row.get::<i64>(4).map_err(|error| error.to_string())?,
+            id: row.get::<String>(0)?,
+            from_id: row.get::<String>(1)?,
+            to_id: row.get::<String>(2)?,
+            kind: row.get::<String>(3)?,
+            created_at_ms: row.get::<i64>(4)?,
         });
     }
 
@@ -4133,7 +4055,7 @@ fn context_freshness_signals_via_hugr_api(
     files: &[String],
     symbols: &[CodeSymbol],
     limit: usize,
-) -> Result<Vec<FreshnessSignal>, String> {
+) -> Result<Vec<FreshnessSignal>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -4171,7 +4093,7 @@ fn context_freshness_signals_via_hugr_api(
 async fn local_index_timestamps(
     conn: &Connection,
     paths: &[String],
-) -> Result<HashMap<String, i64>, String> {
+) -> Result<HashMap<String, i64>> {
     let path_set = paths.iter().map(String::as_str).collect::<HashSet<_>>();
     let mut timestamps = HashMap::<String, i64>::new();
 
@@ -4184,16 +4106,11 @@ async fn local_index_timestamps(
             ",
             params![LOCAL_PROJECT_ID],
         )
-        .await
-        .map_err(|error| error.to_string())?;
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        let path = row.get::<String>(0).map_err(|error| error.to_string())?;
+        .await?;
+    while let Some(row) = rows.next().await? {
+        let path = row.get::<String>(0)?;
         if path_set.contains(path.as_str()) {
-            record_latest_timestamp(
-                &mut timestamps,
-                path,
-                row.get::<i64>(1).map_err(|error| error.to_string())?,
-            );
+            record_latest_timestamp(&mut timestamps, path, row.get::<i64>(1)?);
         }
     }
 
@@ -4206,16 +4123,11 @@ async fn local_index_timestamps(
             ",
             params![LOCAL_PROJECT_ID],
         )
-        .await
-        .map_err(|error| error.to_string())?;
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        let path = row.get::<String>(0).map_err(|error| error.to_string())?;
+        .await?;
+    while let Some(row) = rows.next().await? {
+        let path = row.get::<String>(0)?;
         if path_set.contains(path.as_str()) {
-            record_latest_timestamp(
-                &mut timestamps,
-                path,
-                row.get::<i64>(1).map_err(|error| error.to_string())?,
-            );
+            record_latest_timestamp(&mut timestamps, path, row.get::<i64>(1)?);
         }
     }
 
@@ -4228,23 +4140,18 @@ async fn local_index_timestamps(
             ",
             params![LOCAL_PROJECT_ID],
         )
-        .await
-        .map_err(|error| error.to_string())?;
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        let path = row.get::<String>(0).map_err(|error| error.to_string())?;
+        .await?;
+    while let Some(row) = rows.next().await? {
+        let path = row.get::<String>(0)?;
         if path_set.contains(path.as_str()) {
-            record_latest_timestamp(
-                &mut timestamps,
-                path,
-                row.get::<i64>(1).map_err(|error| error.to_string())?,
-            );
+            record_latest_timestamp(&mut timestamps, path, row.get::<i64>(1)?);
         }
     }
 
     Ok(timestamps)
 }
 
-async fn local_latest_context_pack_updated_at_ms(conn: &Connection) -> Result<Option<i64>, String> {
+async fn local_latest_context_pack_updated_at_ms(conn: &Connection) -> Result<Option<i64>> {
     let mut rows = conn
         .query(
             "
@@ -4256,20 +4163,18 @@ async fn local_latest_context_pack_updated_at_ms(conn: &Connection) -> Result<Op
             ",
             params![LOCAL_PROJECT_ID],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
     rows.next()
-        .await
-        .map_err(|error| error.to_string())?
-        .map(|row| row.get::<i64>(0).map_err(|error| error.to_string()))
+        .await?
+        .map(|row| row.get::<i64>(0).map_err(Error::from))
         .transpose()
 }
 
 async fn local_edit_freshness_events_after(
     conn: &Connection,
     latest_context_pack_updated_at_ms: Option<i64>,
-) -> Result<Vec<EditFreshnessEvent>, String> {
+) -> Result<Vec<EditFreshnessEvent>> {
     let Some(latest_context_pack_updated_at_ms) = latest_context_pack_updated_at_ms else {
         return Ok(Vec::new());
     };
@@ -4288,14 +4193,13 @@ async fn local_edit_freshness_events_after(
             ",
             params![LOCAL_PROJECT_ID, latest_context_pack_updated_at_ms],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut events = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         events.push(EditFreshnessEvent {
-            detail: row.get::<String>(0).map_err(|error| error.to_string())?,
-            created_at_ms: row.get::<i64>(1).map_err(|error| error.to_string())?,
+            detail: row.get::<String>(0)?,
+            created_at_ms: row.get::<i64>(1)?,
         });
     }
 
@@ -4305,7 +4209,7 @@ async fn local_edit_freshness_events_after(
 fn storage_index_timestamps(
     snapshot: &HugrApiStorageSnapshot,
     paths: &[String],
-) -> Result<HashMap<String, i64>, String> {
+) -> Result<HashMap<String, i64>> {
     let path_set = paths.iter().map(String::as_str).collect::<HashSet<_>>();
     let mut timestamps = HashMap::<String, i64>::new();
 
@@ -4334,7 +4238,7 @@ fn storage_index_timestamps(
 
 fn storage_latest_context_pack_updated_at_ms(
     snapshot: &HugrApiStorageSnapshot,
-) -> Result<Option<i64>, String> {
+) -> Result<Option<i64>> {
     storage_payload_records(snapshot, SyncTableKind::ContextPacks)
         .into_iter()
         .map(|value| context_pack_sync_record_from_value(&value).map(|record| record.updated_at_ms))
@@ -4550,7 +4454,7 @@ fn file_modified_at_ms(path: &str) -> Option<i64> {
 fn record_diagnostics_via_hugr_api(
     config: &StorageConfig,
     diagnostics: &[DiagnosticInput],
-) -> Result<Vec<Diagnostic>, String> {
+) -> Result<Vec<Diagnostic>> {
     let records = diagnostic_records_from_inputs(diagnostics)?;
     let now = now_ms()?;
     let project = project_from_input(current_project_input()?, now);
@@ -4577,7 +4481,7 @@ fn recent_diagnostics_via_hugr_api(
     files: &[String],
     symbols: &[CodeSymbol],
     limit: usize,
-) -> Result<Vec<Diagnostic>, String> {
+) -> Result<Vec<Diagnostic>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -4587,7 +4491,7 @@ fn recent_diagnostics_via_hugr_api(
 
 fn diagnostic_records_from_inputs(
     diagnostics: &[DiagnosticInput],
-) -> Result<Vec<DiagnosticSyncRecord>, String> {
+) -> Result<Vec<DiagnosticSyncRecord>> {
     let now = now_ms()?;
     diagnostics
         .iter()
@@ -4656,7 +4560,7 @@ fn normalize_diagnostic_severity(severity: &str) -> String {
 async fn insert_diagnostic_records(
     conn: &Connection,
     records: &[DiagnosticSyncRecord],
-) -> Result<(), String> {
+) -> Result<()> {
     for record in records {
         conn.execute(
             "
@@ -4691,16 +4595,13 @@ async fn insert_diagnostic_records(
                 record.created_at_ms
             ],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     }
 
     Ok(())
 }
 
-async fn local_diagnostic_sync_records(
-    conn: &Connection,
-) -> Result<Vec<DiagnosticSyncRecord>, String> {
+async fn local_diagnostic_sync_records(conn: &Connection) -> Result<Vec<DiagnosticSyncRecord>> {
     let mut rows = conn
         .query(
             "
@@ -4713,33 +4614,22 @@ async fn local_diagnostic_sync_records(
             ",
             params![LOCAL_PROJECT_ID],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(DiagnosticSyncRecord {
-            id: row.get::<String>(0).map_err(|error| error.to_string())?,
-            project_id: row.get::<String>(1).map_err(|error| error.to_string())?,
-            source: row.get::<String>(2).map_err(|error| error.to_string())?,
-            path: row
-                .get::<Option<String>>(3)
-                .map_err(|error| error.to_string())?,
-            line_start: row
-                .get::<Option<i64>>(4)
-                .map_err(|error| error.to_string())?,
-            line_end: row
-                .get::<Option<i64>>(5)
-                .map_err(|error| error.to_string())?,
-            severity: row.get::<String>(6).map_err(|error| error.to_string())?,
-            code: row
-                .get::<Option<String>>(7)
-                .map_err(|error| error.to_string())?,
-            message: row.get::<String>(8).map_err(|error| error.to_string())?,
-            command: row
-                .get::<Option<String>>(9)
-                .map_err(|error| error.to_string())?,
-            created_at_ms: row.get::<i64>(10).map_err(|error| error.to_string())?,
+            id: row.get::<String>(0)?,
+            project_id: row.get::<String>(1)?,
+            source: row.get::<String>(2)?,
+            path: row.get::<Option<String>>(3)?,
+            line_start: row.get::<Option<i64>>(4)?,
+            line_end: row.get::<Option<i64>>(5)?,
+            severity: row.get::<String>(6)?,
+            code: row.get::<Option<String>>(7)?,
+            message: row.get::<String>(8)?,
+            command: row.get::<Option<String>>(9)?,
+            created_at_ms: row.get::<i64>(10)?,
         });
     }
 
@@ -4748,7 +4638,7 @@ async fn local_diagnostic_sync_records(
 
 fn storage_diagnostic_records(
     snapshot: &HugrApiStorageSnapshot,
-) -> Result<Vec<DiagnosticSyncRecord>, String> {
+) -> Result<Vec<DiagnosticSyncRecord>> {
     storage_payload_records(snapshot, SyncTableKind::Diagnostics)
         .iter()
         .map(diagnostic_sync_record_from_value)
@@ -4856,7 +4746,7 @@ fn likely_tests_for_files_via_hugr_api(
     config: &StorageConfig,
     files: &[String],
     limit: usize,
-) -> Result<Vec<TestCandidate>, String> {
+) -> Result<Vec<TestCandidate>> {
     if limit == 0 || files.is_empty() {
         return Ok(Vec::new());
     }
@@ -4881,14 +4771,14 @@ fn source_embedding_file_candidates_via_hugr_api(
     embedding_provider: &SelectedEmbeddingProvider,
     query: &str,
     limit: usize,
-) -> Result<Vec<FileCandidate>, String> {
+) -> Result<Vec<FileCandidate>> {
     if limit == 0 || query.trim().is_empty() {
         return Ok(Vec::new());
     }
 
     let snapshot = fetch_hugr_api_storage_snapshot(config)?;
     let embedding = embedding_provider.embed(query)?;
-    let dimensions = i64::try_from(embedding.dimensions()).map_err(|error| error.to_string())?;
+    let dimensions = i64::try_from(embedding.dimensions())?;
     let discovered_files = storage_discovered_files(&snapshot)?
         .into_iter()
         .map(|file| (file.path.clone(), file))
@@ -4945,7 +4835,7 @@ fn recall_symbols_via_hugr_api(
     config: &StorageConfig,
     query: &str,
     limit: usize,
-) -> Result<Vec<CodeSymbol>, String> {
+) -> Result<Vec<CodeSymbol>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -4971,7 +4861,7 @@ fn recall_symbols_via_hugr_api(
     Ok(matches.into_iter().map(|(_, symbol)| symbol).collect())
 }
 
-fn start_session_via_hugr_api(config: &StorageConfig, task: &str) -> Result<Session, String> {
+fn start_session_via_hugr_api(config: &StorageConfig, task: &str) -> Result<Session> {
     let started_at_ms = now_ms()?;
     let project = project_from_input(current_project_input()?, started_at_ms);
     let session = Session {
@@ -5001,16 +4891,17 @@ fn record_session_event_via_hugr_api(
     config: &StorageConfig,
     kind: &str,
     detail: &str,
-) -> Result<SessionEvent, String> {
-    record_session_event_if_active_via_hugr_api(config, kind, detail)?
-        .ok_or_else(|| "no active session; run `hugr session start <task>` first".to_string())
+) -> Result<SessionEvent> {
+    record_session_event_if_active_via_hugr_api(config, kind, detail)?.ok_or_else(|| {
+        Error::msg("no active session; run `hugr session start <task>` first".to_string())
+    })
 }
 
 fn record_session_event_if_active_via_hugr_api(
     config: &StorageConfig,
     kind: &str,
     detail: &str,
-) -> Result<Option<SessionEvent>, String> {
+) -> Result<Option<SessionEvent>> {
     let snapshot = fetch_hugr_api_storage_snapshot(config)?;
     let Some(session_id) = active_session_id_from_sessions(&storage_sessions(&snapshot)?) else {
         return Ok(None);
@@ -5041,16 +4932,15 @@ fn record_session_event_if_active_via_hugr_api(
     Ok(Some(event))
 }
 
-fn end_session_via_hugr_api(
-    config: &StorageConfig,
-    summary: Option<&str>,
-) -> Result<Session, String> {
+fn end_session_via_hugr_api(config: &StorageConfig, summary: Option<&str>) -> Result<Session> {
     let snapshot = fetch_hugr_api_storage_snapshot(config)?;
     let mut session = storage_sessions(&snapshot)?
         .into_iter()
         .filter(|session| session.ended_at_ms.is_none())
         .max_by(|left, right| left.started_at_ms.cmp(&right.started_at_ms))
-        .ok_or_else(|| "no active session; run `hugr session start <task>` first".to_string())?;
+        .ok_or_else(|| {
+            Error::msg("no active session; run `hugr session start <task>` first".to_string())
+        })?;
     session.ended_at_ms = Some(now_ms()?);
     session.final_summary = summary
         .map(str::trim)
@@ -5075,14 +4965,16 @@ fn promote_latest_session_via_hugr_api(
     config: &StorageConfig,
     embedding_provider: &SelectedEmbeddingProvider,
     synthesizer: Option<SessionSynthesizerFn<'_>>,
-) -> Result<SessionPromotionResult, String> {
+) -> Result<SessionPromotionResult> {
     let snapshot = fetch_hugr_api_storage_snapshot(config)?;
     let sessions = storage_sessions(&snapshot)?;
     let session = latest_session_from_sessions(&sessions)
-        .ok_or_else(|| "no session available to promote".to_string())?;
+        .ok_or_else(|| Error::msg("no session available to promote".to_string()))?;
     let facts = session_promotion_facts_from_records(&session, &snapshot.session_events);
     if facts.is_empty() {
-        return Err("latest session has no events or summary to promote".to_string());
+        return Err(Error::msg(
+            "latest session has no events or summary to promote".to_string(),
+        ));
     }
 
     let memory_records = fetch_hugr_api_memory_records(config)?;
@@ -5130,7 +5022,7 @@ fn recent_session_facts_via_hugr_api(
     config: &StorageConfig,
     query: &str,
     limit: usize,
-) -> Result<Vec<SessionFact>, String> {
+) -> Result<Vec<SessionFact>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -5220,9 +5112,7 @@ struct HugrApiStorageApplyResponse {
     session_promotions_table: SyncTableResult,
 }
 
-fn fetch_hugr_api_storage_snapshot(
-    config: &StorageConfig,
-) -> Result<HugrApiStorageSnapshot, String> {
+fn fetch_hugr_api_storage_snapshot(config: &StorageConfig) -> Result<HugrApiStorageSnapshot> {
     let response = get_hugr_api_json(config, "/v1/storage")?;
     parse_hugr_api_storage_snapshot_response(&response)
 }
@@ -5234,7 +5124,7 @@ fn post_hugr_api_storage_payloads(
     session_events: &[serde_json::Value],
     session_promotions: &[serde_json::Value],
     replace_code_index_paths: &[String],
-) -> Result<HugrApiStorageApplyResponse, String> {
+) -> Result<HugrApiStorageApplyResponse> {
     if payloads.iter().all(|payload| payload.records.is_empty())
         && session_events.is_empty()
         && session_promotions.is_empty()
@@ -5288,17 +5178,16 @@ fn hugr_api_storage_apply_request(
     })
 }
 
-fn parse_hugr_api_storage_snapshot_response(
-    response: &str,
-) -> Result<HugrApiStorageSnapshot, String> {
-    let value = serde_json::from_str::<serde_json::Value>(response)
-        .map_err(|error| format!("invalid Hugr API storage response: {error}"))?;
+fn parse_hugr_api_storage_snapshot_response(response: &str) -> Result<HugrApiStorageSnapshot> {
+    let value = serde_json::from_str::<serde_json::Value>(response).map_err(|error| {
+        Error::with_source(format!("invalid Hugr API storage response: {error}"), error)
+    })?;
     reject_hugr_api_error(&value)?;
     let contract_version = json_string_field(&value, "contract_version")?;
     if contract_version != HUGR_API_CONTRACT_VERSION {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "unsupported Hugr API contract version '{contract_version}'"
-        ));
+        )));
     }
     Ok(HugrApiStorageSnapshot {
         payloads: json_array_field(&value, "tables")?
@@ -5316,17 +5205,16 @@ fn parse_hugr_api_storage_snapshot_response(
     })
 }
 
-fn parse_hugr_api_storage_apply_response(
-    response: &str,
-) -> Result<HugrApiStorageApplyResponse, String> {
-    let value = serde_json::from_str::<serde_json::Value>(response)
-        .map_err(|error| format!("invalid Hugr API storage response: {error}"))?;
+fn parse_hugr_api_storage_apply_response(response: &str) -> Result<HugrApiStorageApplyResponse> {
+    let value = serde_json::from_str::<serde_json::Value>(response).map_err(|error| {
+        Error::with_source(format!("invalid Hugr API storage response: {error}"), error)
+    })?;
     reject_hugr_api_error(&value)?;
     let contract_version = json_string_field(&value, "contract_version")?;
     if contract_version != HUGR_API_CONTRACT_VERSION {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "unsupported Hugr API contract version '{contract_version}'"
-        ));
+        )));
     }
     Ok(HugrApiStorageApplyResponse {
         status: json_string_field(&value, "status")?,
@@ -5361,7 +5249,7 @@ fn storage_payload_records(
         .unwrap_or_default()
 }
 
-fn storage_project_records(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<Project>, String> {
+fn storage_project_records(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<Project>> {
     storage_payload_records(snapshot, SyncTableKind::Projects)
         .iter()
         .map(|value| {
@@ -5381,23 +5269,21 @@ fn storage_project_records(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<Proj
 
 fn storage_discovered_files(
     snapshot: &HugrApiStorageSnapshot,
-) -> Result<Vec<DiscoveredFileSyncRecord>, String> {
+) -> Result<Vec<DiscoveredFileSyncRecord>> {
     storage_payload_records(snapshot, SyncTableKind::DiscoveredFiles)
         .iter()
         .map(discovered_file_sync_record_from_value)
         .collect()
 }
 
-fn storage_test_mappings(
-    snapshot: &HugrApiStorageSnapshot,
-) -> Result<Vec<TestMappingSyncRecord>, String> {
+fn storage_test_mappings(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<TestMappingSyncRecord>> {
     storage_payload_records(snapshot, SyncTableKind::TestMappings)
         .iter()
         .map(test_mapping_sync_record_from_value)
         .collect()
 }
 
-fn storage_code_symbols(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<CodeSymbol>, String> {
+fn storage_code_symbols(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<CodeSymbol>> {
     storage_payload_records(snapshot, SyncTableKind::CodeSymbols)
         .iter()
         .map(|value| {
@@ -5415,9 +5301,7 @@ fn storage_code_symbols(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<CodeSym
         .collect()
 }
 
-fn storage_code_references(
-    snapshot: &HugrApiStorageSnapshot,
-) -> Result<Vec<CodeReference>, String> {
+fn storage_code_references(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<CodeReference>> {
     storage_payload_records(snapshot, SyncTableKind::CodeReferences)
         .iter()
         .map(|value| {
@@ -5436,32 +5320,28 @@ fn storage_code_references(
         .collect()
 }
 
-fn storage_source_records(
-    snapshot: &HugrApiStorageSnapshot,
-) -> Result<Vec<SourceSyncRecord>, String> {
+fn storage_source_records(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<SourceSyncRecord>> {
     storage_payload_records(snapshot, SyncTableKind::Sources)
         .iter()
         .map(source_sync_record_from_value)
         .collect()
 }
 
-fn storage_entity_records(
-    snapshot: &HugrApiStorageSnapshot,
-) -> Result<Vec<EntitySyncRecord>, String> {
+fn storage_entity_records(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<EntitySyncRecord>> {
     storage_payload_records(snapshot, SyncTableKind::Entities)
         .iter()
         .map(entity_sync_record_from_value)
         .collect()
 }
 
-fn storage_edge_records(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<EdgeSyncRecord>, String> {
+fn storage_edge_records(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<EdgeSyncRecord>> {
     storage_payload_records(snapshot, SyncTableKind::Edges)
         .iter()
         .map(edge_sync_record_from_value)
         .collect()
 }
 
-fn storage_sessions(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<Session>, String> {
+fn storage_sessions(snapshot: &HugrApiStorageSnapshot) -> Result<Vec<Session>> {
     storage_payload_records(snapshot, SyncTableKind::Sessions)
         .iter()
         .map(|value| {
@@ -5516,9 +5396,7 @@ fn session_promotion_facts_from_records(
     facts
 }
 
-fn project_for_storage_snapshot(
-    snapshot: &HugrApiStorageSnapshot,
-) -> Result<Option<Project>, String> {
+fn project_for_storage_snapshot(snapshot: &HugrApiStorageSnapshot) -> Result<Option<Project>> {
     let projects = storage_project_records(snapshot)?;
     if let Some(project) = projects
         .iter()
@@ -5560,7 +5438,7 @@ fn planned_storage_table_result(
     }
 }
 
-fn hugr_api_active_memories(config: &StorageConfig) -> Result<Vec<Memory>, String> {
+fn hugr_api_active_memories(config: &StorageConfig) -> Result<Vec<Memory>> {
     Ok(fetch_hugr_api_memory_records(config)?
         .iter()
         .filter(|record| record.valid_to.is_none())
@@ -5573,7 +5451,7 @@ fn recall_via_hugr_api(
     query: &str,
     terms: &[String],
     limit: usize,
-) -> Result<Vec<Memory>, String> {
+) -> Result<Vec<Memory>> {
     let memories = hugr_api_active_memories(config)?;
     Ok(rank_memories_by_query(memories, terms, query, limit))
 }
@@ -5583,7 +5461,7 @@ fn forget_via_hugr_api(
     query: &str,
     terms: &[String],
     limit: usize,
-) -> Result<ForgetResult, String> {
+) -> Result<ForgetResult> {
     let records = fetch_hugr_api_memory_records(config)?;
     let mut matches = records
         .into_iter()
@@ -5630,14 +5508,14 @@ fn forget_via_hugr_api(
 
 fn memory_maintenance_report_via_hugr_api(
     config: &StorageConfig,
-) -> Result<MemoryMaintenanceReport, String> {
+) -> Result<MemoryMaintenanceReport> {
     let records = fetch_hugr_api_memory_records(config)?;
     Ok(memory_maintenance_report_from_records(&records))
 }
 
 fn consolidate_duplicate_memories_via_hugr_api(
     config: &StorageConfig,
-) -> Result<MemoryConsolidationResult, String> {
+) -> Result<MemoryConsolidationResult> {
     let records = fetch_hugr_api_memory_records(config)?;
     let report = memory_maintenance_report_from_records(&records);
     let executed_at = now_ms()?.to_string();
@@ -5678,9 +5556,7 @@ fn consolidate_duplicate_memories_via_hugr_api(
     })
 }
 
-fn retire_stale_memories_via_hugr_api(
-    config: &StorageConfig,
-) -> Result<StaleRetirementResult, String> {
+fn retire_stale_memories_via_hugr_api(config: &StorageConfig) -> Result<StaleRetirementResult> {
     let records = fetch_hugr_api_memory_records(config)?;
     let report = memory_maintenance_report_from_records(&records);
     let executed_at = now_ms()?.to_string();
@@ -5840,7 +5716,7 @@ fn memory_record_promotes_session(record: &MemorySyncRecord, session_id: &str) -
         })
 }
 
-fn fetch_hugr_api_memory_records(config: &StorageConfig) -> Result<Vec<MemorySyncRecord>, String> {
+fn fetch_hugr_api_memory_records(config: &StorageConfig) -> Result<Vec<MemorySyncRecord>> {
     let response = get_hugr_api_json(config, "/v1/memories")?;
     parse_hugr_api_memory_records_response(&response)
 }
@@ -5849,7 +5725,7 @@ fn post_hugr_api_memory_payloads(
     config: &StorageConfig,
     operation: &str,
     payloads: &[SyncApiTablePayload],
-) -> Result<Vec<SyncTableResult>, String> {
+) -> Result<Vec<SyncTableResult>> {
     if payloads.iter().all(|payload| payload.records.is_empty()) {
         return Ok(Vec::new());
     }
@@ -5872,7 +5748,7 @@ fn ensure_hugr_api_memory_operation_accepted(
     operation: &str,
     status: &str,
     tables: &[SyncTableResult],
-) -> Result<(), String> {
+) -> Result<()> {
     if status == "accepted" && tables.iter().all(|table| table.conflict_count == 0) {
         return Ok(());
     }
@@ -5887,9 +5763,9 @@ fn ensure_hugr_api_memory_operation_accepted(
     } else {
         format!(" ({})", conflicts.join(", "))
     };
-    Err(format!(
+    Err(Error::msg(format!(
         "remote Hugr API {operation} returned status '{status}'{details}"
-    ))
+    )))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5898,15 +5774,16 @@ struct HugrApiMemoryApplyResponse {
     tables: Vec<SyncTableResult>,
 }
 
-fn parse_hugr_api_memory_records_response(response: &str) -> Result<Vec<MemorySyncRecord>, String> {
-    let value = serde_json::from_str::<serde_json::Value>(response)
-        .map_err(|error| format!("invalid Hugr API memory response: {error}"))?;
+fn parse_hugr_api_memory_records_response(response: &str) -> Result<Vec<MemorySyncRecord>> {
+    let value = serde_json::from_str::<serde_json::Value>(response).map_err(|error| {
+        Error::with_source(format!("invalid Hugr API memory response: {error}"), error)
+    })?;
     reject_hugr_api_error(&value)?;
     let contract_version = json_string_field(&value, "contract_version")?;
     if contract_version != HUGR_API_CONTRACT_VERSION {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "unsupported Hugr API contract version '{contract_version}'"
-        ));
+        )));
     }
     json_array_field(&value, "records")?
         .iter()
@@ -5914,17 +5791,16 @@ fn parse_hugr_api_memory_records_response(response: &str) -> Result<Vec<MemorySy
         .collect()
 }
 
-fn parse_hugr_api_memory_apply_response(
-    response: &str,
-) -> Result<HugrApiMemoryApplyResponse, String> {
-    let value = serde_json::from_str::<serde_json::Value>(response)
-        .map_err(|error| format!("invalid Hugr API memory response: {error}"))?;
+fn parse_hugr_api_memory_apply_response(response: &str) -> Result<HugrApiMemoryApplyResponse> {
+    let value = serde_json::from_str::<serde_json::Value>(response).map_err(|error| {
+        Error::with_source(format!("invalid Hugr API memory response: {error}"), error)
+    })?;
     reject_hugr_api_error(&value)?;
     let contract_version = json_string_field(&value, "contract_version")?;
     if contract_version != HUGR_API_CONTRACT_VERSION {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "unsupported Hugr API contract version '{contract_version}'"
-        ));
+        )));
     }
     Ok(HugrApiMemoryApplyResponse {
         status: json_string_field(&value, "status")?,
@@ -5940,15 +5816,12 @@ fn post_hugr_api_sync(
     operation: &str,
     dry_run: bool,
     payloads: &[SyncApiTablePayload],
-) -> Result<String, String> {
+) -> Result<String> {
     let body = hugr_api_sync_request(config, operation, dry_run, payloads);
     post_hugr_api_json(config, &format!("/v1/sync/{operation}"), &body)
 }
 
-fn fetch_hugr_api_history(
-    config: &StorageConfig,
-    limit: usize,
-) -> Result<Vec<SyncRunHistory>, String> {
+fn fetch_hugr_api_history(config: &StorageConfig, limit: usize) -> Result<Vec<SyncRunHistory>> {
     let response = get_hugr_api_json(config, &format!("/v1/sync/history?limit={limit}"))?;
     parse_hugr_api_history_response(&response)
 }
@@ -6004,11 +5877,11 @@ fn post_hugr_api_json(
     config: &StorageConfig,
     path: &str,
     body: &serde_json::Value,
-) -> Result<String, String> {
+) -> Result<String> {
     request_hugr_api_json(config, "POST", path, Some(body))
 }
 
-fn get_hugr_api_json(config: &StorageConfig, path: &str) -> Result<String, String> {
+fn get_hugr_api_json(config: &StorageConfig, path: &str) -> Result<String> {
     request_hugr_api_json(config, "GET", path, None)
 }
 
@@ -6017,18 +5890,16 @@ fn request_hugr_api_json(
     method: &str,
     path: &str,
     body: Option<&serde_json::Value>,
-) -> Result<String, String> {
+) -> Result<String> {
     let url = hugr_api_route_url(
-        config
-            .remote_url
-            .as_ref()
-            .ok_or_else(|| "HUGR_SYNC_BACKEND=hugr_api requires HUGR_API_URL".to_string())?,
+        config.remote_url.as_ref().ok_or_else(|| {
+            Error::msg("HUGR_SYNC_BACKEND=hugr_api requires HUGR_API_URL".to_string())
+        })?,
         path,
     );
-    let token = config
-        .remote_auth_token
-        .as_ref()
-        .ok_or_else(|| "HUGR_SYNC_BACKEND=hugr_api requires HUGR_API_TOKEN".to_string())?;
+    let token = config.remote_auth_token.as_ref().ok_or_else(|| {
+        Error::msg("HUGR_SYNC_BACKEND=hugr_api requires HUGR_API_TOKEN".to_string())
+    })?;
     let mut args = vec![
         "-fsS".to_string(),
         "-X".to_string(),
@@ -6056,35 +5927,40 @@ fn request_hugr_api_json(
     if body.is_some() {
         command.stdin(Stdio::piped());
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("failed to execute curl for Hugr API: {error}"))?;
+    let mut child = command.spawn().map_err(|error| {
+        Error::with_source(
+            format!("failed to execute curl for Hugr API: {error}"),
+            error,
+        )
+    })?;
 
     if let Some(body) = body {
         let stdin = child
             .stdin
             .as_mut()
-            .ok_or_else(|| "failed to open Hugr API request stdin".to_string())?;
+            .ok_or_else(|| Error::msg("failed to open Hugr API request stdin".to_string()))?;
         stdin
             .write_all(body.to_string().as_bytes())
-            .map_err(|error| format!("failed to write Hugr API request: {error}"))?;
+            .map_err(|error| {
+                Error::with_source(format!("failed to write Hugr API request: {error}"), error)
+            })?;
     }
 
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("failed to read Hugr API response: {error}"))?;
+    let output = child.wait_with_output().map_err(|error| {
+        Error::with_source(format!("failed to read Hugr API response: {error}"), error)
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if stderr.is_empty() {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "Hugr API request failed with status {}",
                 output.status
-            ));
+            )));
         }
-        return Err(format!("Hugr API request failed: {stderr}"));
+        return Err(Error::msg(format!("Hugr API request failed: {stderr}")));
     }
 
-    String::from_utf8(output.stdout).map_err(|error| error.to_string())
+    String::from_utf8(output.stdout).map_err(Error::from)
 }
 
 fn hugr_api_route_url(base_url: &str, path: &str) -> String {
@@ -6103,9 +5979,10 @@ struct HugrApiSyncResponse {
     payloads: Vec<SyncApiTablePayload>,
 }
 
-fn parse_hugr_api_sync_response(response: &str) -> Result<HugrApiSyncResponse, String> {
-    let value = serde_json::from_str::<serde_json::Value>(response)
-        .map_err(|error| format!("invalid Hugr API sync response: {error}"))?;
+fn parse_hugr_api_sync_response(response: &str) -> Result<HugrApiSyncResponse> {
+    let value = serde_json::from_str::<serde_json::Value>(response).map_err(|error| {
+        Error::with_source(format!("invalid Hugr API sync response: {error}"), error)
+    })?;
     reject_hugr_api_error(&value)?;
     let payloads = json_array_field(&value, "tables")?
         .iter()
@@ -6123,7 +6000,7 @@ fn parse_hugr_api_sync_response(response: &str) -> Result<HugrApiSyncResponse, S
     })
 }
 
-fn parse_sync_api_table_payload(value: &serde_json::Value) -> Result<SyncApiTablePayload, String> {
+fn parse_sync_api_table_payload(value: &serde_json::Value) -> Result<SyncApiTablePayload> {
     let records = value
         .get("records")
         .and_then(serde_json::Value::as_array)
@@ -6135,9 +6012,10 @@ fn parse_sync_api_table_payload(value: &serde_json::Value) -> Result<SyncApiTabl
     })
 }
 
-fn parse_hugr_api_history_response(response: &str) -> Result<Vec<SyncRunHistory>, String> {
-    let value = serde_json::from_str::<serde_json::Value>(response)
-        .map_err(|error| format!("invalid Hugr API history response: {error}"))?;
+fn parse_hugr_api_history_response(response: &str) -> Result<Vec<SyncRunHistory>> {
+    let value = serde_json::from_str::<serde_json::Value>(response).map_err(|error| {
+        Error::with_source(format!("invalid Hugr API history response: {error}"), error)
+    })?;
     reject_hugr_api_error(&value)?;
     json_array_field(&value, "runs")?
         .iter()
@@ -6145,7 +6023,7 @@ fn parse_hugr_api_history_response(response: &str) -> Result<Vec<SyncRunHistory>
         .collect()
 }
 
-fn parse_sync_run_history(value: &serde_json::Value) -> Result<SyncRunHistory, String> {
+fn parse_sync_run_history(value: &serde_json::Value) -> Result<SyncRunHistory> {
     Ok(SyncRunHistory {
         id: json_string_field(value, "id")?,
         operation: json_string_field(value, "operation")?,
@@ -6160,7 +6038,7 @@ fn parse_sync_run_history(value: &serde_json::Value) -> Result<SyncRunHistory, S
     })
 }
 
-fn parse_sync_table_result(value: &serde_json::Value) -> Result<SyncTableResult, String> {
+fn parse_sync_table_result(value: &serde_json::Value) -> Result<SyncTableResult> {
     Ok(SyncTableResult {
         class: json_string_field(value, "class")?,
         table: json_string_field(value, "table")?,
@@ -6177,23 +6055,23 @@ fn parse_sync_table_result(value: &serde_json::Value) -> Result<SyncTableResult,
     })
 }
 
-fn parse_sync_conflict_summary(value: &serde_json::Value) -> Result<SyncConflictSummary, String> {
+fn parse_sync_conflict_summary(value: &serde_json::Value) -> Result<SyncConflictSummary> {
     Ok(SyncConflictSummary {
         reason: json_string_field(value, "reason")?,
         count: json_usize_field(value, "count")?,
     })
 }
 
-fn reject_hugr_api_error(value: &serde_json::Value) -> Result<(), String> {
+fn reject_hugr_api_error(value: &serde_json::Value) -> Result<()> {
     if let Some(message) = value
         .get("error")
         .and_then(|error| error.get("message"))
         .and_then(serde_json::Value::as_str)
     {
-        return Err(format!("Hugr API request failed: {message}"));
+        return Err(Error::msg(format!("Hugr API request failed: {message}")));
     }
     if let Some(message) = value.get("error").and_then(serde_json::Value::as_str) {
-        return Err(format!("Hugr API request failed: {message}"));
+        return Err(Error::msg(format!("Hugr API request failed: {message}")));
     }
     Ok(())
 }
@@ -6201,11 +6079,11 @@ fn reject_hugr_api_error(value: &serde_json::Value) -> Result<(), String> {
 fn json_array_field<'a>(
     value: &'a serde_json::Value,
     field: &str,
-) -> Result<&'a Vec<serde_json::Value>, String> {
+) -> Result<&'a Vec<serde_json::Value>> {
     value
         .get(field)
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| format!("Hugr API response missing array field '{field}'"))
+        .ok_or_else(|| Error::msg(format!("Hugr API response missing array field '{field}'")))
 }
 
 fn optional_json_array_field(value: &serde_json::Value, field: &str) -> Vec<serde_json::Value> {
@@ -6216,75 +6094,83 @@ fn optional_json_array_field(value: &serde_json::Value, field: &str) -> Vec<serd
         .unwrap_or_default()
 }
 
-fn json_string_field(value: &serde_json::Value, field: &str) -> Result<String, String> {
+fn json_string_field(value: &serde_json::Value, field: &str) -> Result<String> {
     value
         .get(field)
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| format!("Hugr API response missing string field '{field}'"))
+        .ok_or_else(|| Error::msg(format!("Hugr API response missing string field '{field}'")))
 }
 
-fn json_optional_string_field(
-    value: &serde_json::Value,
-    field: &str,
-) -> Result<Option<String>, String> {
+fn json_optional_string_field(value: &serde_json::Value, field: &str) -> Result<Option<String>> {
     match value.get(field) {
         Some(serde_json::Value::Null) | None => Ok(None),
         Some(value) => value
             .as_str()
             .map(|value| Some(value.to_string()))
-            .ok_or_else(|| format!("Hugr API response field '{field}' must be a string")),
+            .ok_or_else(|| {
+                Error::msg(format!(
+                    "Hugr API response field '{field}' must be a string"
+                ))
+            }),
     }
 }
 
-fn json_i64_field(value: &serde_json::Value, field: &str) -> Result<i64, String> {
+fn json_i64_field(value: &serde_json::Value, field: &str) -> Result<i64> {
     value
         .get(field)
         .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| format!("Hugr API response missing integer field '{field}'"))
+        .ok_or_else(|| Error::msg(format!("Hugr API response missing integer field '{field}'")))
 }
 
-fn json_usize_field(value: &serde_json::Value, field: &str) -> Result<usize, String> {
+fn json_usize_field(value: &serde_json::Value, field: &str) -> Result<usize> {
     let raw = value
         .get(field)
         .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| format!("Hugr API response missing unsigned integer field '{field}'"))?;
-    usize::try_from(raw).map_err(|error| error.to_string())
+        .ok_or_else(|| {
+            Error::msg(format!(
+                "Hugr API response missing unsigned integer field '{field}'"
+            ))
+        })?;
+    usize::try_from(raw).map_err(Error::from)
 }
 
-fn json_bool_field(value: &serde_json::Value, field: &str) -> Result<bool, String> {
+fn json_bool_field(value: &serde_json::Value, field: &str) -> Result<bool> {
     value
         .get(field)
         .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| format!("Hugr API response missing boolean field '{field}'"))
+        .ok_or_else(|| Error::msg(format!("Hugr API response missing boolean field '{field}'")))
 }
 
-fn json_f64_field(value: &serde_json::Value, field: &str) -> Result<f64, String> {
+fn json_f64_field(value: &serde_json::Value, field: &str) -> Result<f64> {
     value
         .get(field)
         .and_then(serde_json::Value::as_f64)
-        .ok_or_else(|| format!("Hugr API response missing number field '{field}'"))
+        .ok_or_else(|| Error::msg(format!("Hugr API response missing number field '{field}'")))
 }
 
-fn json_optional_i64_field(value: &serde_json::Value, field: &str) -> Result<Option<i64>, String> {
+fn json_optional_i64_field(value: &serde_json::Value, field: &str) -> Result<Option<i64>> {
     match value.get(field) {
         Some(serde_json::Value::Null) | None => Ok(None),
-        Some(value) => value
-            .as_i64()
-            .map(Some)
-            .ok_or_else(|| format!("Hugr API response field '{field}' must be an integer")),
+        Some(value) => value.as_i64().map(Some).ok_or_else(|| {
+            Error::msg(format!(
+                "Hugr API response field '{field}' must be an integer"
+            ))
+        }),
     }
 }
 
-fn json_bytes_field(value: &serde_json::Value, field: &str) -> Result<Vec<u8>, String> {
+fn json_bytes_field(value: &serde_json::Value, field: &str) -> Result<Vec<u8>> {
     let values = json_array_field(value, field)?;
     values
         .iter()
         .map(|value| {
-            let byte = value
-                .as_u64()
-                .ok_or_else(|| format!("Hugr API response field '{field}' must contain bytes"))?;
-            u8::try_from(byte).map_err(|error| error.to_string())
+            let byte = value.as_u64().ok_or_else(|| {
+                Error::msg(format!(
+                    "Hugr API response field '{field}' must contain bytes"
+                ))
+            })?;
+            u8::try_from(byte).map_err(Error::from)
         })
         .collect()
 }
@@ -6383,7 +6269,7 @@ fn api_storage_table_supports_records(table: SyncTableKind) -> bool {
 async fn api_sync_records_for_table(
     conn: &Connection,
     table: SyncTableKind,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<serde_json::Value>> {
     match table {
         SyncTableKind::Projects => project_sync_records(conn).await,
         SyncTableKind::Memories => memory_sync_records(conn).await,
@@ -6402,7 +6288,7 @@ async fn api_sync_records_for_table(
     }
 }
 
-async fn project_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+async fn project_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     let mut rows = conn
         .query(
             "
@@ -6412,26 +6298,25 @@ async fn project_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(json!({
-            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
-            "name": row.get::<String>(1).map_err(|error| error.to_string())?,
-            "root_path": row.get::<String>(2).map_err(|error| error.to_string())?,
-            "git_remote": row.get::<Option<String>>(3).map_err(|error| error.to_string())?,
-            "default_branch": row.get::<Option<String>>(4).map_err(|error| error.to_string())?,
-            "created_at_ms": row.get::<i64>(5).map_err(|error| error.to_string())?,
-            "updated_at_ms": row.get::<i64>(6).map_err(|error| error.to_string())?
+            "id": row.get::<String>(0)?,
+            "name": row.get::<String>(1)?,
+            "root_path": row.get::<String>(2)?,
+            "git_remote": row.get::<Option<String>>(3)?,
+            "default_branch": row.get::<Option<String>>(4)?,
+            "created_at_ms": row.get::<i64>(5)?,
+            "updated_at_ms": row.get::<i64>(6)?
         }));
     }
 
     Ok(records)
 }
 
-async fn memory_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+async fn memory_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     let mut rows = conn
         .query(
             "
@@ -6443,75 +6328,71 @@ async fn memory_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(json!({
-            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
-            "created_at_ms": row.get::<i64>(1).map_err(|error| error.to_string())?,
-            "kind": row.get::<String>(2).map_err(|error| error.to_string())?,
-            "text": row.get::<String>(3).map_err(|error| error.to_string())?,
-            "confidence": row.get::<f64>(4).map_err(|error| error.to_string())?,
-            "valid_from": row.get::<Option<String>>(5).map_err(|error| error.to_string())?,
-            "valid_to": row.get::<Option<String>>(6).map_err(|error| error.to_string())?,
-            "superseded_by": row.get::<Option<String>>(7).map_err(|error| error.to_string())?,
-            "sensitivity": row.get::<String>(8).map_err(|error| error.to_string())?,
-            "structured_payload": row.get::<Option<String>>(9).map_err(|error| error.to_string())?
+            "id": row.get::<String>(0)?,
+            "created_at_ms": row.get::<i64>(1)?,
+            "kind": row.get::<String>(2)?,
+            "text": row.get::<String>(3)?,
+            "confidence": row.get::<f64>(4)?,
+            "valid_from": row.get::<Option<String>>(5)?,
+            "valid_to": row.get::<Option<String>>(6)?,
+            "superseded_by": row.get::<Option<String>>(7)?,
+            "sensitivity": row.get::<String>(8)?,
+            "structured_payload": row.get::<Option<String>>(9)?
         }));
     }
 
     Ok(records)
 }
 
-async fn memory_embedding_sync_records(
-    conn: &Connection,
-) -> Result<Vec<serde_json::Value>, String> {
+async fn memory_embedding_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     let mut rows = conn
         .query(
             "SELECT memory_id, model, dimensions, embedding FROM memory_embeddings ORDER BY memory_id",
             (),
         )
         .await
-        .map_err(|error| error.to_string())?;
+        ?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(json!({
-            "memory_id": row.get::<String>(0).map_err(|error| error.to_string())?,
-            "model": row.get::<String>(1).map_err(|error| error.to_string())?,
-            "dimensions": row.get::<i64>(2).map_err(|error| error.to_string())?,
-            "embedding": row.get::<Vec<u8>>(3).map_err(|error| error.to_string())?
+            "memory_id": row.get::<String>(0)?,
+            "model": row.get::<String>(1)?,
+            "dimensions": row.get::<i64>(2)?,
+            "embedding": row.get::<Vec<u8>>(3)?
         }));
     }
 
     Ok(records)
 }
 
-async fn source_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+async fn source_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     let mut rows = conn
         .query(
             "SELECT id, kind, locator, created_at_ms FROM sources ORDER BY id",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(json!({
-            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
-            "kind": row.get::<String>(1).map_err(|error| error.to_string())?,
-            "locator": row.get::<String>(2).map_err(|error| error.to_string())?,
-            "created_at_ms": row.get::<i64>(3).map_err(|error| error.to_string())?
+            "id": row.get::<String>(0)?,
+            "kind": row.get::<String>(1)?,
+            "locator": row.get::<String>(2)?,
+            "created_at_ms": row.get::<i64>(3)?
         }));
     }
 
     Ok(records)
 }
 
-async fn discovered_file_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+async fn discovered_file_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     let mut rows = conn
         .query(
             "
@@ -6521,48 +6402,46 @@ async fn discovered_file_sync_records(conn: &Connection) -> Result<Vec<serde_jso
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(json!({
-            "project_id": row.get::<String>(0).map_err(|error| error.to_string())?,
-            "path": row.get::<String>(1).map_err(|error| error.to_string())?,
-            "language": row.get::<Option<String>>(2).map_err(|error| error.to_string())?,
-            "size_bytes": row.get::<Option<i64>>(3).map_err(|error| error.to_string())?,
-            "discovered_at_ms": row.get::<i64>(4).map_err(|error| error.to_string())?,
-            "updated_at_ms": row.get::<i64>(5).map_err(|error| error.to_string())?
+            "project_id": row.get::<String>(0)?,
+            "path": row.get::<String>(1)?,
+            "language": row.get::<Option<String>>(2)?,
+            "size_bytes": row.get::<Option<i64>>(3)?,
+            "discovered_at_ms": row.get::<i64>(4)?,
+            "updated_at_ms": row.get::<i64>(5)?
         }));
     }
 
     Ok(records)
 }
 
-async fn entity_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+async fn entity_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     let mut rows = conn
         .query(
             "SELECT id, kind, name, locator, created_at_ms FROM entities ORDER BY id",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(json!({
-            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
-            "kind": row.get::<String>(1).map_err(|error| error.to_string())?,
-            "name": row.get::<String>(2).map_err(|error| error.to_string())?,
-            "locator": row.get::<Option<String>>(3).map_err(|error| error.to_string())?,
-            "created_at_ms": row.get::<i64>(4).map_err(|error| error.to_string())?
+            "id": row.get::<String>(0)?,
+            "kind": row.get::<String>(1)?,
+            "name": row.get::<String>(2)?,
+            "locator": row.get::<Option<String>>(3)?,
+            "created_at_ms": row.get::<i64>(4)?
         }));
     }
 
     Ok(records)
 }
 
-async fn code_symbol_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+async fn code_symbol_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     let mut rows = conn
         .query(
             "
@@ -6574,51 +6453,49 @@ async fn code_symbol_sync_records(conn: &Connection) -> Result<Vec<serde_json::V
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(json!({
-            "project_id": row.get::<String>(0).map_err(|error| error.to_string())?,
-            "path": row.get::<String>(1).map_err(|error| error.to_string())?,
-            "name": row.get::<String>(2).map_err(|error| error.to_string())?,
-            "kind": row.get::<String>(3).map_err(|error| error.to_string())?,
-            "language": row.get::<Option<String>>(4).map_err(|error| error.to_string())?,
-            "line_start": row.get::<i64>(5).map_err(|error| error.to_string())?,
-            "line_end": row.get::<Option<i64>>(6).map_err(|error| error.to_string())?,
-            "signature": row.get::<String>(7).map_err(|error| error.to_string())?,
-            "indexed_at_ms": row.get::<i64>(8).map_err(|error| error.to_string())?
+            "project_id": row.get::<String>(0)?,
+            "path": row.get::<String>(1)?,
+            "name": row.get::<String>(2)?,
+            "kind": row.get::<String>(3)?,
+            "language": row.get::<Option<String>>(4)?,
+            "line_start": row.get::<i64>(5)?,
+            "line_end": row.get::<Option<i64>>(6)?,
+            "signature": row.get::<String>(7)?,
+            "indexed_at_ms": row.get::<i64>(8)?
         }));
     }
 
     Ok(records)
 }
 
-async fn edge_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+async fn edge_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     let mut rows = conn
         .query(
             "SELECT id, from_id, to_id, kind, created_at_ms FROM edges ORDER BY id",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(json!({
-            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
-            "from_id": row.get::<String>(1).map_err(|error| error.to_string())?,
-            "to_id": row.get::<String>(2).map_err(|error| error.to_string())?,
-            "kind": row.get::<String>(3).map_err(|error| error.to_string())?,
-            "created_at_ms": row.get::<i64>(4).map_err(|error| error.to_string())?
+            "id": row.get::<String>(0)?,
+            "from_id": row.get::<String>(1)?,
+            "to_id": row.get::<String>(2)?,
+            "kind": row.get::<String>(3)?,
+            "created_at_ms": row.get::<i64>(4)?
         }));
     }
 
     Ok(records)
 }
 
-async fn code_reference_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+async fn code_reference_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     let mut rows = conn
         .query(
             "
@@ -6630,29 +6507,28 @@ async fn code_reference_sync_records(conn: &Connection) -> Result<Vec<serde_json
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(json!({
-            "project_id": row.get::<String>(0).map_err(|error| error.to_string())?,
-            "path": row.get::<String>(1).map_err(|error| error.to_string())?,
-            "target_path": row.get::<String>(2).map_err(|error| error.to_string())?,
-            "target_name": row.get::<String>(3).map_err(|error| error.to_string())?,
-            "target_kind": row.get::<String>(4).map_err(|error| error.to_string())?,
-            "kind": row.get::<String>(5).map_err(|error| error.to_string())?,
-            "language": row.get::<Option<String>>(6).map_err(|error| error.to_string())?,
-            "line_start": row.get::<i64>(7).map_err(|error| error.to_string())?,
-            "excerpt": row.get::<String>(8).map_err(|error| error.to_string())?,
-            "indexed_at_ms": row.get::<i64>(9).map_err(|error| error.to_string())?
+            "project_id": row.get::<String>(0)?,
+            "path": row.get::<String>(1)?,
+            "target_path": row.get::<String>(2)?,
+            "target_name": row.get::<String>(3)?,
+            "target_kind": row.get::<String>(4)?,
+            "kind": row.get::<String>(5)?,
+            "language": row.get::<Option<String>>(6)?,
+            "line_start": row.get::<i64>(7)?,
+            "excerpt": row.get::<String>(8)?,
+            "indexed_at_ms": row.get::<i64>(9)?
         }));
     }
 
     Ok(records)
 }
 
-async fn test_mapping_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+async fn test_mapping_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     let mut rows = conn
         .query(
             "
@@ -6662,27 +6538,24 @@ async fn test_mapping_sync_records(conn: &Connection) -> Result<Vec<serde_json::
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(json!({
-            "project_id": row.get::<String>(0).map_err(|error| error.to_string())?,
-            "source_path": row.get::<String>(1).map_err(|error| error.to_string())?,
-            "test_path": row.get::<String>(2).map_err(|error| error.to_string())?,
-            "reason": row.get::<String>(3).map_err(|error| error.to_string())?,
-            "score": row.get::<i64>(4).map_err(|error| error.to_string())?,
-            "updated_at_ms": row.get::<i64>(5).map_err(|error| error.to_string())?
+            "project_id": row.get::<String>(0)?,
+            "source_path": row.get::<String>(1)?,
+            "test_path": row.get::<String>(2)?,
+            "reason": row.get::<String>(3)?,
+            "score": row.get::<i64>(4)?,
+            "updated_at_ms": row.get::<i64>(5)?
         }));
     }
 
     Ok(records)
 }
 
-async fn source_embedding_sync_records(
-    conn: &Connection,
-) -> Result<Vec<serde_json::Value>, String> {
+async fn source_embedding_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     let mut rows = conn
         .query(
             "
@@ -6692,26 +6565,25 @@ async fn source_embedding_sync_records(
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(json!({
-            "project_id": row.get::<String>(0).map_err(|error| error.to_string())?,
-            "path": row.get::<String>(1).map_err(|error| error.to_string())?,
-            "model": row.get::<String>(2).map_err(|error| error.to_string())?,
-            "dimensions": row.get::<i64>(3).map_err(|error| error.to_string())?,
-            "embedding": row.get::<Vec<u8>>(4).map_err(|error| error.to_string())?,
-            "content_key": row.get::<String>(5).map_err(|error| error.to_string())?,
-            "updated_at_ms": row.get::<i64>(6).map_err(|error| error.to_string())?
+            "project_id": row.get::<String>(0)?,
+            "path": row.get::<String>(1)?,
+            "model": row.get::<String>(2)?,
+            "dimensions": row.get::<i64>(3)?,
+            "embedding": row.get::<Vec<u8>>(4)?,
+            "content_key": row.get::<String>(5)?,
+            "updated_at_ms": row.get::<i64>(6)?
         }));
     }
 
     Ok(records)
 }
 
-async fn session_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+async fn session_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     let mut rows = conn
         .query(
             "
@@ -6722,26 +6594,25 @@ async fn session_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(json!({
-            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
-            "project_id": row.get::<String>(1).map_err(|error| error.to_string())?,
-            "task": row.get::<String>(2).map_err(|error| error.to_string())?,
-            "branch": row.get::<Option<String>>(3).map_err(|error| error.to_string())?,
-            "started_at_ms": row.get::<i64>(4).map_err(|error| error.to_string())?,
-            "ended_at_ms": row.get::<Option<i64>>(5).map_err(|error| error.to_string())?,
-            "final_summary": row.get::<Option<String>>(6).map_err(|error| error.to_string())?
+            "id": row.get::<String>(0)?,
+            "project_id": row.get::<String>(1)?,
+            "task": row.get::<String>(2)?,
+            "branch": row.get::<Option<String>>(3)?,
+            "started_at_ms": row.get::<i64>(4)?,
+            "ended_at_ms": row.get::<Option<i64>>(5)?,
+            "final_summary": row.get::<Option<String>>(6)?
         }));
     }
 
     Ok(records)
 }
 
-async fn session_storage_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+async fn session_storage_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     let mut rows = conn
         .query(
             "
@@ -6751,26 +6622,25 @@ async fn session_storage_records(conn: &Connection) -> Result<Vec<serde_json::Va
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(json!({
-            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
-            "project_id": row.get::<String>(1).map_err(|error| error.to_string())?,
-            "task": row.get::<String>(2).map_err(|error| error.to_string())?,
-            "branch": row.get::<Option<String>>(3).map_err(|error| error.to_string())?,
-            "started_at_ms": row.get::<i64>(4).map_err(|error| error.to_string())?,
-            "ended_at_ms": row.get::<Option<i64>>(5).map_err(|error| error.to_string())?,
-            "final_summary": row.get::<Option<String>>(6).map_err(|error| error.to_string())?
+            "id": row.get::<String>(0)?,
+            "project_id": row.get::<String>(1)?,
+            "task": row.get::<String>(2)?,
+            "branch": row.get::<Option<String>>(3)?,
+            "started_at_ms": row.get::<i64>(4)?,
+            "ended_at_ms": row.get::<Option<i64>>(5)?,
+            "final_summary": row.get::<Option<String>>(6)?
         }));
     }
 
     Ok(records)
 }
 
-async fn context_pack_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+async fn context_pack_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     let mut rows = conn
         .query(
             "
@@ -6780,25 +6650,24 @@ async fn context_pack_sync_records(conn: &Connection) -> Result<Vec<serde_json::
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(json!({
-            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
-            "project_id": row.get::<String>(1).map_err(|error| error.to_string())?,
-            "task": row.get::<String>(2).map_err(|error| error.to_string())?,
-            "payload_json": row.get::<String>(3).map_err(|error| error.to_string())?,
-            "created_at_ms": row.get::<i64>(4).map_err(|error| error.to_string())?,
-            "updated_at_ms": row.get::<i64>(5).map_err(|error| error.to_string())?
+            "id": row.get::<String>(0)?,
+            "project_id": row.get::<String>(1)?,
+            "task": row.get::<String>(2)?,
+            "payload_json": row.get::<String>(3)?,
+            "created_at_ms": row.get::<i64>(4)?,
+            "updated_at_ms": row.get::<i64>(5)?
         }));
     }
 
     Ok(records)
 }
 
-async fn diagnostic_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+async fn diagnostic_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     Ok(local_diagnostic_sync_records(conn)
         .await?
         .iter()
@@ -6806,7 +6675,7 @@ async fn diagnostic_sync_records(conn: &Connection) -> Result<Vec<serde_json::Va
         .collect())
 }
 
-async fn session_event_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+async fn session_event_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     let mut rows = conn
         .query(
             "
@@ -6816,26 +6685,23 @@ async fn session_event_sync_records(conn: &Connection) -> Result<Vec<serde_json:
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(json!({
-            "id": row.get::<String>(0).map_err(|error| error.to_string())?,
-            "session_id": row.get::<String>(1).map_err(|error| error.to_string())?,
-            "kind": row.get::<String>(2).map_err(|error| error.to_string())?,
-            "detail": row.get::<String>(3).map_err(|error| error.to_string())?,
-            "created_at_ms": row.get::<i64>(4).map_err(|error| error.to_string())?
+            "id": row.get::<String>(0)?,
+            "session_id": row.get::<String>(1)?,
+            "kind": row.get::<String>(2)?,
+            "detail": row.get::<String>(3)?,
+            "created_at_ms": row.get::<i64>(4)?
         }));
     }
 
     Ok(records)
 }
 
-async fn session_promotion_sync_records(
-    conn: &Connection,
-) -> Result<Vec<serde_json::Value>, String> {
+async fn session_promotion_sync_records(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     let mut rows = conn
         .query(
             "
@@ -6845,15 +6711,14 @@ async fn session_promotion_sync_records(
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut records = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         records.push(json!({
-            "session_id": row.get::<String>(0).map_err(|error| error.to_string())?,
-            "memory_id": row.get::<String>(1).map_err(|error| error.to_string())?,
-            "promoted_at_ms": row.get::<i64>(2).map_err(|error| error.to_string())?
+            "session_id": row.get::<String>(0)?,
+            "memory_id": row.get::<String>(1)?,
+            "promoted_at_ms": row.get::<i64>(2)?
         }));
     }
 
@@ -6871,7 +6736,7 @@ struct ProjectSyncRecord {
     updated_at_ms: i64,
 }
 
-fn project_sync_record_from_value(value: &serde_json::Value) -> Result<ProjectSyncRecord, String> {
+fn project_sync_record_from_value(value: &serde_json::Value) -> Result<ProjectSyncRecord> {
     Ok(ProjectSyncRecord {
         id: json_string_field(value, "id")?,
         name: json_string_field(value, "name")?,
@@ -6907,7 +6772,7 @@ struct MemoryEmbeddingSyncRecord {
 
 fn memory_embedding_sync_record_from_value(
     value: &serde_json::Value,
-) -> Result<MemoryEmbeddingSyncRecord, String> {
+) -> Result<MemoryEmbeddingSyncRecord> {
     Ok(MemoryEmbeddingSyncRecord {
         memory_id: json_string_field(value, "memory_id")?,
         model: json_string_field(value, "model")?,
@@ -6916,7 +6781,7 @@ fn memory_embedding_sync_record_from_value(
     })
 }
 
-fn memory_sync_record_from_value(value: &serde_json::Value) -> Result<MemorySyncRecord, String> {
+fn memory_sync_record_from_value(value: &serde_json::Value) -> Result<MemorySyncRecord> {
     Ok(MemorySyncRecord {
         id: json_string_field(value, "id")?,
         created_at_ms: json_i64_field(value, "created_at_ms")?,
@@ -6939,7 +6804,7 @@ struct SourceSyncRecord {
     created_at_ms: i64,
 }
 
-fn source_sync_record_from_value(value: &serde_json::Value) -> Result<SourceSyncRecord, String> {
+fn source_sync_record_from_value(value: &serde_json::Value) -> Result<SourceSyncRecord> {
     Ok(SourceSyncRecord {
         id: json_string_field(value, "id")?,
         kind: json_string_field(value, "kind")?,
@@ -6960,7 +6825,7 @@ struct DiscoveredFileSyncRecord {
 
 fn discovered_file_sync_record_from_value(
     value: &serde_json::Value,
-) -> Result<DiscoveredFileSyncRecord, String> {
+) -> Result<DiscoveredFileSyncRecord> {
     Ok(DiscoveredFileSyncRecord {
         project_id: json_string_field(value, "project_id")?,
         path: json_string_field(value, "path")?,
@@ -6980,7 +6845,7 @@ struct EntitySyncRecord {
     created_at_ms: i64,
 }
 
-fn entity_sync_record_from_value(value: &serde_json::Value) -> Result<EntitySyncRecord, String> {
+fn entity_sync_record_from_value(value: &serde_json::Value) -> Result<EntitySyncRecord> {
     Ok(EntitySyncRecord {
         id: json_string_field(value, "id")?,
         kind: json_string_field(value, "kind")?,
@@ -7003,9 +6868,7 @@ struct CodeSymbolSyncRecord {
     indexed_at_ms: i64,
 }
 
-fn code_symbol_sync_record_from_value(
-    value: &serde_json::Value,
-) -> Result<CodeSymbolSyncRecord, String> {
+fn code_symbol_sync_record_from_value(value: &serde_json::Value) -> Result<CodeSymbolSyncRecord> {
     Ok(CodeSymbolSyncRecord {
         project_id: json_string_field(value, "project_id")?,
         path: json_string_field(value, "path")?,
@@ -7028,7 +6891,7 @@ struct EdgeSyncRecord {
     created_at_ms: i64,
 }
 
-fn edge_sync_record_from_value(value: &serde_json::Value) -> Result<EdgeSyncRecord, String> {
+fn edge_sync_record_from_value(value: &serde_json::Value) -> Result<EdgeSyncRecord> {
     Ok(EdgeSyncRecord {
         id: json_string_field(value, "id")?,
         from_id: json_string_field(value, "from_id")?,
@@ -7059,9 +6922,7 @@ struct EditFreshnessEvent {
     created_at_ms: i64,
 }
 
-fn diagnostic_sync_record_from_value(
-    value: &serde_json::Value,
-) -> Result<DiagnosticSyncRecord, String> {
+fn diagnostic_sync_record_from_value(value: &serde_json::Value) -> Result<DiagnosticSyncRecord> {
     Ok(DiagnosticSyncRecord {
         id: json_string_field(value, "id")?,
         project_id: json_string_field(value, "project_id")?,
@@ -7114,7 +6975,7 @@ struct SourceEmbeddingSyncRecord {
 
 fn code_reference_sync_record_from_value(
     value: &serde_json::Value,
-) -> Result<CodeReferenceSyncRecord, String> {
+) -> Result<CodeReferenceSyncRecord> {
     Ok(CodeReferenceSyncRecord {
         project_id: json_string_field(value, "project_id")?,
         path: json_string_field(value, "path")?,
@@ -7129,9 +6990,7 @@ fn code_reference_sync_record_from_value(
     })
 }
 
-fn test_mapping_sync_record_from_value(
-    value: &serde_json::Value,
-) -> Result<TestMappingSyncRecord, String> {
+fn test_mapping_sync_record_from_value(value: &serde_json::Value) -> Result<TestMappingSyncRecord> {
     Ok(TestMappingSyncRecord {
         project_id: json_string_field(value, "project_id")?,
         source_path: json_string_field(value, "source_path")?,
@@ -7144,7 +7003,7 @@ fn test_mapping_sync_record_from_value(
 
 fn source_embedding_sync_record_from_value(
     value: &serde_json::Value,
-) -> Result<SourceEmbeddingSyncRecord, String> {
+) -> Result<SourceEmbeddingSyncRecord> {
     Ok(SourceEmbeddingSyncRecord {
         project_id: json_string_field(value, "project_id")?,
         path: json_string_field(value, "path")?,
@@ -7167,7 +7026,7 @@ struct SessionSyncRecord {
     final_summary: Option<String>,
 }
 
-fn session_sync_record_from_value(value: &serde_json::Value) -> Result<SessionSyncRecord, String> {
+fn session_sync_record_from_value(value: &serde_json::Value) -> Result<SessionSyncRecord> {
     Ok(SessionSyncRecord {
         id: json_string_field(value, "id")?,
         project_id: json_string_field(value, "project_id")?,
@@ -7189,9 +7048,7 @@ struct ContextPackSyncRecord {
     updated_at_ms: i64,
 }
 
-fn context_pack_sync_record_from_value(
-    value: &serde_json::Value,
-) -> Result<ContextPackSyncRecord, String> {
+fn context_pack_sync_record_from_value(value: &serde_json::Value) -> Result<ContextPackSyncRecord> {
     Ok(ContextPackSyncRecord {
         id: json_string_field(value, "id")?,
         project_id: json_string_field(value, "project_id")?,
@@ -7220,7 +7077,7 @@ struct SessionPromotionSyncRecord {
 
 fn session_event_sync_record_from_value(
     value: &serde_json::Value,
-) -> Result<SessionEventSyncRecord, String> {
+) -> Result<SessionEventSyncRecord> {
     Ok(SessionEventSyncRecord {
         id: json_string_field(value, "id")?,
         session_id: json_string_field(value, "session_id")?,
@@ -7232,7 +7089,7 @@ fn session_event_sync_record_from_value(
 
 fn session_promotion_sync_record_from_value(
     value: &serde_json::Value,
-) -> Result<SessionPromotionSyncRecord, String> {
+) -> Result<SessionPromotionSyncRecord> {
     Ok(SessionPromotionSyncRecord {
         session_id: json_string_field(value, "session_id")?,
         memory_id: json_string_field(value, "memory_id")?,
@@ -7243,7 +7100,7 @@ fn session_promotion_sync_record_from_value(
 async fn apply_api_push_project_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Projects;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7274,8 +7131,7 @@ async fn apply_api_push_project_records(
                     record.updated_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -7285,7 +7141,7 @@ async fn apply_api_push_project_records(
 async fn apply_api_pull_project_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Projects;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7317,8 +7173,7 @@ async fn apply_api_pull_project_records(
                     record.updated_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_newer_or_equal");
         } else {
@@ -7332,7 +7187,7 @@ async fn apply_api_pull_project_records(
 async fn apply_api_push_memory_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Memories;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7371,8 +7226,7 @@ async fn apply_api_push_memory_records(
                     record.structured_payload
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -7382,7 +7236,7 @@ async fn apply_api_push_memory_records(
 async fn apply_api_pull_memory_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Memories;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7416,8 +7270,7 @@ async fn apply_api_pull_memory_records(
                     record.structured_payload
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_preserved");
         } else {
@@ -7431,7 +7284,7 @@ async fn apply_api_pull_memory_records(
 async fn apply_api_push_memory_embedding_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::MemoryEmbeddings;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7459,8 +7312,7 @@ async fn apply_api_push_memory_embedding_records(
                     record.embedding
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -7470,7 +7322,7 @@ async fn apply_api_push_memory_embedding_records(
 async fn apply_api_pull_memory_embedding_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::MemoryEmbeddings;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7494,8 +7346,7 @@ async fn apply_api_pull_memory_embedding_records(
                     record.embedding
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_preserved");
         } else {
@@ -7509,7 +7360,7 @@ async fn apply_api_pull_memory_embedding_records(
 async fn apply_api_push_source_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Sources;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7528,8 +7379,7 @@ async fn apply_api_push_source_records(
                 ",
                 params![record.id, record.kind, record.locator, record.created_at_ms],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -7539,7 +7389,7 @@ async fn apply_api_push_source_records(
 async fn apply_api_pull_source_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Sources;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7554,8 +7404,7 @@ async fn apply_api_pull_source_records(
                 ",
                 params![record.id, record.kind, record.locator, record.created_at_ms],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_preserved");
         } else {
@@ -7569,7 +7418,7 @@ async fn apply_api_pull_source_records(
 async fn apply_api_push_discovered_file_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::DiscoveredFiles;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7597,8 +7446,7 @@ async fn apply_api_push_discovered_file_records(
                     record.updated_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -7608,7 +7456,7 @@ async fn apply_api_push_discovered_file_records(
 async fn apply_api_pull_discovered_file_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::DiscoveredFiles;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7637,8 +7485,7 @@ async fn apply_api_pull_discovered_file_records(
                     record.updated_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_newer_or_equal");
         } else {
@@ -7652,7 +7499,7 @@ async fn apply_api_pull_discovered_file_records(
 async fn apply_api_push_entity_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Entities;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7678,8 +7525,7 @@ async fn apply_api_push_entity_records(
                     record.created_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -7689,7 +7535,7 @@ async fn apply_api_push_entity_records(
 async fn apply_api_pull_entity_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Entities;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7710,8 +7556,7 @@ async fn apply_api_pull_entity_records(
                     record.created_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_preserved");
         } else {
@@ -7725,7 +7570,7 @@ async fn apply_api_pull_entity_records(
 async fn apply_api_push_code_symbol_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::CodeSymbols;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7758,8 +7603,7 @@ async fn apply_api_push_code_symbol_records(
                     record.indexed_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -7769,7 +7613,7 @@ async fn apply_api_push_code_symbol_records(
 async fn apply_api_pull_code_symbol_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::CodeSymbols;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7803,8 +7647,7 @@ async fn apply_api_pull_code_symbol_records(
                     record.indexed_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_newer_or_equal");
         } else {
@@ -7818,7 +7661,7 @@ async fn apply_api_pull_code_symbol_records(
 async fn apply_api_push_edge_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Edges;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7844,8 +7687,7 @@ async fn apply_api_push_edge_records(
                     record.created_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -7855,7 +7697,7 @@ async fn apply_api_push_edge_records(
 async fn apply_api_pull_edge_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Edges;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7876,8 +7718,7 @@ async fn apply_api_pull_edge_records(
                     record.created_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_preserved");
         } else {
@@ -7891,7 +7732,7 @@ async fn apply_api_pull_edge_records(
 async fn apply_api_push_code_reference_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::CodeReferences;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7926,8 +7767,7 @@ async fn apply_api_push_code_reference_records(
                     record.indexed_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -7937,7 +7777,7 @@ async fn apply_api_push_code_reference_records(
 async fn apply_api_pull_code_reference_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::CodeReferences;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -7973,8 +7813,7 @@ async fn apply_api_pull_code_reference_records(
                     record.indexed_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_newer_or_equal");
         } else {
@@ -7988,7 +7827,7 @@ async fn apply_api_pull_code_reference_records(
 async fn apply_api_push_test_mapping_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::TestMappings;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -8016,8 +7855,7 @@ async fn apply_api_push_test_mapping_records(
                     record.updated_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -8027,7 +7865,7 @@ async fn apply_api_push_test_mapping_records(
 async fn apply_api_pull_test_mapping_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::TestMappings;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -8056,8 +7894,7 @@ async fn apply_api_pull_test_mapping_records(
                     record.updated_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_newer_or_equal");
         } else {
@@ -8071,7 +7908,7 @@ async fn apply_api_pull_test_mapping_records(
 async fn apply_api_push_source_embedding_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::SourceEmbeddings;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -8102,8 +7939,7 @@ async fn apply_api_push_source_embedding_records(
                     record.updated_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -8113,7 +7949,7 @@ async fn apply_api_push_source_embedding_records(
 async fn apply_api_pull_source_embedding_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::SourceEmbeddings;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -8145,8 +7981,7 @@ async fn apply_api_pull_source_embedding_records(
                     record.updated_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_newer_or_equal");
         } else {
@@ -8160,7 +7995,7 @@ async fn apply_api_pull_source_embedding_records(
 async fn apply_api_push_session_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Sessions;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -8192,8 +8027,7 @@ async fn apply_api_push_session_records(
                     record.final_summary
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -8203,7 +8037,7 @@ async fn apply_api_push_session_records(
 async fn apply_api_pull_session_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Sessions;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -8237,8 +8071,7 @@ async fn apply_api_pull_session_records(
                     record.final_summary
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_newer_or_equal");
         } else {
@@ -8252,7 +8085,7 @@ async fn apply_api_pull_session_records(
 async fn apply_api_push_context_pack_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::ContextPacks;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -8281,8 +8114,7 @@ async fn apply_api_push_context_pack_records(
                     record.updated_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -8292,7 +8124,7 @@ async fn apply_api_push_context_pack_records(
 async fn apply_api_pull_context_pack_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::ContextPacks;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -8322,8 +8154,7 @@ async fn apply_api_pull_context_pack_records(
                     record.updated_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_newer_or_equal");
         } else {
@@ -8337,7 +8168,7 @@ async fn apply_api_pull_context_pack_records(
 async fn apply_api_push_diagnostic_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Diagnostics;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -8354,7 +8185,7 @@ async fn apply_api_push_diagnostic_records(
 async fn apply_api_pull_diagnostic_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Diagnostics;
     let before_count = table_row_count(conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -8384,8 +8215,7 @@ async fn apply_api_pull_diagnostic_records(
                     record.created_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_preserved");
         } else {
@@ -8399,7 +8229,7 @@ async fn apply_api_pull_diagnostic_records(
 async fn apply_api_pull_payloads(
     conn: &Connection,
     payloads: &[SyncApiTablePayload],
-) -> Result<Vec<SyncTableResult>, String> {
+) -> Result<Vec<SyncTableResult>> {
     let mut results = Vec::new();
     for payload in payloads {
         match SyncTableKind::from_table_name(&payload.result.table) {
@@ -8456,7 +8286,7 @@ async fn apply_api_pull_payloads(
 async fn apply_api_storage_session_event_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let before_count = table_row_count(conn, "session_events").await?;
     let mut stats = SyncApplyStats::default();
 
@@ -8482,8 +8312,7 @@ async fn apply_api_storage_session_event_records(
                     record.created_at_ms
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_preserved");
         } else {
@@ -8504,7 +8333,7 @@ async fn apply_api_storage_session_event_records(
 async fn apply_api_storage_session_promotion_records(
     conn: &Connection,
     records: &[serde_json::Value],
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let before_count = table_row_count(conn, "session_promotions").await?;
     let mut stats = SyncApplyStats::default();
 
@@ -8528,8 +8357,7 @@ async fn apply_api_storage_session_promotion_records(
                 ",
                 params![record.session_id, record.memory_id, record.promoted_at_ms],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_preserved");
         } else {
@@ -8547,7 +8375,7 @@ async fn apply_api_storage_session_promotion_records(
     .await
 }
 
-async fn delete_code_index_paths(conn: &Connection, paths: &[String]) -> Result<(), String> {
+async fn delete_code_index_paths(conn: &Connection, paths: &[String]) -> Result<()> {
     let mut normalized_paths = paths
         .iter()
         .map(|path| normalize_target(path))
@@ -8564,8 +8392,7 @@ async fn delete_code_index_paths(conn: &Connection, paths: &[String]) -> Result<
             ",
             params![LOCAL_PROJECT_ID, path.clone()],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
         conn.execute(
             "
             DELETE FROM code_references
@@ -8573,8 +8400,7 @@ async fn delete_code_index_paths(conn: &Connection, paths: &[String]) -> Result<
             ",
             params![LOCAL_PROJECT_ID, path.clone()],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
         conn.execute(
             "
             DELETE FROM test_mappings
@@ -8582,8 +8408,7 @@ async fn delete_code_index_paths(conn: &Connection, paths: &[String]) -> Result<
             ",
             params![LOCAL_PROJECT_ID, path.clone()],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
         conn.execute(
             "
             DELETE FROM source_embeddings
@@ -8591,8 +8416,7 @@ async fn delete_code_index_paths(conn: &Connection, paths: &[String]) -> Result<
             ",
             params![LOCAL_PROJECT_ID, path],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     }
     Ok(())
 }
@@ -8605,8 +8429,8 @@ struct SyncApplyStats {
 }
 
 impl SyncApplyStats {
-    fn record_affected(&mut self, affected: u64) -> Result<(), String> {
-        self.affected_count += usize::try_from(affected).map_err(|error| error.to_string())?;
+    fn record_affected(&mut self, affected: u64) -> Result<()> {
+        self.affected_count += usize::try_from(affected)?;
         Ok(())
     }
 
@@ -8666,33 +8490,23 @@ fn planned_sync_table_result(table: SyncTableKind, row_count: usize) -> SyncTabl
     }
 }
 
-async fn table_row_count(conn: &Connection, table_name: &str) -> Result<usize, String> {
+async fn table_row_count(conn: &Connection, table_name: &str) -> Result<usize> {
     let sql = format!("SELECT COUNT(*) FROM {table_name}");
-    let mut rows = conn
-        .query(&sql, ())
-        .await
-        .map_err(|error| error.to_string())?;
-    let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+    let mut rows = conn.query(&sql, ()).await?;
+    let Some(row) = rows.next().await? else {
         return Ok(0);
     };
-    let count = row.get::<i64>(0).map_err(|error| error.to_string())?;
-    usize::try_from(count).map_err(|error| error.to_string())
+    let count = row.get::<i64>(0)?;
+    usize::try_from(count).map_err(Error::from)
 }
 
-async fn table_count_where(
-    conn: &Connection,
-    table_name: &str,
-    predicate: &str,
-) -> Result<usize, String> {
+async fn table_count_where(conn: &Connection, table_name: &str, predicate: &str) -> Result<usize> {
     let sql = format!("SELECT COUNT(*) FROM {table_name} WHERE {predicate}");
-    let mut rows = conn
-        .query(&sql, ())
-        .await
-        .map_err(|error| error.to_string())?;
-    let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+    let mut rows = conn.query(&sql, ()).await?;
+    let Some(row) = rows.next().await? else {
         return Ok(0);
     };
-    usize_from_i64(row.get::<i64>(0).map_err(|error| error.to_string())?)
+    usize_from_i64(row.get::<i64>(0)?)
 }
 
 async fn insert_memory(
@@ -8702,7 +8516,7 @@ async fn insert_memory(
     confidence: f64,
     sensitivity: String,
     structured_payload: Option<String>,
-) -> Result<Memory, String> {
+) -> Result<Memory> {
     let created_at_ms = now_ms()?;
     let memory = Memory {
         id: format!("mem_{created_at_ms}"),
@@ -8735,12 +8549,10 @@ async fn insert_memory(
             memory.structured_payload.clone()
         ],
     )
-    .await
-    .map_err(|error| error.to_string())?;
+    .await?;
 
     let embedding = embedding_provider.embed(&memory.text)?;
-    let embedding_dimensions =
-        i64::try_from(embedding.dimensions()).map_err(|error| error.to_string())?;
+    let embedding_dimensions = i64::try_from(embedding.dimensions())?;
     let embedding_vector = embedding.to_vector_literal();
     conn.execute(
         "INSERT INTO memory_embeddings (memory_id, model, dimensions, embedding) VALUES (?1, ?2, ?3, vector(?4))",
@@ -8752,12 +8564,12 @@ async fn insert_memory(
         ],
     )
     .await
-    .map_err(|error| error.to_string())?;
+    ?;
 
     Ok(memory)
 }
 
-async fn active_memories(conn: &Connection) -> Result<Vec<Memory>, String> {
+async fn active_memories(conn: &Connection) -> Result<Vec<Memory>> {
     let mut rows = conn
         .query(
             "
@@ -8768,26 +8580,23 @@ async fn active_memories(conn: &Connection) -> Result<Vec<Memory>, String> {
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut memories = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         memories.push(memory_from_row(&row)?);
     }
 
     Ok(memories)
 }
 
-fn memory_from_row(row: &Row) -> Result<Memory, String> {
+fn memory_from_row(row: &Row) -> Result<Memory> {
     Ok(Memory {
-        id: row.get::<String>(0).map_err(|error| error.to_string())?,
-        created_at_ms: row.get::<i64>(1).map_err(|error| error.to_string())?,
-        kind: row.get::<String>(2).map_err(|error| error.to_string())?,
-        text: row.get::<String>(3).map_err(|error| error.to_string())?,
-        structured_payload: row
-            .get::<Option<String>>(4)
-            .map_err(|error| error.to_string())?,
+        id: row.get::<String>(0)?,
+        created_at_ms: row.get::<i64>(1)?,
+        kind: row.get::<String>(2)?,
+        text: row.get::<String>(3)?,
+        structured_payload: row.get::<Option<String>>(4)?,
     })
 }
 
@@ -8927,7 +8736,7 @@ async fn finish_sync_table_result(
     table: SyncTableKind,
     before_count: usize,
     stats: SyncApplyStats,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let after_count = table_row_count(conn, table.table_name()).await?;
     Ok(stats.into_result(table, after_count, before_count, after_count, true))
 }
@@ -8938,7 +8747,7 @@ async fn finish_storage_table_result(
     table: &str,
     before_count: usize,
     stats: SyncApplyStats,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let after_count = table_row_count(conn, table).await?;
     let inserted_count = after_count.saturating_sub(before_count);
     let updated_count = stats.affected_count.saturating_sub(inserted_count);
@@ -8956,7 +8765,7 @@ async fn finish_storage_table_result(
     })
 }
 
-async fn sync_run_tables(conn: &Connection, run_id: &str) -> Result<Vec<SyncTableResult>, String> {
+async fn sync_run_tables(conn: &Connection, run_id: &str) -> Result<Vec<SyncTableResult>> {
     let mut rows = conn
         .query(
             "
@@ -8969,22 +8778,21 @@ async fn sync_run_tables(conn: &Connection, run_id: &str) -> Result<Vec<SyncTabl
             ",
             params![run_id.to_string()],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut tables = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        let table = row.get::<String>(1).map_err(|error| error.to_string())?;
+    while let Some(row) = rows.next().await? {
+        let table = row.get::<String>(1)?;
         tables.push(SyncTableResult {
-            class: row.get::<String>(0).map_err(|error| error.to_string())?,
+            class: row.get::<String>(0)?,
             conflicts: sync_table_conflicts(conn, run_id, &table).await?,
             table,
-            row_count: usize_from_i64(row.get::<i64>(2).map_err(|error| error.to_string())?)?,
-            inserted_count: usize_from_i64(row.get::<i64>(3).map_err(|error| error.to_string())?)?,
-            updated_count: usize_from_i64(row.get::<i64>(4).map_err(|error| error.to_string())?)?,
-            skipped_count: usize_from_i64(row.get::<i64>(5).map_err(|error| error.to_string())?)?,
-            conflict_count: usize_from_i64(row.get::<i64>(6).map_err(|error| error.to_string())?)?,
-            executed: row.get::<i64>(7).map_err(|error| error.to_string())? != 0,
+            row_count: usize_from_i64(row.get::<i64>(2)?)?,
+            inserted_count: usize_from_i64(row.get::<i64>(3)?)?,
+            updated_count: usize_from_i64(row.get::<i64>(4)?)?,
+            skipped_count: usize_from_i64(row.get::<i64>(5)?)?,
+            conflict_count: usize_from_i64(row.get::<i64>(6)?)?,
+            executed: row.get::<i64>(7)? != 0,
         });
     }
 
@@ -8995,7 +8803,7 @@ async fn sync_table_conflicts(
     conn: &Connection,
     run_id: &str,
     table: &str,
-) -> Result<Vec<SyncConflictSummary>, String> {
+) -> Result<Vec<SyncConflictSummary>> {
     let mut rows = conn
         .query(
             "
@@ -9006,59 +8814,56 @@ async fn sync_table_conflicts(
             ",
             params![run_id.to_string(), table.to_string()],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut conflicts = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         conflicts.push(SyncConflictSummary {
-            reason: row.get::<String>(0).map_err(|error| error.to_string())?,
-            count: usize_from_i64(row.get::<i64>(1).map_err(|error| error.to_string())?)?,
+            reason: row.get::<String>(0)?,
+            count: usize_from_i64(row.get::<i64>(1)?)?,
         });
     }
 
     Ok(conflicts)
 }
 
-fn usize_from_i64(value: i64) -> Result<usize, String> {
-    usize::try_from(value).map_err(|error| error.to_string())
+fn usize_from_i64(value: i64) -> Result<usize> {
+    usize::try_from(value).map_err(Error::from)
 }
 
-async fn memory_exists(conn: &Connection, memory_id: &str) -> Result<bool, String> {
+async fn memory_exists(conn: &Connection, memory_id: &str) -> Result<bool> {
     let mut rows = conn
         .query(
             "SELECT 1 FROM memories WHERE id = ?1 LIMIT 1",
             params![memory_id.to_string()],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
     rows.next()
         .await
         .map(|row| row.is_some())
-        .map_err(|error| error.to_string())
+        .map_err(Error::from)
 }
 
-async fn session_exists(conn: &Connection, session_id: &str) -> Result<bool, String> {
+async fn session_exists(conn: &Connection, session_id: &str) -> Result<bool> {
     let mut rows = conn
         .query(
             "SELECT 1 FROM sessions WHERE id = ?1 LIMIT 1",
             params![session_id.to_string()],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
     rows.next()
         .await
         .map(|row| row.is_some())
-        .map_err(|error| error.to_string())
+        .map_err(Error::from)
 }
 
 async fn copy_sync_table(
     local_conn: &Connection,
     remote_conn: &Connection,
     table: SyncTableKind,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     match table {
         SyncTableKind::Projects => copy_projects(local_conn, remote_conn).await,
         SyncTableKind::Memories => copy_memories(local_conn, remote_conn).await,
@@ -9081,7 +8886,7 @@ async fn copy_pull_table(
     remote_conn: &Connection,
     local_conn: &Connection,
     table: SyncTableKind,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     match table {
         SyncTableKind::Projects => pull_projects(remote_conn, local_conn).await,
         SyncTableKind::Memories => pull_memories(remote_conn, local_conn).await,
@@ -9103,7 +8908,7 @@ async fn copy_pull_table(
 async fn copy_projects(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Projects;
     let before_count = table_row_count(remote_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -9115,10 +8920,9 @@ async fn copy_projects(
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = remote_conn
             .execute(
                 "
@@ -9134,19 +8938,16 @@ async fn copy_projects(
                     updated_at_ms = excluded.updated_at_ms
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(3)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(4)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<i64>(5).map_err(|error| error.to_string())?,
-                    row.get::<i64>(6).map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<Option<String>>(3)?,
+                    row.get::<Option<String>>(4)?,
+                    row.get::<i64>(5)?,
+                    row.get::<i64>(6)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -9156,7 +8957,7 @@ async fn copy_projects(
 async fn copy_memories(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Memories;
     let before_count = table_row_count(remote_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -9170,10 +8971,9 @@ async fn copy_memories(
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = remote_conn
             .execute(
                 "
@@ -9194,24 +8994,19 @@ async fn copy_memories(
                     structured_payload = excluded.structured_payload
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<i64>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<String>(3).map_err(|error| error.to_string())?,
-                    row.get::<f64>(4).map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(5)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(6)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(7)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<String>(8).map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(9)
-                        .map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<i64>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<String>(3)?,
+                    row.get::<f64>(4)?,
+                    row.get::<Option<String>>(5)?,
+                    row.get::<Option<String>>(6)?,
+                    row.get::<Option<String>>(7)?,
+                    row.get::<String>(8)?,
+                    row.get::<Option<String>>(9)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -9221,7 +9016,7 @@ async fn copy_memories(
 async fn copy_memory_embeddings(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::MemoryEmbeddings;
     let before_count = table_row_count(remote_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -9230,11 +9025,10 @@ async fn copy_memory_embeddings(
             "SELECT memory_id, model, dimensions, embedding FROM memory_embeddings",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        let memory_id = row.get::<String>(0).map_err(|error| error.to_string())?;
+    while let Some(row) = rows.next().await? {
+        let memory_id = row.get::<String>(0)?;
         if !memory_exists(remote_conn, &memory_id).await? {
             stats.record_skip("missing_memory");
             continue;
@@ -9251,13 +9045,12 @@ async fn copy_memory_embeddings(
                 ",
                 params![
                     memory_id,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<i64>(2).map_err(|error| error.to_string())?,
-                    row.get::<Vec<u8>>(3).map_err(|error| error.to_string())?,
+                    row.get::<String>(1)?,
+                    row.get::<i64>(2)?,
+                    row.get::<Vec<u8>>(3)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -9267,16 +9060,15 @@ async fn copy_memory_embeddings(
 async fn copy_sources(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Sources;
     let before_count = table_row_count(remote_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
     let mut rows = local_conn
         .query("SELECT id, kind, locator, created_at_ms FROM sources", ())
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = remote_conn
             .execute(
                 "
@@ -9288,14 +9080,13 @@ async fn copy_sources(
                     created_at_ms = excluded.created_at_ms
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<i64>(3).map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<i64>(3)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -9305,7 +9096,7 @@ async fn copy_sources(
 async fn copy_discovered_files(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::DiscoveredFiles;
     let before_count = table_row_count(remote_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -9317,10 +9108,9 @@ async fn copy_discovered_files(
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = remote_conn
             .execute(
                 "
@@ -9334,18 +9124,15 @@ async fn copy_discovered_files(
                     updated_at_ms = excluded.updated_at_ms
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(2)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<Option<i64>>(3)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<i64>(4).map_err(|error| error.to_string())?,
-                    row.get::<i64>(5).map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<Option<String>>(2)?,
+                    row.get::<Option<i64>>(3)?,
+                    row.get::<i64>(4)?,
+                    row.get::<i64>(5)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -9355,7 +9142,7 @@ async fn copy_discovered_files(
 async fn copy_entities(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Entities;
     let before_count = table_row_count(remote_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -9364,10 +9151,9 @@ async fn copy_entities(
             "SELECT id, kind, name, locator, created_at_ms FROM entities",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = remote_conn
             .execute(
                 "
@@ -9380,16 +9166,14 @@ async fn copy_entities(
                     created_at_ms = excluded.created_at_ms
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(3)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<i64>(4).map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<Option<String>>(3)?,
+                    row.get::<i64>(4)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -9399,7 +9183,7 @@ async fn copy_entities(
 async fn copy_code_symbols(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::CodeSymbols;
     let before_count = table_row_count(remote_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -9413,10 +9197,9 @@ async fn copy_code_symbols(
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = remote_conn
             .execute(
                 "
@@ -9432,31 +9215,25 @@ async fn copy_code_symbols(
                     indexed_at_ms = excluded.indexed_at_ms
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<String>(3).map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(4)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<i64>(5).map_err(|error| error.to_string())?,
-                    row.get::<Option<i64>>(6)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<String>(7).map_err(|error| error.to_string())?,
-                    row.get::<i64>(8).map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<String>(3)?,
+                    row.get::<Option<String>>(4)?,
+                    row.get::<i64>(5)?,
+                    row.get::<Option<i64>>(6)?,
+                    row.get::<String>(7)?,
+                    row.get::<i64>(8)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
     finish_sync_table_result(remote_conn, table, before_count, stats).await
 }
 
-async fn copy_edges(
-    local_conn: &Connection,
-    remote_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+async fn copy_edges(local_conn: &Connection, remote_conn: &Connection) -> Result<SyncTableResult> {
     let table = SyncTableKind::Edges;
     let before_count = table_row_count(remote_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -9465,10 +9242,9 @@ async fn copy_edges(
             "SELECT id, from_id, to_id, kind, created_at_ms FROM edges",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = remote_conn
             .execute(
                 "
@@ -9481,15 +9257,14 @@ async fn copy_edges(
                     created_at_ms = excluded.created_at_ms
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<String>(3).map_err(|error| error.to_string())?,
-                    row.get::<i64>(4).map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<String>(3)?,
+                    row.get::<i64>(4)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -9499,7 +9274,7 @@ async fn copy_edges(
 async fn copy_code_references(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::CodeReferences;
     let before_count = table_row_count(remote_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -9513,10 +9288,9 @@ async fn copy_code_references(
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = remote_conn
             .execute(
                 "
@@ -9533,21 +9307,19 @@ async fn copy_code_references(
                     indexed_at_ms = excluded.indexed_at_ms
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<String>(3).map_err(|error| error.to_string())?,
-                    row.get::<String>(4).map_err(|error| error.to_string())?,
-                    row.get::<String>(5).map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(6)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<i64>(7).map_err(|error| error.to_string())?,
-                    row.get::<String>(8).map_err(|error| error.to_string())?,
-                    row.get::<i64>(9).map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<String>(3)?,
+                    row.get::<String>(4)?,
+                    row.get::<String>(5)?,
+                    row.get::<Option<String>>(6)?,
+                    row.get::<i64>(7)?,
+                    row.get::<String>(8)?,
+                    row.get::<i64>(9)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -9557,7 +9329,7 @@ async fn copy_code_references(
 async fn copy_test_mappings(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let records = test_mapping_sync_records(local_conn).await?;
     apply_api_push_test_mapping_records(remote_conn, &records).await
 }
@@ -9565,7 +9337,7 @@ async fn copy_test_mappings(
 async fn copy_source_embeddings(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let records = source_embedding_sync_records(local_conn).await?;
     apply_api_push_source_embedding_records(remote_conn, &records).await
 }
@@ -9573,7 +9345,7 @@ async fn copy_source_embeddings(
 async fn copy_sessions(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Sessions;
     let before_count = table_row_count(remote_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -9586,10 +9358,9 @@ async fn copy_sessions(
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = remote_conn
             .execute(
                 "
@@ -9606,20 +9377,16 @@ async fn copy_sessions(
                     final_summary = excluded.final_summary
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(3)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<i64>(4).map_err(|error| error.to_string())?,
-                    row.get::<Option<i64>>(5)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(6)
-                        .map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<Option<String>>(3)?,
+                    row.get::<i64>(4)?,
+                    row.get::<Option<i64>>(5)?,
+                    row.get::<Option<String>>(6)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -9629,7 +9396,7 @@ async fn copy_sessions(
 async fn copy_context_packs(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::ContextPacks;
     let before_count = table_row_count(remote_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -9641,10 +9408,9 @@ async fn copy_context_packs(
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = remote_conn
             .execute(
                 "
@@ -9659,16 +9425,15 @@ async fn copy_context_packs(
                     updated_at_ms = excluded.updated_at_ms
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<String>(3).map_err(|error| error.to_string())?,
-                    row.get::<i64>(4).map_err(|error| error.to_string())?,
-                    row.get::<i64>(5).map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<String>(3)?,
+                    row.get::<i64>(4)?,
+                    row.get::<i64>(5)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         stats.record_affected(affected)?;
     }
 
@@ -9678,7 +9443,7 @@ async fn copy_context_packs(
 async fn copy_diagnostics(
     local_conn: &Connection,
     remote_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Diagnostics;
     let before_count = table_row_count(remote_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -9695,7 +9460,7 @@ async fn copy_diagnostics(
 async fn pull_projects(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Projects;
     let before_count = table_row_count(local_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -9707,10 +9472,9 @@ async fn pull_projects(
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = local_conn
             .execute(
                 "
@@ -9727,19 +9491,16 @@ async fn pull_projects(
                 WHERE excluded.updated_at_ms > projects.updated_at_ms
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(3)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(4)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<i64>(5).map_err(|error| error.to_string())?,
-                    row.get::<i64>(6).map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<Option<String>>(3)?,
+                    row.get::<Option<String>>(4)?,
+                    row.get::<i64>(5)?,
+                    row.get::<i64>(6)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_newer_or_equal");
         } else {
@@ -9753,7 +9514,7 @@ async fn pull_projects(
 async fn pull_memories(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Memories;
     let before_count = table_row_count(local_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -9767,10 +9528,9 @@ async fn pull_memories(
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = local_conn
             .execute(
                 "
@@ -9786,24 +9546,19 @@ async fn pull_memories(
                    OR (memories.superseded_by IS NULL AND excluded.superseded_by IS NOT NULL)
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<i64>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<String>(3).map_err(|error| error.to_string())?,
-                    row.get::<f64>(4).map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(5)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(6)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(7)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<String>(8).map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(9)
-                        .map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<i64>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<String>(3)?,
+                    row.get::<f64>(4)?,
+                    row.get::<Option<String>>(5)?,
+                    row.get::<Option<String>>(6)?,
+                    row.get::<Option<String>>(7)?,
+                    row.get::<String>(8)?,
+                    row.get::<Option<String>>(9)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_preserved");
         } else {
@@ -9817,7 +9572,7 @@ async fn pull_memories(
 async fn pull_memory_embeddings(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::MemoryEmbeddings;
     let before_count = table_row_count(local_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -9826,11 +9581,10 @@ async fn pull_memory_embeddings(
             "SELECT memory_id, model, dimensions, embedding FROM memory_embeddings",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        let memory_id = row.get::<String>(0).map_err(|error| error.to_string())?;
+    while let Some(row) = rows.next().await? {
+        let memory_id = row.get::<String>(0)?;
         if !memory_exists(local_conn, &memory_id).await? {
             stats.record_skip("missing_memory");
             continue;
@@ -9843,13 +9597,12 @@ async fn pull_memory_embeddings(
                 ",
                 params![
                     memory_id,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<i64>(2).map_err(|error| error.to_string())?,
-                    row.get::<Vec<u8>>(3).map_err(|error| error.to_string())?,
+                    row.get::<String>(1)?,
+                    row.get::<i64>(2)?,
+                    row.get::<Vec<u8>>(3)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_preserved");
         } else {
@@ -9863,16 +9616,15 @@ async fn pull_memory_embeddings(
 async fn pull_sources(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Sources;
     let before_count = table_row_count(local_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
     let mut rows = remote_conn
         .query("SELECT id, kind, locator, created_at_ms FROM sources", ())
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = local_conn
             .execute(
                 "
@@ -9880,14 +9632,13 @@ async fn pull_sources(
                 VALUES (?1, ?2, ?3, ?4)
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<i64>(3).map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<i64>(3)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_preserved");
         } else {
@@ -9901,7 +9652,7 @@ async fn pull_sources(
 async fn pull_discovered_files(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::DiscoveredFiles;
     let before_count = table_row_count(local_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -9913,10 +9664,9 @@ async fn pull_discovered_files(
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = local_conn
             .execute(
                 "
@@ -9931,18 +9681,15 @@ async fn pull_discovered_files(
                 WHERE excluded.updated_at_ms > discovered_files.updated_at_ms
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(2)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<Option<i64>>(3)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<i64>(4).map_err(|error| error.to_string())?,
-                    row.get::<i64>(5).map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<Option<String>>(2)?,
+                    row.get::<Option<i64>>(3)?,
+                    row.get::<i64>(4)?,
+                    row.get::<i64>(5)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_newer_or_equal");
         } else {
@@ -9956,7 +9703,7 @@ async fn pull_discovered_files(
 async fn pull_entities(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Entities;
     let before_count = table_row_count(local_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -9965,10 +9712,9 @@ async fn pull_entities(
             "SELECT id, kind, name, locator, created_at_ms FROM entities",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = local_conn
             .execute(
                 "
@@ -9976,16 +9722,14 @@ async fn pull_entities(
                 VALUES (?1, ?2, ?3, ?4, ?5)
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(3)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<i64>(4).map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<Option<String>>(3)?,
+                    row.get::<i64>(4)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_preserved");
         } else {
@@ -9999,7 +9743,7 @@ async fn pull_entities(
 async fn pull_code_symbols(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::CodeSymbols;
     let before_count = table_row_count(local_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -10013,10 +9757,9 @@ async fn pull_code_symbols(
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = local_conn
             .execute(
                 "
@@ -10033,21 +9776,18 @@ async fn pull_code_symbols(
                 WHERE excluded.indexed_at_ms > code_symbols.indexed_at_ms
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<String>(3).map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(4)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<i64>(5).map_err(|error| error.to_string())?,
-                    row.get::<Option<i64>>(6)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<String>(7).map_err(|error| error.to_string())?,
-                    row.get::<i64>(8).map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<String>(3)?,
+                    row.get::<Option<String>>(4)?,
+                    row.get::<i64>(5)?,
+                    row.get::<Option<i64>>(6)?,
+                    row.get::<String>(7)?,
+                    row.get::<i64>(8)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_newer_or_equal");
         } else {
@@ -10058,10 +9798,7 @@ async fn pull_code_symbols(
     finish_sync_table_result(local_conn, table, before_count, stats).await
 }
 
-async fn pull_edges(
-    remote_conn: &Connection,
-    local_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+async fn pull_edges(remote_conn: &Connection, local_conn: &Connection) -> Result<SyncTableResult> {
     let table = SyncTableKind::Edges;
     let before_count = table_row_count(local_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -10070,10 +9807,9 @@ async fn pull_edges(
             "SELECT id, from_id, to_id, kind, created_at_ms FROM edges",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = local_conn
             .execute(
                 "
@@ -10081,15 +9817,14 @@ async fn pull_edges(
                 VALUES (?1, ?2, ?3, ?4, ?5)
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<String>(3).map_err(|error| error.to_string())?,
-                    row.get::<i64>(4).map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<String>(3)?,
+                    row.get::<i64>(4)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_preserved");
         } else {
@@ -10103,7 +9838,7 @@ async fn pull_edges(
 async fn pull_code_references(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::CodeReferences;
     let before_count = table_row_count(local_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -10117,10 +9852,9 @@ async fn pull_code_references(
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = local_conn
             .execute(
                 "
@@ -10138,21 +9872,19 @@ async fn pull_code_references(
                 WHERE excluded.indexed_at_ms > code_references.indexed_at_ms
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<String>(3).map_err(|error| error.to_string())?,
-                    row.get::<String>(4).map_err(|error| error.to_string())?,
-                    row.get::<String>(5).map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(6)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<i64>(7).map_err(|error| error.to_string())?,
-                    row.get::<String>(8).map_err(|error| error.to_string())?,
-                    row.get::<i64>(9).map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<String>(3)?,
+                    row.get::<String>(4)?,
+                    row.get::<String>(5)?,
+                    row.get::<Option<String>>(6)?,
+                    row.get::<i64>(7)?,
+                    row.get::<String>(8)?,
+                    row.get::<i64>(9)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_newer_or_equal");
         } else {
@@ -10166,7 +9898,7 @@ async fn pull_code_references(
 async fn pull_test_mappings(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let records = test_mapping_sync_records(remote_conn).await?;
     apply_api_pull_test_mapping_records(local_conn, &records).await
 }
@@ -10174,7 +9906,7 @@ async fn pull_test_mappings(
 async fn pull_source_embeddings(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let records = source_embedding_sync_records(remote_conn).await?;
     apply_api_pull_source_embedding_records(local_conn, &records).await
 }
@@ -10182,7 +9914,7 @@ async fn pull_source_embeddings(
 async fn pull_sessions(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::Sessions;
     let before_count = table_row_count(local_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -10195,10 +9927,9 @@ async fn pull_sessions(
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = local_conn
             .execute(
                 "
@@ -10217,20 +9948,16 @@ async fn pull_sessions(
                    OR excluded.ended_at_ms > sessions.ended_at_ms
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(3)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<i64>(4).map_err(|error| error.to_string())?,
-                    row.get::<Option<i64>>(5)
-                        .map_err(|error| error.to_string())?,
-                    row.get::<Option<String>>(6)
-                        .map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<Option<String>>(3)?,
+                    row.get::<i64>(4)?,
+                    row.get::<Option<i64>>(5)?,
+                    row.get::<Option<String>>(6)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_newer_or_equal");
         } else {
@@ -10244,7 +9971,7 @@ async fn pull_sessions(
 async fn pull_context_packs(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let table = SyncTableKind::ContextPacks;
     let before_count = table_row_count(local_conn, table.table_name()).await?;
     let mut stats = SyncApplyStats::default();
@@ -10256,10 +9983,9 @@ async fn pull_context_packs(
             ",
             (),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         let affected = local_conn
             .execute(
                 "
@@ -10275,16 +10001,15 @@ async fn pull_context_packs(
                 WHERE excluded.updated_at_ms > context_packs.updated_at_ms
                 ",
                 params![
-                    row.get::<String>(0).map_err(|error| error.to_string())?,
-                    row.get::<String>(1).map_err(|error| error.to_string())?,
-                    row.get::<String>(2).map_err(|error| error.to_string())?,
-                    row.get::<String>(3).map_err(|error| error.to_string())?,
-                    row.get::<i64>(4).map_err(|error| error.to_string())?,
-                    row.get::<i64>(5).map_err(|error| error.to_string())?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<String>(3)?,
+                    row.get::<i64>(4)?,
+                    row.get::<i64>(5)?,
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if affected == 0 {
             stats.record_skip("local_row_newer_or_equal");
         } else {
@@ -10298,21 +10023,21 @@ async fn pull_context_packs(
 async fn pull_diagnostics(
     remote_conn: &Connection,
     local_conn: &Connection,
-) -> Result<SyncTableResult, String> {
+) -> Result<SyncTableResult> {
     let records = diagnostic_sync_records(remote_conn).await?;
     let values = records;
     apply_api_pull_diagnostic_records(local_conn, &values).await
 }
 
 impl StorageMode {
-    fn parse(value: &str) -> Result<Self, String> {
+    fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "local" => Ok(Self::Local),
             "hybrid" => Ok(Self::Hybrid),
             "remote" => Ok(Self::Remote),
-            unknown => Err(format!(
+            unknown => Err(Error::msg(format!(
                 "invalid HUGR_STORAGE_MODE '{unknown}', expected local, hybrid, or remote"
-            )),
+            ))),
         }
     }
 
@@ -10330,13 +10055,13 @@ impl StorageMode {
 }
 
 impl SyncBackend {
-    fn parse(value: &str) -> Result<Self, String> {
+    fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
             "direct" | "direct_libsql" | "libsql" | "turso" => Ok(Self::DirectLibsql),
             "api" | "hugr_api" => Ok(Self::HugrApi),
-            unknown => Err(format!(
+            unknown => Err(Error::msg(format!(
                 "invalid HUGR_SYNC_BACKEND '{unknown}', expected direct_libsql or hugr_api"
-            )),
+            ))),
         }
     }
 
@@ -10360,11 +10085,11 @@ impl StorageConfig {
         }
     }
 
-    fn from_env() -> Result<Self, String> {
+    fn from_env() -> Result<Self> {
         Self::from_lookup(|name| env::var(name).ok())
     }
 
-    fn from_lookup<F>(lookup: F) -> Result<Self, String>
+    fn from_lookup<F>(lookup: F) -> Result<Self>
     where
         F: Fn(&str) -> Option<String>,
     {
@@ -10404,16 +10129,16 @@ impl StorageConfig {
 
         if mode.requires_remote_config() {
             if remote_url.is_none() {
-                return Err(format!(
+                return Err(Error::msg(format!(
                     "HUGR_STORAGE_MODE={} requires HUGR_REMOTE_DATABASE_URL",
                     mode.as_str()
-                ));
+                )));
             }
             if !auth_token_configured {
-                return Err(format!(
+                return Err(Error::msg(format!(
                     "HUGR_STORAGE_MODE={} requires HUGR_REMOTE_AUTH_TOKEN",
                     mode.as_str()
-                ));
+                )));
             }
         }
 
@@ -10523,7 +10248,7 @@ impl StorageConfig {
 }
 
 impl SyncClass {
-    fn parse(value: &str) -> Result<Self, String> {
+    fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
             "memories" => Ok(Self::Memories),
             "sources" => Ok(Self::Sources),
@@ -10537,7 +10262,9 @@ impl SyncClass {
             "raw_command_output" => Ok(Self::RawCommandOutput),
             "secrets" => Ok(Self::Secrets),
             "private_notes" => Ok(Self::PrivateNotes),
-            unknown => Err(format!("invalid HUGR_SYNC_CLASSES value '{unknown}'")),
+            unknown => Err(Error::msg(format!(
+                "invalid HUGR_SYNC_CLASSES value '{unknown}'"
+            ))),
         }
     }
 
@@ -10579,7 +10306,7 @@ fn default_sync_classes() -> Vec<SyncClass> {
     ]
 }
 
-fn parse_sync_classes(value: &str) -> Result<Vec<SyncClass>, String> {
+fn parse_sync_classes(value: &str) -> Result<Vec<SyncClass>> {
     let normalized = value.trim().to_ascii_lowercase();
     if normalized.is_empty() || normalized == "default" {
         return Ok(default_sync_classes());
@@ -10621,7 +10348,7 @@ where
     })
 }
 
-async fn upsert_project(conn: &Connection, project: ProjectInput) -> Result<(), String> {
+async fn upsert_project(conn: &Connection, project: ProjectInput) -> Result<()> {
     let now = now_ms()?;
 
     conn.execute(
@@ -10652,17 +10379,12 @@ async fn upsert_project(conn: &Connection, project: ProjectInput) -> Result<(), 
             now
         ],
     )
-    .await
-    .map_err(|error| error.to_string())?;
+    .await?;
 
     Ok(())
 }
 
-async fn insert_context_pack(
-    conn: &Connection,
-    task: &str,
-    payload_json: &str,
-) -> Result<String, String> {
+async fn insert_context_pack(conn: &Connection, task: &str, payload_json: &str) -> Result<String> {
     let now = now_ms()?;
     let id = format!("ctx_{now}");
     conn.execute(
@@ -10684,12 +10406,11 @@ async fn insert_context_pack(
             now
         ],
     )
-    .await
-    .map_err(|error| error.to_string())?;
+    .await?;
     Ok(id)
 }
 
-async fn project_from_conn(conn: &Connection) -> Result<Option<Project>, String> {
+async fn project_from_conn(conn: &Connection) -> Result<Option<Project>> {
     let mut rows = conn
         .query(
             "
@@ -10700,33 +10421,24 @@ async fn project_from_conn(conn: &Connection) -> Result<Option<Project>, String>
             ",
             params![LOCAL_PROJECT_ID],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+    let Some(row) = rows.next().await? else {
         return Ok(None);
     };
 
     Ok(Some(Project {
-        id: row.get::<String>(0).map_err(|error| error.to_string())?,
-        name: row.get::<String>(1).map_err(|error| error.to_string())?,
-        root_path: row.get::<String>(2).map_err(|error| error.to_string())?,
-        git_remote: row
-            .get::<Option<String>>(3)
-            .map_err(|error| error.to_string())?,
-        default_branch: row
-            .get::<Option<String>>(4)
-            .map_err(|error| error.to_string())?,
-        created_at_ms: row.get::<i64>(5).map_err(|error| error.to_string())?,
-        updated_at_ms: row.get::<i64>(6).map_err(|error| error.to_string())?,
+        id: row.get::<String>(0)?,
+        name: row.get::<String>(1)?,
+        root_path: row.get::<String>(2)?,
+        git_remote: row.get::<Option<String>>(3)?,
+        default_branch: row.get::<Option<String>>(4)?,
+        created_at_ms: row.get::<i64>(5)?,
+        updated_at_ms: row.get::<i64>(6)?,
     }))
 }
 
-async fn insert_code_symbol(
-    conn: &Connection,
-    symbol: &CodeSymbol,
-    now: i64,
-) -> Result<(), String> {
+async fn insert_code_symbol(conn: &Connection, symbol: &CodeSymbol, now: i64) -> Result<()> {
     conn.execute(
         "
         INSERT INTO code_symbols (
@@ -10754,8 +10466,7 @@ async fn insert_code_symbol(
             now
         ],
     )
-    .await
-    .map_err(|error| error.to_string())?;
+    .await?;
     Ok(())
 }
 
@@ -10763,7 +10474,7 @@ async fn insert_code_reference(
     conn: &Connection,
     reference: &CodeReference,
     now: i64,
-) -> Result<(), String> {
+) -> Result<()> {
     conn.execute(
         "
         INSERT INTO code_references (
@@ -10793,39 +10504,32 @@ async fn insert_code_reference(
             now
         ],
     )
-    .await
-    .map_err(|error| error.to_string())?;
+    .await?;
     Ok(())
 }
 
-fn code_symbol_from_row(row: &Row) -> Result<CodeSymbol, String> {
+fn code_symbol_from_row(row: &Row) -> Result<CodeSymbol> {
     Ok(CodeSymbol {
-        path: row.get::<String>(0).map_err(|error| error.to_string())?,
-        language: row
-            .get::<Option<String>>(1)
-            .map_err(|error| error.to_string())?,
-        name: row.get::<String>(2).map_err(|error| error.to_string())?,
-        kind: row.get::<String>(3).map_err(|error| error.to_string())?,
-        line_start: row.get::<i64>(4).map_err(|error| error.to_string())?,
-        line_end: row
-            .get::<Option<i64>>(5)
-            .map_err(|error| error.to_string())?,
-        signature: row.get::<String>(6).map_err(|error| error.to_string())?,
+        path: row.get::<String>(0)?,
+        language: row.get::<Option<String>>(1)?,
+        name: row.get::<String>(2)?,
+        kind: row.get::<String>(3)?,
+        line_start: row.get::<i64>(4)?,
+        line_end: row.get::<Option<i64>>(5)?,
+        signature: row.get::<String>(6)?,
     })
 }
 
-fn code_reference_from_row(row: &Row) -> Result<CodeReference, String> {
+fn code_reference_from_row(row: &Row) -> Result<CodeReference> {
     Ok(CodeReference {
-        path: row.get::<String>(0).map_err(|error| error.to_string())?,
-        language: row
-            .get::<Option<String>>(1)
-            .map_err(|error| error.to_string())?,
-        target_path: row.get::<String>(2).map_err(|error| error.to_string())?,
-        target_name: row.get::<String>(3).map_err(|error| error.to_string())?,
-        target_kind: row.get::<String>(4).map_err(|error| error.to_string())?,
-        kind: row.get::<String>(5).map_err(|error| error.to_string())?,
-        line_start: row.get::<i64>(6).map_err(|error| error.to_string())?,
-        excerpt: row.get::<String>(7).map_err(|error| error.to_string())?,
+        path: row.get::<String>(0)?,
+        language: row.get::<Option<String>>(1)?,
+        target_path: row.get::<String>(2)?,
+        target_name: row.get::<String>(3)?,
+        target_kind: row.get::<String>(4)?,
+        kind: row.get::<String>(5)?,
+        line_start: row.get::<i64>(6)?,
+        excerpt: row.get::<String>(7)?,
     })
 }
 
@@ -10840,8 +10544,8 @@ fn reference_is_in_symbol(reference: &CodeReference, symbol: &CodeSymbol) -> boo
         && reference.line_start <= line_end
 }
 
-fn current_project_input() -> Result<ProjectInput, String> {
-    let root = env::current_dir().map_err(|error| error.to_string())?;
+fn current_project_input() -> Result<ProjectInput> {
+    let root = env::current_dir()?;
     let root = root.canonicalize().unwrap_or(root);
     let name = root
         .file_name()
@@ -10894,20 +10598,22 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-fn current_branch() -> Result<Option<String>, String> {
-    let root = env::current_dir().map_err(|error| error.to_string())?;
+fn current_branch() -> Result<Option<String>> {
+    let root = env::current_dir()?;
     Ok(git_output(&root, &["branch", "--show-current"]))
 }
 
-async fn active_session_id(conn: &Connection) -> Result<String, String> {
+async fn active_session_id(conn: &Connection) -> Result<String> {
     let Some(session_id) = active_session_id_optional(conn).await? else {
-        return Err("no active session; run `hugr session start <task>` first".to_string());
+        return Err(Error::msg(
+            "no active session; run `hugr session start <task>` first".to_string(),
+        ));
     };
 
     Ok(session_id)
 }
 
-async fn active_session_id_optional(conn: &Connection) -> Result<Option<String>, String> {
+async fn active_session_id_optional(conn: &Connection) -> Result<Option<String>> {
     let mut rows = conn
         .query(
             "
@@ -10919,16 +10625,13 @@ async fn active_session_id_optional(conn: &Connection) -> Result<Option<String>,
             ",
             params![LOCAL_PROJECT_ID],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+    let Some(row) = rows.next().await? else {
         return Ok(None);
     };
 
-    row.get::<String>(0)
-        .map(Some)
-        .map_err(|error| error.to_string())
+    row.get::<String>(0).map(Some).map_err(Error::from)
 }
 
 async fn insert_session_event(
@@ -10936,7 +10639,7 @@ async fn insert_session_event(
     session_id: String,
     kind: &str,
     detail: &str,
-) -> Result<SessionEvent, String> {
+) -> Result<SessionEvent> {
     let created_at_ms = now_ms()?;
     let event = SessionEvent {
         id: session_event_id(created_at_ms),
@@ -10959,8 +10662,7 @@ async fn insert_session_event(
             event.created_at_ms
         ],
     )
-    .await
-    .map_err(|error| error.to_string())?;
+    .await?;
 
     Ok(event)
 }
@@ -10970,7 +10672,7 @@ fn session_event_id(created_at_ms: i64) -> String {
     format!("evt_{created_at_ms}_{sequence}")
 }
 
-async fn session_by_id(conn: &Connection, session_id: &str) -> Result<Option<Session>, String> {
+async fn session_by_id(conn: &Connection, session_id: &str) -> Result<Option<Session>> {
     let mut rows = conn
         .query(
             "
@@ -10981,30 +10683,23 @@ async fn session_by_id(conn: &Connection, session_id: &str) -> Result<Option<Ses
             ",
             params![session_id],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+    let Some(row) = rows.next().await? else {
         return Ok(None);
     };
 
     Ok(Some(Session {
-        id: row.get::<String>(0).map_err(|error| error.to_string())?,
-        task: row.get::<String>(1).map_err(|error| error.to_string())?,
-        branch: row
-            .get::<Option<String>>(2)
-            .map_err(|error| error.to_string())?,
-        started_at_ms: row.get::<i64>(3).map_err(|error| error.to_string())?,
-        ended_at_ms: row
-            .get::<Option<i64>>(4)
-            .map_err(|error| error.to_string())?,
-        final_summary: row
-            .get::<Option<String>>(5)
-            .map_err(|error| error.to_string())?,
+        id: row.get::<String>(0)?,
+        task: row.get::<String>(1)?,
+        branch: row.get::<Option<String>>(2)?,
+        started_at_ms: row.get::<i64>(3)?,
+        ended_at_ms: row.get::<Option<i64>>(4)?,
+        final_summary: row.get::<Option<String>>(5)?,
     }))
 }
 
-async fn latest_session(conn: &Connection) -> Result<Option<Session>, String> {
+async fn latest_session(conn: &Connection) -> Result<Option<Session>> {
     let mut rows = conn
         .query(
             "
@@ -11016,30 +10711,23 @@ async fn latest_session(conn: &Connection) -> Result<Option<Session>, String> {
             ",
             params![LOCAL_PROJECT_ID],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+    let Some(row) = rows.next().await? else {
         return Ok(None);
     };
 
     Ok(Some(Session {
-        id: row.get::<String>(0).map_err(|error| error.to_string())?,
-        task: row.get::<String>(1).map_err(|error| error.to_string())?,
-        branch: row
-            .get::<Option<String>>(2)
-            .map_err(|error| error.to_string())?,
-        started_at_ms: row.get::<i64>(3).map_err(|error| error.to_string())?,
-        ended_at_ms: row
-            .get::<Option<i64>>(4)
-            .map_err(|error| error.to_string())?,
-        final_summary: row
-            .get::<Option<String>>(5)
-            .map_err(|error| error.to_string())?,
+        id: row.get::<String>(0)?,
+        task: row.get::<String>(1)?,
+        branch: row.get::<Option<String>>(2)?,
+        started_at_ms: row.get::<i64>(3)?,
+        ended_at_ms: row.get::<Option<i64>>(4)?,
+        final_summary: row.get::<Option<String>>(5)?,
     }))
 }
 
-async fn next_unpromoted_ended_session(conn: &Connection) -> Result<Option<Session>, String> {
+async fn next_unpromoted_ended_session(conn: &Connection) -> Result<Option<Session>> {
     let mut rows = conn
         .query(
             "
@@ -11065,26 +10753,19 @@ async fn next_unpromoted_ended_session(conn: &Connection) -> Result<Option<Sessi
             ",
             params![LOCAL_PROJECT_ID],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+    let Some(row) = rows.next().await? else {
         return Ok(None);
     };
 
     Ok(Some(Session {
-        id: row.get::<String>(0).map_err(|error| error.to_string())?,
-        task: row.get::<String>(1).map_err(|error| error.to_string())?,
-        branch: row
-            .get::<Option<String>>(2)
-            .map_err(|error| error.to_string())?,
-        started_at_ms: row.get::<i64>(3).map_err(|error| error.to_string())?,
-        ended_at_ms: row
-            .get::<Option<i64>>(4)
-            .map_err(|error| error.to_string())?,
-        final_summary: row
-            .get::<Option<String>>(5)
-            .map_err(|error| error.to_string())?,
+        id: row.get::<String>(0)?,
+        task: row.get::<String>(1)?,
+        branch: row.get::<Option<String>>(2)?,
+        started_at_ms: row.get::<i64>(3)?,
+        ended_at_ms: row.get::<Option<i64>>(4)?,
+        final_summary: row.get::<Option<String>>(5)?,
     }))
 }
 
@@ -11092,12 +10773,12 @@ async fn session_events(
     conn: &Connection,
     session_id: &str,
     limit: usize,
-) -> Result<Vec<SessionFact>, String> {
+) -> Result<Vec<SessionFact>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
 
-    let limit = i64::try_from(limit).map_err(|error| error.to_string())?;
+    let limit = i64::try_from(limit)?;
     let mut rows = conn
         .query(
             "
@@ -11109,26 +10790,22 @@ async fn session_events(
             ",
             params![session_id.to_string(), limit],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut facts = Vec::new();
 
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+    while let Some(row) = rows.next().await? {
         facts.push(SessionFact {
-            session_id: row.get::<String>(0).map_err(|error| error.to_string())?,
-            kind: row.get::<String>(1).map_err(|error| error.to_string())?,
-            detail: row.get::<String>(2).map_err(|error| error.to_string())?,
-            created_at_ms: row.get::<i64>(3).map_err(|error| error.to_string())?,
+            session_id: row.get::<String>(0)?,
+            kind: row.get::<String>(1)?,
+            detail: row.get::<String>(2)?,
+            created_at_ms: row.get::<i64>(3)?,
         });
     }
 
     Ok(facts)
 }
 
-async fn session_promotion_facts(
-    conn: &Connection,
-    session: &Session,
-) -> Result<Vec<SessionFact>, String> {
+async fn session_promotion_facts(conn: &Connection, session: &Session) -> Result<Vec<SessionFact>> {
     let mut facts = session_events(conn, &session.id, 12).await?;
     if let Some(summary) = session
         .final_summary
@@ -11149,7 +10826,7 @@ async fn session_promotion_facts(
 async fn promoted_memory_for_session(
     conn: &Connection,
     session_id: &str,
-) -> Result<Option<Memory>, String> {
+) -> Result<Option<Memory>> {
     let mut rows = conn
         .query(
             "
@@ -11161,10 +10838,9 @@ async fn promoted_memory_for_session(
             ",
             params![session_id.to_string()],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
-    let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+    let Some(row) = rows.next().await? else {
         return Ok(None);
     };
 
@@ -11175,7 +10851,7 @@ async fn insert_session_promotion(
     conn: &Connection,
     session_id: &str,
     memory_id: &str,
-) -> Result<(), String> {
+) -> Result<()> {
     conn.execute(
         "
         INSERT INTO session_promotions (session_id, memory_id, promoted_at_ms)
@@ -11183,8 +10859,7 @@ async fn insert_session_promotion(
         ",
         params![session_id.to_string(), memory_id.to_string(), now_ms()?],
     )
-    .await
-    .map_err(|error| error.to_string())?;
+    .await?;
     Ok(())
 }
 
@@ -11322,13 +10997,13 @@ fn memory_write_payload(
     (!payload.is_empty()).then(|| json!(payload).to_string())
 }
 
-fn normalize_memory_write_options(
-    options: MemoryWriteOptions,
-) -> Result<MemoryWriteOptions, String> {
+fn normalize_memory_write_options(options: MemoryWriteOptions) -> Result<MemoryWriteOptions> {
     if let Some(confidence) = options.confidence
         && (!confidence.is_finite() || !(0.0..=1.0).contains(&confidence))
     {
-        return Err("memory confidence must be between 0.0 and 1.0".to_string());
+        return Err(Error::msg(
+            "memory confidence must be between 0.0 and 1.0".to_string(),
+        ));
     }
 
     let source = options.source.map(normalize_memory_source).transpose()?;
@@ -11348,14 +11023,14 @@ fn normalize_memory_write_options(
     })
 }
 
-fn normalize_memory_source(source: MemorySource) -> Result<MemorySource, String> {
+fn normalize_memory_source(source: MemorySource) -> Result<MemorySource> {
     let kind = source.kind.trim();
     let locator = source.locator.trim();
     if kind.is_empty() {
-        return Err("memory source kind is required".to_string());
+        return Err(Error::msg("memory source kind is required".to_string()));
     }
     if locator.is_empty() {
-        return Err("memory source locator is required".to_string());
+        return Err(Error::msg("memory source locator is required".to_string()));
     }
 
     Ok(MemorySource {
@@ -11364,27 +11039,27 @@ fn normalize_memory_source(source: MemorySource) -> Result<MemorySource, String>
     })
 }
 
-fn normalize_memory_label(value: String) -> Result<String, String> {
+fn normalize_memory_label(value: String) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
-        return Err("memory sensitivity is required".to_string());
+        return Err(Error::msg("memory sensitivity is required".to_string()));
     }
     if !value
         .chars()
         .all(|char| char.is_ascii_alphanumeric() || char == '_' || char == '-')
     {
-        return Err(
+        return Err(Error::msg(
             "memory sensitivity may only contain letters, numbers, hyphens, or underscores"
                 .to_string(),
-        );
+        ));
     }
     Ok(value.to_string())
 }
 
-fn normalize_memory_value(value: String) -> Result<String, String> {
+fn normalize_memory_value(value: String) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
-        Err("memory validity value is required".to_string())
+        Err(Error::msg("memory validity value is required".to_string()))
     } else {
         Ok(value.to_string())
     }
@@ -11577,22 +11252,21 @@ fn query_terms(query: &str) -> Vec<String> {
         .collect()
 }
 
-fn global_root(lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+fn global_root(lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf> {
     if let Some(dir) = lookup("HUGR_GLOBAL_DIR").filter(|value| !value.trim().is_empty()) {
         return Ok(PathBuf::from(dir));
     }
     lookup("HOME")
         .filter(|value| !value.trim().is_empty())
         .map(|home| PathBuf::from(home).join(HUGR_DIR))
-        .ok_or_else(|| "global memory requires HOME or HUGR_GLOBAL_DIR".to_string())
+        .ok_or_else(|| Error::msg("global memory requires HOME or HUGR_GLOBAL_DIR".to_string()))
 }
 
-fn now_ms() -> Result<i64, String> {
+fn now_ms() -> Result<i64> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .map_err(|error| error.to_string())?;
-    i64::try_from(millis).map_err(|error| error.to_string())
+        .map(|duration| duration.as_millis())?;
+    i64::try_from(millis).map_err(Error::from)
 }
 
 async fn collect_stored_paths(
@@ -11600,15 +11274,12 @@ async fn collect_stored_paths(
     table: &str,
     column: &str,
     paths: &mut HashSet<String>,
-) -> Result<(), String> {
+) -> Result<()> {
     // `table` and `column` are fixed internal literals, never user input.
     let sql = format!("SELECT DISTINCT {column} FROM {table} WHERE project_id = ?1");
-    let mut rows = conn
-        .query(&sql, params![LOCAL_PROJECT_ID])
-        .await
-        .map_err(|error| error.to_string())?;
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        let path = row.get::<String>(0).map_err(|error| error.to_string())?;
+    let mut rows = conn.query(&sql, params![LOCAL_PROJECT_ID]).await?;
+    while let Some(row) = rows.next().await? {
+        let path = row.get::<String>(0)?;
         paths.insert(path);
     }
     Ok(())
@@ -11625,7 +11296,7 @@ async fn refresh_test_mappings_for_paths(
     conn: &Connection,
     paths: &HashSet<String>,
     now: i64,
-) -> Result<(), String> {
+) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -11653,8 +11324,7 @@ async fn refresh_test_mappings_for_paths(
             "DELETE FROM test_mappings WHERE project_id = ?1 AND source_path = ?2",
             params![LOCAL_PROJECT_ID, source_path.clone()],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
         let candidates = testmap::likely_tests_for_files(
             std::slice::from_ref(&source_path),
@@ -11663,7 +11333,7 @@ async fn refresh_test_mappings_for_paths(
             32,
         );
         for candidate in candidates {
-            let score = i64::try_from(candidate.score).map_err(|error| error.to_string())?;
+            let score = i64::try_from(candidate.score)?;
             conn.execute(
                 "
                 INSERT INTO test_mappings (
@@ -11680,15 +11350,14 @@ async fn refresh_test_mappings_for_paths(
                     now
                 ],
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         }
     }
 
     Ok(())
 }
 
-async fn load_inline_test_paths(conn: &Connection) -> Result<HashSet<String>, String> {
+async fn load_inline_test_paths(conn: &Connection) -> Result<HashSet<String>> {
     let mut rows = conn
         .query(
             "
@@ -11701,16 +11370,15 @@ async fn load_inline_test_paths(conn: &Connection) -> Result<HashSet<String>, St
             ",
             params![LOCAL_PROJECT_ID],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut paths = HashSet::new();
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        paths.insert(row.get::<String>(0).map_err(|error| error.to_string())?);
+    while let Some(row) = rows.next().await? {
+        paths.insert(row.get::<String>(0)?);
     }
     Ok(paths)
 }
 
-async fn load_known_file_paths(conn: &Connection) -> Result<Vec<String>, String> {
+async fn load_known_file_paths(conn: &Connection) -> Result<Vec<String>> {
     let mut rows = conn
         .query(
             "
@@ -11721,11 +11389,10 @@ async fn load_known_file_paths(conn: &Connection) -> Result<Vec<String>, String>
             ",
             params![LOCAL_PROJECT_ID],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut known_files = Vec::new();
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        known_files.push(row.get::<String>(0).map_err(|error| error.to_string())?);
+    while let Some(row) = rows.next().await? {
+        known_files.push(row.get::<String>(0)?);
     }
     Ok(known_files)
 }
@@ -11734,13 +11401,13 @@ async fn stored_test_candidates_for_files(
     conn: &Connection,
     files: &[String],
     limit: usize,
-) -> Result<Vec<TestCandidate>, String> {
+) -> Result<Vec<TestCandidate>> {
     if files.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
 
     let mut candidates = Vec::new();
-    let row_limit = i64::try_from(limit.max(32)).map_err(|error| error.to_string())?;
+    let row_limit = i64::try_from(limit.max(32))?;
     for file in files {
         let mut rows = conn
             .query(
@@ -11753,14 +11420,12 @@ async fn stored_test_candidates_for_files(
                 ",
                 params![LOCAL_PROJECT_ID, file.clone(), row_limit],
             )
-            .await
-            .map_err(|error| error.to_string())?;
-        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+            .await?;
+        while let Some(row) = rows.next().await? {
             candidates.push(TestCandidate {
-                path: row.get::<String>(0).map_err(|error| error.to_string())?,
-                reason: row.get::<String>(1).map_err(|error| error.to_string())?,
-                score: usize::try_from(row.get::<i64>(2).map_err(|error| error.to_string())?)
-                    .map_err(|error| error.to_string())?,
+                path: row.get::<String>(0)?,
+                reason: row.get::<String>(1)?,
+                score: usize::try_from(row.get::<i64>(2)?)?,
             });
         }
     }
@@ -11832,15 +11497,15 @@ async fn local_source_embedding_file_candidates(
     embedding_provider: &SelectedEmbeddingProvider,
     query: &str,
     limit: usize,
-) -> Result<Vec<FileCandidate>, String> {
+) -> Result<Vec<FileCandidate>> {
     if limit == 0 || query.trim().is_empty() {
         return Ok(Vec::new());
     }
 
     let embedding = embedding_provider.embed(query)?;
     let query_vector = embedding.to_vector_literal();
-    let dimensions = i64::try_from(embedding.dimensions()).map_err(|error| error.to_string())?;
-    let candidate_limit = i64::try_from(limit.max(50)).map_err(|error| error.to_string())?;
+    let dimensions = i64::try_from(embedding.dimensions())?;
+    let candidate_limit = i64::try_from(limit.max(50))?;
     let mut rows = conn
         .query(
             "
@@ -11869,25 +11534,20 @@ async fn local_source_embedding_file_candidates(
                 LOCAL_PROJECT_ID,
                 embedding.model,
                 dimensions,
-                i64::try_from(limit).map_err(|error| error.to_string())?
+                i64::try_from(limit)?
             ],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
     let mut candidates = Vec::new();
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        let rank = usize::try_from(row.get::<i64>(3).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
+    while let Some(row) = rows.next().await? {
+        let rank = usize::try_from(row.get::<i64>(3)?)?;
         let size_bytes = row
-            .get::<Option<i64>>(2)
-            .map_err(|error| error.to_string())?
+            .get::<Option<i64>>(2)?
             .and_then(|bytes| u64::try_from(bytes).ok());
         candidates.push(FileCandidate {
-            path: row.get::<String>(0).map_err(|error| error.to_string())?,
-            language: row
-                .get::<Option<String>>(1)
-                .map_err(|error| error.to_string())?,
+            path: row.get::<String>(0)?,
+            language: row.get::<Option<String>>(1)?,
             size_bytes,
             score: crate::discovery::source_embedding_score(rank),
         });
@@ -11896,9 +11556,11 @@ async fn local_source_embedding_file_candidates(
     Ok(candidates)
 }
 
-fn f32_blob_to_vector(blob: &[u8]) -> Result<Vec<f32>, String> {
+fn f32_blob_to_vector(blob: &[u8]) -> Result<Vec<f32>> {
     if !blob.len().is_multiple_of(4) {
-        return Err("source embedding blob length is not divisible by 4".to_string());
+        return Err(Error::msg(
+            "source embedding blob length is not divisible by 4".to_string(),
+        ));
     }
 
     Ok(blob
@@ -11920,22 +11582,18 @@ async fn refresh_source_embeddings_for_files(
     symbols: &[CodeSymbol],
     now: i64,
     embedding_provider: &SelectedEmbeddingProvider,
-) -> Result<(), String> {
+) -> Result<()> {
     let inputs = files
         .iter()
         .map(|file| {
-            let size_bytes = file
-                .size_bytes
-                .map(i64::try_from)
-                .transpose()
-                .map_err(|error| error.to_string())?;
+            let size_bytes = file.size_bytes.map(i64::try_from).transpose()?;
             Ok(SourceEmbeddingInput {
                 path: file.path.clone(),
                 language: file.language.clone(),
                 size_bytes,
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>>>()?;
     refresh_source_embeddings_for_inputs(conn, &inputs, symbols, now, embedding_provider).await
 }
 
@@ -11945,7 +11603,7 @@ async fn refresh_source_embeddings_for_paths(
     symbols: &[CodeSymbol],
     now: i64,
     embedding_provider: &SelectedEmbeddingProvider,
-) -> Result<(), String> {
+) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -11968,24 +11626,20 @@ async fn refresh_source_embeddings_for_paths(
             ",
             params![LOCAL_PROJECT_ID],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let mut inputs = Vec::new();
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        let path = row.get::<String>(0).map_err(|error| error.to_string())?;
+    while let Some(row) = rows.next().await? {
+        let path = row.get::<String>(0)?;
         if !paths.contains(&path) {
             continue;
         }
         let language = row
-            .get::<Option<String>>(1)
-            .map_err(|error| error.to_string())?
+            .get::<Option<String>>(1)?
             .or_else(|| symbol_languages.get(&path).cloned());
         inputs.push(SourceEmbeddingInput {
             path,
             language,
-            size_bytes: row
-                .get::<Option<i64>>(2)
-                .map_err(|error| error.to_string())?,
+            size_bytes: row.get::<Option<i64>>(2)?,
         });
     }
     for path in paths {
@@ -12006,7 +11660,7 @@ async fn refresh_source_embeddings_for_inputs(
     symbols: &[CodeSymbol],
     now: i64,
     embedding_provider: &SelectedEmbeddingProvider,
-) -> Result<(), String> {
+) -> Result<()> {
     if inputs.is_empty() {
         return Ok(());
     }
@@ -12014,8 +11668,7 @@ async fn refresh_source_embeddings_for_inputs(
     for input in inputs {
         let summary = source_embedding_summary(input, symbols);
         let content_key = source_embedding_content_key(&summary);
-        let dimensions =
-            i64::try_from(embedding_provider.dimensions()).map_err(|error| error.to_string())?;
+        let dimensions = i64::try_from(embedding_provider.dimensions())?;
         if source_embedding_is_fresh(
             conn,
             &input.path,
@@ -12028,8 +11681,7 @@ async fn refresh_source_embeddings_for_inputs(
             continue;
         }
         let embedding = embedding_provider.embed(&summary)?;
-        let embedding_dimensions =
-            i64::try_from(embedding.dimensions()).map_err(|error| error.to_string())?;
+        let embedding_dimensions = i64::try_from(embedding.dimensions())?;
         let embedding_vector = embedding.to_vector_literal();
         conn.execute(
             "
@@ -12054,8 +11706,7 @@ async fn refresh_source_embeddings_for_inputs(
                 now
             ],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     }
 
     Ok(())
@@ -12067,7 +11718,7 @@ async fn source_embedding_is_fresh(
     model: &str,
     dimensions: i64,
     content_key: &str,
-) -> Result<bool, String> {
+) -> Result<bool> {
     let mut rows = conn
         .query(
             "
@@ -12088,12 +11739,11 @@ async fn source_embedding_is_fresh(
                 content_key.to_string()
             ],
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     rows.next()
         .await
         .map(|row| row.is_some())
-        .map_err(|error| error.to_string())
+        .map_err(Error::from)
 }
 
 fn source_embedding_summary(input: &SourceEmbeddingInput, symbols: &[CodeSymbol]) -> String {
@@ -12147,6 +11797,8 @@ fn source_embedding_content_key(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::{Error, Result};
+
     use super::{
         DiagnosticInput, HUGR_API_CONTRACT_VERSION, HUGR_API_ROUTES, LOCAL_PROJECT_ID, Memory,
         MemorySource, MemorySyncRecord, MemoryWriteOptions, Project, Session,
@@ -12439,23 +12091,29 @@ mod tests {
     #[test]
     fn storage_config_requires_remote_credentials() {
         let missing_url =
-            StorageConfig::from_lookup(env_lookup(&[("HUGR_STORAGE_MODE", "hybrid")])).unwrap_err();
+            StorageConfig::from_lookup(env_lookup(&[("HUGR_STORAGE_MODE", "hybrid")]))
+                .unwrap_err()
+                .to_string();
         assert!(missing_url.contains("requires HUGR_REMOTE_DATABASE_URL"));
 
         let missing_token = StorageConfig::from_lookup(env_lookup(&[
             ("HUGR_STORAGE_MODE", "hybrid"),
             ("HUGR_REMOTE_DATABASE_URL", "libsql://example.turso.io"),
         ]))
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(missing_token.contains("requires HUGR_REMOTE_AUTH_TOKEN"));
 
         let invalid_class =
             StorageConfig::from_lookup(env_lookup(&[("HUGR_SYNC_CLASSES", "memories,unknown")]))
-                .unwrap_err();
+                .unwrap_err()
+                .to_string();
         assert!(invalid_class.contains("invalid HUGR_SYNC_CLASSES"));
 
         let invalid_backend =
-            StorageConfig::from_lookup(env_lookup(&[("HUGR_SYNC_BACKEND", "ftp")])).unwrap_err();
+            StorageConfig::from_lookup(env_lookup(&[("HUGR_SYNC_BACKEND", "ftp")]))
+                .unwrap_err()
+                .to_string();
         assert!(invalid_backend.contains("invalid HUGR_SYNC_BACKEND"));
     }
 
@@ -13449,7 +13107,7 @@ mod tests {
             sync_classes: vec![SyncClass::Memories],
         });
 
-        let error = test.store.init().await.unwrap_err();
+        let error = test.store.init().await.unwrap_err().to_string();
 
         assert!(error.contains("hosted Hugr API storage operations"));
         assert!(!test.store.db_path().exists());
@@ -14928,7 +14586,7 @@ mod tests {
             .unwrap();
 
         let synthesize =
-            |task: &str, facts: &[super::SessionFact]| -> Result<super::SessionSynthesis, String> {
+            |task: &str, facts: &[super::SessionFact]| -> Result<super::SessionSynthesis> {
                 Ok(super::SessionSynthesis {
                     text: format!("Distilled: {task} taught us {} facts.", facts.len()),
                     provider: "test-provider".to_string(),
@@ -14966,10 +14624,9 @@ mod tests {
             .await
             .unwrap();
 
-        let synthesize =
-            |_: &str, _: &[super::SessionFact]| -> Result<super::SessionSynthesis, String> {
-                Err("model unreachable".to_string())
-            };
+        let synthesize = |_: &str, _: &[super::SessionFact]| -> Result<super::SessionSynthesis> {
+            Err(Error::msg("model unreachable".to_string()))
+        };
         let promoted = test
             .store
             .promote_latest_session_with_synthesis(Some(&synthesize))
@@ -15207,7 +14864,7 @@ mod tests {
         id: &str,
         text: &str,
         created_at_ms: i64,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         conn.execute(
             "
             INSERT INTO memories (id, created_at_ms, kind, text)
@@ -15217,7 +14874,7 @@ mod tests {
         )
         .await
         .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(Error::from)
     }
 
     async fn insert_source_for_sync(
@@ -15310,7 +14967,7 @@ mod tests {
         name: &str,
         signature: &str,
         indexed_at_ms: i64,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         conn.execute(
             "
             INSERT INTO code_symbols (
@@ -15328,7 +14985,7 @@ mod tests {
         )
         .await
         .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(Error::from)
     }
 
     async fn code_symbol_signature(conn: &Connection, name: &str) -> String {

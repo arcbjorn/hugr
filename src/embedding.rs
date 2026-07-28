@@ -1,3 +1,4 @@
+use crate::error::{Error, Result};
 use serde_json::{Value, json};
 use std::env;
 use std::io::Write as _;
@@ -61,7 +62,7 @@ impl Embedding {
 pub(crate) trait EmbeddingProvider {
     fn model(&self) -> &str;
     fn dimensions(&self) -> usize;
-    fn embed(&self, text: &str) -> Result<Embedding, String>;
+    fn embed(&self, text: &str) -> Result<Embedding>;
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +74,7 @@ pub(crate) enum SelectedEmbeddingProvider {
 }
 
 impl SelectedEmbeddingProvider {
-    pub(crate) fn from_env() -> Result<Self, String> {
+    pub(crate) fn from_env() -> Result<Self> {
         EmbeddingProviderConfig::from_env()?.provider()
     }
 }
@@ -103,7 +104,7 @@ impl EmbeddingProvider for SelectedEmbeddingProvider {
         }
     }
 
-    fn embed(&self, text: &str) -> Result<Embedding, String> {
+    fn embed(&self, text: &str) -> Result<Embedding> {
         match self {
             Self::Deterministic(provider) => provider.embed(text),
             Self::OpenAi(provider) => provider.embed(text),
@@ -131,11 +132,11 @@ pub(crate) enum EmbeddingProviderConfig {
 }
 
 impl EmbeddingProviderConfig {
-    pub(crate) fn from_env() -> Result<Self, String> {
+    pub(crate) fn from_env() -> Result<Self> {
         Self::from_lookup(|key| env::var(key).ok())
     }
 
-    fn provider(self) -> Result<SelectedEmbeddingProvider, String> {
+    fn provider(self) -> Result<SelectedEmbeddingProvider> {
         match self {
             Self::Deterministic { dimensions } => Ok(SelectedEmbeddingProvider::Deterministic(
                 DeterministicEmbeddingProvider::new(dimensions)?,
@@ -158,7 +159,7 @@ impl EmbeddingProviderConfig {
         }
     }
 
-    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let provider = lookup("HUGR_EMBEDDING_PROVIDER")
             .unwrap_or_else(|| "deterministic".to_string())
             .trim()
@@ -236,16 +237,16 @@ impl EmbeddingProviderConfig {
                 }
                 #[cfg(not(feature = "local-embeddings"))]
                 {
-                    Err(
+                    Err(Error::msg(
                         "this hugr build does not include local embeddings; rebuild with \
                          --features local-embeddings or use the ollama or openai provider"
                             .to_string(),
-                    )
+                    ))
                 }
             }
-            unknown => Err(format!(
+            unknown => Err(Error::msg(format!(
                 "unknown embedding provider '{unknown}'; expected deterministic, local, openai, or ollama"
-            )),
+            ))),
         }
     }
 }
@@ -256,9 +257,11 @@ pub(crate) struct DeterministicEmbeddingProvider {
 }
 
 impl DeterministicEmbeddingProvider {
-    pub(crate) fn new(dimensions: usize) -> Result<Self, String> {
+    pub(crate) fn new(dimensions: usize) -> Result<Self> {
         if dimensions == 0 {
-            return Err("embedding dimensions must be greater than zero".to_string());
+            return Err(Error::msg(
+                "embedding dimensions must be greater than zero".to_string(),
+            ));
         }
 
         Ok(Self { dimensions })
@@ -281,7 +284,7 @@ impl EmbeddingProvider for DeterministicEmbeddingProvider {
         self.dimensions
     }
 
-    fn embed(&self, text: &str) -> Result<Embedding, String> {
+    fn embed(&self, text: &str) -> Result<Embedding> {
         let mut vector = vec![0.0; self.dimensions()];
 
         for term in embedding_terms(text) {
@@ -310,9 +313,7 @@ impl EmbeddingProvider for DeterministicEmbeddingProvider {
 pub(crate) struct LocalEmbeddingProvider {
     model_name: String,
     dimensions: usize,
-    engine: std::sync::Arc<
-        std::sync::OnceLock<Result<std::sync::Mutex<fastembed::TextEmbedding>, String>>,
-    >,
+    engine: std::sync::Arc<std::sync::OnceLock<Result<std::sync::Mutex<fastembed::TextEmbedding>>>>,
 }
 
 #[cfg(feature = "local-embeddings")]
@@ -328,7 +329,7 @@ impl std::fmt::Debug for LocalEmbeddingProvider {
 
 #[cfg(feature = "local-embeddings")]
 impl LocalEmbeddingProvider {
-    pub fn new(model_name: &str) -> Result<Self, String> {
+    pub fn new(model_name: &str) -> Result<Self> {
         let (_, dimensions) = local_embedding_model(model_name)?;
         Ok(Self {
             model_name: model_name.to_string(),
@@ -348,20 +349,24 @@ impl EmbeddingProvider for LocalEmbeddingProvider {
         self.dimensions
     }
 
-    fn embed(&self, text: &str) -> Result<Embedding, String> {
+    fn embed(&self, text: &str) -> Result<Embedding> {
         let engine = self.engine.get_or_init(|| {
             build_local_embedding_engine(&self.model_name).map(std::sync::Mutex::new)
         });
-        let engine = engine.as_ref().map_err(Clone::clone)?;
+        let engine = engine
+            .as_ref()
+            .map_err(|error| Error::msg(error.to_string()))?;
         let mut engine = engine
             .lock()
-            .map_err(|_| "local embedding engine mutex poisoned".to_string())?;
+            .map_err(|_| Error::msg("local embedding engine mutex poisoned".to_string()))?;
         let mut vectors = engine
             .embed(vec![text.to_string()], None)
-            .map_err(|error| format!("local embedding failed: {error}"))?;
+            .map_err(|error| {
+                Error::with_source(format!("local embedding failed: {error}"), error)
+            })?;
         let vector = vectors
             .pop()
-            .ok_or_else(|| "local embedding returned no vector".to_string())?;
+            .ok_or_else(|| Error::msg("local embedding returned no vector".to_string()))?;
 
         Ok(Embedding {
             model: self.model_name.clone(),
@@ -374,29 +379,33 @@ impl EmbeddingProvider for LocalEmbeddingProvider {
 /// dimensionality. Kept to a small curated set so configuration errors
 /// surface at startup instead of after a model download.
 #[cfg(feature = "local-embeddings")]
-fn local_embedding_model(name: &str) -> Result<(fastembed::EmbeddingModel, usize), String> {
+fn local_embedding_model(name: &str) -> Result<(fastembed::EmbeddingModel, usize)> {
     match name {
         "bge-small-en-v1.5" => Ok((fastembed::EmbeddingModel::BGESmallENV15, 384)),
         "bge-base-en-v1.5" => Ok((fastembed::EmbeddingModel::BGEBaseENV15, 768)),
         "all-minilm-l6-v2" => Ok((fastembed::EmbeddingModel::AllMiniLML6V2, 384)),
         "nomic-embed-text-v1.5" => Ok((fastembed::EmbeddingModel::NomicEmbedTextV15, 768)),
         "multilingual-e5-small" => Ok((fastembed::EmbeddingModel::MultilingualE5Small, 384)),
-        unknown => Err(format!(
+        unknown => Err(Error::msg(format!(
             "unknown local embedding model '{unknown}'; expected one of bge-small-en-v1.5, \
              bge-base-en-v1.5, all-minilm-l6-v2, nomic-embed-text-v1.5, multilingual-e5-small"
-        )),
+        ))),
     }
 }
 
 #[cfg(feature = "local-embeddings")]
-fn build_local_embedding_engine(model_name: &str) -> Result<fastembed::TextEmbedding, String> {
+fn build_local_embedding_engine(model_name: &str) -> Result<fastembed::TextEmbedding> {
     let (model, _) = local_embedding_model(model_name)?;
     let mut options = fastembed::TextInitOptions::new(model).with_show_download_progress(false);
     if let Some(cache_dir) = local_embedding_cache_dir(|name| env::var(name).ok()) {
         options = options.with_cache_dir(cache_dir);
     }
-    fastembed::TextEmbedding::try_new(options)
-        .map_err(|error| format!("failed to load local embedding model '{model_name}': {error}"))
+    fastembed::TextEmbedding::try_new(options).map_err(|error| {
+        Error::with_source(
+            format!("failed to load local embedding model '{model_name}': {error}"),
+            error,
+        )
+    })
 }
 
 /// Model cache resolution: explicit override, else ~/.hugr/models next to the
@@ -431,7 +440,7 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
         self.dimensions
     }
 
-    fn embed(&self, text: &str) -> Result<Embedding, String> {
+    fn embed(&self, text: &str) -> Result<Embedding> {
         let body = openai_embedding_request(&self.model, text);
         let response = post_json_with_curl(&self.url, &self.api_key, &body)?;
         parse_openai_embedding_response(&response, &self.model, self.dimensions)
@@ -445,7 +454,7 @@ fn openai_embedding_request(model: &str, text: &str) -> Value {
     })
 }
 
-fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String, String> {
+fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String> {
     let mut args = vec![
         "-fsS".to_string(),
         "-X".to_string(),
@@ -467,47 +476,54 @@ fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String,
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("failed to execute curl for embeddings: {error}"))?;
+        .map_err(|error| {
+            Error::with_source(
+                format!("failed to execute curl for embeddings: {error}"),
+                error,
+            )
+        })?;
 
     {
         let stdin = child
             .stdin
             .as_mut()
-            .ok_or_else(|| "failed to open curl stdin".to_string())?;
+            .ok_or_else(|| Error::msg("failed to open curl stdin".to_string()))?;
         stdin
             .write_all(body.to_string().as_bytes())
-            .map_err(|error| format!("failed to write embedding request: {error}"))?;
+            .map_err(|error| {
+                Error::with_source(format!("failed to write embedding request: {error}"), error)
+            })?;
     }
 
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("failed to read embedding response: {error}"))?;
+    let output = child.wait_with_output().map_err(|error| {
+        Error::with_source(format!("failed to read embedding response: {error}"), error)
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if stderr.is_empty() {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "embedding request failed with status {}",
                 output.status
-            ));
+            )));
         }
-        return Err(format!("embedding request failed: {stderr}"));
+        return Err(Error::msg(format!("embedding request failed: {stderr}")));
     }
 
-    String::from_utf8(output.stdout).map_err(|error| error.to_string())
+    String::from_utf8(output.stdout).map_err(Error::from)
 }
 
 fn parse_openai_embedding_response(
     response: &str,
     fallback_model: &str,
     expected_dimensions: usize,
-) -> Result<Embedding, String> {
-    let value = serde_json::from_str::<Value>(response).map_err(|error| error.to_string())?;
+) -> Result<Embedding> {
+    let value = serde_json::from_str::<Value>(response)?;
     if let Some(message) = value
         .get("error")
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
     {
-        return Err(format!("embedding request failed: {message}"));
+        return Err(Error::msg(format!("embedding request failed: {message}")));
     }
 
     let embedding = value
@@ -516,23 +532,24 @@ fn parse_openai_embedding_response(
         .and_then(|data| data.first())
         .and_then(|item| item.get("embedding"))
         .and_then(Value::as_array)
-        .ok_or_else(|| "embedding response did not include data[0].embedding".to_string())?;
+        .ok_or_else(|| {
+            Error::msg("embedding response did not include data[0].embedding".to_string())
+        })?;
     let vector = embedding
         .iter()
         .map(|value| {
-            value
-                .as_f64()
-                .map(|value| value as f32)
-                .ok_or_else(|| "embedding response included a non-numeric value".to_string())
+            value.as_f64().map(|value| value as f32).ok_or_else(|| {
+                Error::msg("embedding response included a non-numeric value".to_string())
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     if vector.len() != expected_dimensions {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "embedding response dimensions {} did not match expected {}",
             vector.len(),
             expected_dimensions
-        ));
+        )));
     }
 
     let model = value
@@ -544,13 +561,14 @@ fn parse_openai_embedding_response(
     Ok(Embedding { model, vector })
 }
 
-fn parse_dimensions(value: &str) -> Result<usize, String> {
-    let dimensions = value
-        .trim()
-        .parse::<usize>()
-        .map_err(|error| format!("invalid HUGR_EMBEDDING_DIMENSIONS: {error}"))?;
+fn parse_dimensions(value: &str) -> Result<usize> {
+    let dimensions = value.trim().parse::<usize>().map_err(|error| {
+        Error::with_source(format!("invalid HUGR_EMBEDDING_DIMENSIONS: {error}"), error)
+    })?;
     if dimensions == 0 {
-        Err("embedding dimensions must be greater than zero".to_string())
+        Err(Error::msg(
+            "embedding dimensions must be greater than zero".to_string(),
+        ))
     } else {
         Ok(dimensions)
     }
@@ -870,7 +888,8 @@ mod tests {
             "HUGR_EMBEDDING_PROVIDER",
             "openai",
         )]))
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("requires HUGR_OPENAI_API_KEY"));
     }
@@ -901,7 +920,9 @@ mod tests {
     fn rejects_openai_dimension_mismatch() {
         let response = r#"{"data":[{"embedding":[1.0,2.0]}]}"#;
 
-        let error = parse_openai_embedding_response(response, "model", 3).unwrap_err();
+        let error = parse_openai_embedding_response(response, "model", 3)
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("did not match expected"));
     }

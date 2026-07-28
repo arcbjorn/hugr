@@ -1,3 +1,4 @@
+use crate::error::{Error, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -27,23 +28,24 @@ pub(crate) fn source_embedding_rank(score: usize) -> Option<usize> {
 }
 
 pub(crate) trait FileFinder {
-    fn find_files(&self, root: &Path) -> Result<Vec<PathBuf>, String>;
+    fn find_files(&self, root: &Path) -> Result<Vec<PathBuf>>;
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct GitFileFinder;
 
 impl FileFinder for GitFileFinder {
-    fn find_files(&self, root: &Path) -> Result<Vec<PathBuf>, String> {
+    fn find_files(&self, root: &Path) -> Result<Vec<PathBuf>> {
         let output = ProcessCommand::new("git")
             .arg("-C")
             .arg(root)
             .args(["ls-files", "--cached", "--others", "--exclude-standard"])
-            .output()
-            .map_err(|error| error.to_string())?;
+            .output()?;
 
         if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+            return Err(Error::msg(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
         }
 
         Ok(String::from_utf8_lossy(&output.stdout)
@@ -59,7 +61,7 @@ impl FileFinder for GitFileFinder {
 pub(crate) struct WalkingFileFinder;
 
 impl FileFinder for WalkingFileFinder {
-    fn find_files(&self, root: &Path) -> Result<Vec<PathBuf>, String> {
+    fn find_files(&self, root: &Path) -> Result<Vec<PathBuf>> {
         let matcher = IgnoreMatcher::from_root(root);
         let mut files = Vec::new();
         visit(root, root, &matcher, &mut files)?;
@@ -71,7 +73,7 @@ pub(crate) fn discover_candidate_files(
     root: &Path,
     task: &str,
     limit: usize,
-) -> Result<Vec<FileCandidate>, String> {
+) -> Result<Vec<FileCandidate>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -83,10 +85,7 @@ pub(crate) fn discover_candidate_files(
     Ok(rank_files(root, task, files, limit))
 }
 
-pub(crate) fn discover_project_files(
-    root: &Path,
-    limit: usize,
-) -> Result<Vec<FileCandidate>, String> {
+pub(crate) fn discover_project_files(root: &Path, limit: usize) -> Result<Vec<FileCandidate>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -218,11 +217,11 @@ fn visit(
     path: &Path,
     matcher: &IgnoreMatcher,
     files: &mut Vec<PathBuf>,
-) -> Result<(), String> {
-    let entries = fs::read_dir(path).map_err(|error| error.to_string())?;
+) -> Result<()> {
+    let entries = fs::read_dir(path)?;
 
     for entry in entries {
-        let entry = entry.map_err(|error| error.to_string())?;
+        let entry = entry?;
         let path = entry.path();
         let relative = path.strip_prefix(root).unwrap_or(&path);
         let is_dir = path.is_dir();

@@ -1,4 +1,5 @@
 use crate::context::json_string;
+use crate::error::{Error, Result};
 use crate::indexer;
 use crate::store::{
     HUGR_API_CONTRACT_VERSION, Store, SyncApiTablePayload, SyncConflictSummary, SyncExecutionPlan,
@@ -44,11 +45,14 @@ impl Default for DaemonConfig {
     }
 }
 
-pub(crate) async fn serve(config: DaemonConfig) -> Result<(), String> {
-    let listener = TcpListener::bind(&config.addr)
-        .await
-        .map_err(|error| format!("failed to bind daemon to {}: {error}", config.addr))?;
-    let local_addr = listener.local_addr().map_err(|error| error.to_string())?;
+pub(crate) async fn serve(config: DaemonConfig) -> Result<()> {
+    let listener = TcpListener::bind(&config.addr).await.map_err(|error| {
+        Error::with_source(
+            format!("failed to bind daemon to {}: {error}", config.addr),
+            error,
+        )
+    })?;
+    let local_addr = listener.local_addr()?;
     let state = Arc::new(DaemonState::default());
     let (mut watcher_events, _watcher) = start_file_watcher(Path::new("."), state.clone())?;
     let debounce = tokio::time::sleep(IDLE_DEBOUNCE);
@@ -112,7 +116,7 @@ pub(crate) async fn serve(config: DaemonConfig) -> Result<(), String> {
                 });
             }
             signal = tokio::signal::ctrl_c() => {
-                signal.map_err(|error| error.to_string())?;
+                signal?;
                 println!("Hugr daemon shutting down");
                 return Ok(());
             }
@@ -124,37 +128,31 @@ async fn handle_client(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     state: Arc<DaemonState>,
-) -> Result<(), String> {
+) -> Result<()> {
     let request = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, read_http_request(&mut stream))
         .await
-        .map_err(|_| "timed out reading HTTP request".to_string())??;
+        .map_err(|_| Error::msg("timed out reading HTTP request".to_string()))??;
     if request.is_empty() {
         return Ok(());
     }
 
     let response = response_for_request(&request, peer_addr, &state).await;
-    stream
-        .write_all(response.as_bytes())
-        .await
-        .map_err(|error| error.to_string())?;
-    stream.shutdown().await.map_err(|error| error.to_string())
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await.map_err(Error::from)
 }
 
-async fn read_http_request(stream: &mut TcpStream) -> Result<String, String> {
+async fn read_http_request(stream: &mut TcpStream) -> Result<String> {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 8192];
 
     loop {
-        let bytes_read = stream
-            .read(&mut chunk)
-            .await
-            .map_err(|error| error.to_string())?;
+        let bytes_read = stream.read(&mut chunk).await?;
         if bytes_read == 0 {
             break;
         }
         buffer.extend_from_slice(&chunk[..bytes_read]);
         if buffer.len() > MAX_HTTP_REQUEST_BYTES {
-            return Err("HTTP request exceeded maximum size".to_string());
+            return Err(Error::msg("HTTP request exceeded maximum size".to_string()));
         }
         if let Some(expected_len) = expected_http_request_len(&buffer)?
             && buffer.len() >= expected_len
@@ -163,14 +161,14 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<String, String> {
         }
     }
 
-    String::from_utf8(buffer).map_err(|error| error.to_string())
+    String::from_utf8(buffer).map_err(Error::from)
 }
 
-fn expected_http_request_len(buffer: &[u8]) -> Result<Option<usize>, String> {
+fn expected_http_request_len(buffer: &[u8]) -> Result<Option<usize>> {
     let Some((header_end, separator_len)) = http_header_end(buffer) else {
         return Ok(None);
     };
-    let headers = std::str::from_utf8(&buffer[..header_end]).map_err(|error| error.to_string())?;
+    let headers = std::str::from_utf8(&buffer[..header_end])?;
     let content_length = headers
         .lines()
         .find_map(|line| {
@@ -178,8 +176,7 @@ fn expected_http_request_len(buffer: &[u8]) -> Result<Option<usize>, String> {
             name.eq_ignore_ascii_case("content-length")
                 .then(|| value.trim().parse::<usize>())
         })
-        .transpose()
-        .map_err(|error| error.to_string())?
+        .transpose()?
         .unwrap_or(0);
     Ok(Some(header_end + separator_len + content_length))
 }
@@ -228,9 +225,7 @@ async fn run_background_index(state: Arc<DaemonState>, changed_paths: Vec<String
     state.indexing.store(false, Ordering::SeqCst);
 }
 
-async fn record_refresh_capture(
-    summary: &indexer::RefreshSummary,
-) -> Result<Option<String>, String> {
+async fn record_refresh_capture(summary: &indexer::RefreshSummary) -> Result<Option<String>> {
     Store::open_current()
         .record_session_event_if_active("discovery", &render_refresh_capture_detail(summary))
         .await
@@ -362,7 +357,7 @@ fn render_session_observation_detail(
 fn start_file_watcher(
     root: &Path,
     state: Arc<DaemonState>,
-) -> Result<(UnboundedReceiver<Vec<String>>, RecommendedWatcher), String> {
+) -> Result<(UnboundedReceiver<Vec<String>>, RecommendedWatcher)> {
     let (sender, receiver) = unbounded_channel();
     let callback_state = state.clone();
     let mut watcher =
@@ -376,12 +371,9 @@ fn start_file_watcher(
             Err(error) => {
                 callback_state.set_last_index_status(&format!("watch_error: {error}"));
             }
-        })
-        .map_err(|error| error.to_string())?;
+        })?;
 
-    watcher
-        .watch(root, RecursiveMode::Recursive)
-        .map_err(|error| error.to_string())?;
+    watcher.watch(root, RecursiveMode::Recursive)?;
     state.watcher_enabled.store(true, Ordering::SeqCst);
     state.set_last_index_status("watching");
     Ok((receiver, watcher))
@@ -488,7 +480,11 @@ async fn response_for_sync_api_request(
                 "application/json",
                 &render_sync_api_status_json(&plan, state),
             ),
-            Err(error) => http_response(500, "application/json", &render_error_json(&error)),
+            Err(error) => http_response(
+                500,
+                "application/json",
+                &render_error_json(&error.to_string()),
+            ),
         },
         ("GET", "/v1/sync/history") => {
             let limit = sync_history_limit(&request.path);
@@ -498,7 +494,11 @@ async fn response_for_sync_api_request(
                     "application/json",
                     &render_sync_history_response_json(&history),
                 ),
-                Err(error) => http_response(500, "application/json", &render_error_json(&error)),
+                Err(error) => http_response(
+                    500,
+                    "application/json",
+                    &render_error_json(&error.to_string()),
+                ),
             }
         }
         ("POST", "/v1/sync/push") => response_for_sync_api_operation("push", &request.body).await,
@@ -523,7 +523,11 @@ async fn response_for_memory_api_request(request: &HttpRequest, api_token: Optio
                 "application/json",
                 &render_memory_records_response_json(&records),
             ),
-            Err(error) => http_response(500, "application/json", &render_error_json(&error)),
+            Err(error) => http_response(
+                500,
+                "application/json",
+                &render_error_json(&error.to_string()),
+            ),
         },
         ("POST", "/v1/memories") => response_for_memory_api_apply(&request.body).await,
         (_, "/v1/memories") => {
@@ -536,7 +540,13 @@ async fn response_for_memory_api_request(request: &HttpRequest, api_token: Optio
 async fn response_for_memory_api_apply(body: &str) -> String {
     let request = match parse_memory_api_apply_request(body) {
         Ok(request) => request,
-        Err(error) => return http_response(400, "application/json", &render_error_json(&error)),
+        Err(error) => {
+            return http_response(
+                400,
+                "application/json",
+                &render_error_json(&error.to_string()),
+            );
+        }
     };
 
     match Store::open_current()
@@ -548,7 +558,11 @@ async fn response_for_memory_api_apply(body: &str) -> String {
             "application/json",
             &render_memory_apply_response_json(&status, &payloads),
         ),
-        Err(error) => http_response(500, "application/json", &render_error_json(&error)),
+        Err(error) => http_response(
+            500,
+            "application/json",
+            &render_error_json(&error.to_string()),
+        ),
     }
 }
 
@@ -572,7 +586,11 @@ async fn response_for_storage_api_request(
                     &session_promotions,
                 ),
             ),
-            Err(error) => http_response(500, "application/json", &render_error_json(&error)),
+            Err(error) => http_response(
+                500,
+                "application/json",
+                &render_error_json(&error.to_string()),
+            ),
         },
         ("POST", "/v1/storage") => response_for_storage_api_apply(&request.body).await,
         (_, "/v1/storage") => {
@@ -585,7 +603,13 @@ async fn response_for_storage_api_request(
 async fn response_for_storage_api_apply(body: &str) -> String {
     let request = match parse_storage_api_apply_request(body) {
         Ok(request) => request,
-        Err(error) => return http_response(400, "application/json", &render_error_json(&error)),
+        Err(error) => {
+            return http_response(
+                400,
+                "application/json",
+                &render_error_json(&error.to_string()),
+            );
+        }
     };
 
     match Store::open_current()
@@ -607,14 +631,24 @@ async fn response_for_storage_api_apply(body: &str) -> String {
                 &session_promotions_table,
             ),
         ),
-        Err(error) => http_response(500, "application/json", &render_error_json(&error)),
+        Err(error) => http_response(
+            500,
+            "application/json",
+            &render_error_json(&error.to_string()),
+        ),
     }
 }
 
 async fn response_for_sync_api_operation(operation: &str, body: &str) -> String {
     let request = match parse_sync_api_operation_request(operation, body) {
         Ok(request) => request,
-        Err(error) => return http_response(400, "application/json", &render_error_json(&error)),
+        Err(error) => {
+            return http_response(
+                400,
+                "application/json",
+                &render_error_json(&error.to_string()),
+            );
+        }
     };
 
     match operation {
@@ -640,7 +674,11 @@ async fn response_for_sync_api_operation(operation: &str, body: &str) -> String 
                     &render_sync_push_response_json(&result, &payloads),
                 )
             }
-            Err(error) => http_response(500, "application/json", &render_error_json(&error)),
+            Err(error) => http_response(
+                500,
+                "application/json",
+                &render_error_json(&error.to_string()),
+            ),
         },
         "pull" => match Store::open_current()
             .api_sync_pull_payloads(&request.table_payloads, request.dry_run)
@@ -664,7 +702,11 @@ async fn response_for_sync_api_operation(operation: &str, body: &str) -> String 
                     &render_sync_pull_response_json(&result, &payloads),
                 )
             }
-            Err(error) => http_response(500, "application/json", &render_error_json(&error)),
+            Err(error) => http_response(
+                500,
+                "application/json",
+                &render_error_json(&error.to_string()),
+            ),
         },
         _ => http_response(400, "application/json", r#"{"error":"bad_request"}"#),
     }
@@ -785,14 +827,14 @@ struct StorageApiApplyRequest {
     replace_code_index_paths: Vec<String>,
 }
 
-fn parse_memory_api_apply_request(body: &str) -> Result<MemoryApiApplyRequest, String> {
-    let value =
-        serde_json::from_str::<Value>(body).map_err(|error| format!("invalid JSON: {error}"))?;
+fn parse_memory_api_apply_request(body: &str) -> Result<MemoryApiApplyRequest> {
+    let value = serde_json::from_str::<Value>(body)
+        .map_err(|error| Error::with_source(format!("invalid JSON: {error}"), error))?;
     let contract_version = json_string_field(&value, "contract_version")?;
     if contract_version != HUGR_API_CONTRACT_VERSION {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "unsupported Hugr API contract version '{contract_version}'"
-        ));
+        )));
     }
 
     Ok(MemoryApiApplyRequest {
@@ -803,14 +845,14 @@ fn parse_memory_api_apply_request(body: &str) -> Result<MemoryApiApplyRequest, S
     })
 }
 
-fn parse_storage_api_apply_request(body: &str) -> Result<StorageApiApplyRequest, String> {
-    let value =
-        serde_json::from_str::<Value>(body).map_err(|error| format!("invalid JSON: {error}"))?;
+fn parse_storage_api_apply_request(body: &str) -> Result<StorageApiApplyRequest> {
+    let value = serde_json::from_str::<Value>(body)
+        .map_err(|error| Error::with_source(format!("invalid JSON: {error}"), error))?;
     let contract_version = json_string_field(&value, "contract_version")?;
     if contract_version != HUGR_API_CONTRACT_VERSION {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "unsupported Hugr API contract version '{contract_version}'"
-        ));
+        )));
     }
 
     Ok(StorageApiApplyRequest {
@@ -827,20 +869,20 @@ fn parse_storage_api_apply_request(body: &str) -> Result<StorageApiApplyRequest,
 fn parse_sync_api_operation_request(
     expected_operation: &str,
     body: &str,
-) -> Result<SyncApiOperationRequest, String> {
-    let value =
-        serde_json::from_str::<Value>(body).map_err(|error| format!("invalid JSON: {error}"))?;
+) -> Result<SyncApiOperationRequest> {
+    let value = serde_json::from_str::<Value>(body)
+        .map_err(|error| Error::with_source(format!("invalid JSON: {error}"), error))?;
     let contract_version = json_string_field(&value, "contract_version")?;
     if contract_version != HUGR_API_CONTRACT_VERSION {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "unsupported Hugr API contract version '{contract_version}'"
-        ));
+        )));
     }
     let operation = json_string_field(&value, "operation")?;
     if operation != expected_operation {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "operation '{operation}' does not match route '{expected_operation}'"
-        ));
+        )));
     }
 
     Ok(SyncApiOperationRequest {
@@ -852,7 +894,7 @@ fn parse_sync_api_operation_request(
     })
 }
 
-fn parse_sync_api_table_payload(value: &Value) -> Result<SyncApiTablePayload, String> {
+fn parse_sync_api_table_payload(value: &Value) -> Result<SyncApiTablePayload> {
     let records = value
         .get("records")
         .and_then(Value::as_array)
@@ -865,7 +907,7 @@ fn parse_sync_api_table_payload(value: &Value) -> Result<SyncApiTablePayload, St
     })
 }
 
-fn parse_sync_table_result(value: &Value) -> Result<SyncTableResult, String> {
+fn parse_sync_table_result(value: &Value) -> Result<SyncTableResult> {
     Ok(SyncTableResult {
         class: json_string_field(value, "class")?,
         table: json_string_field(value, "table")?,
@@ -882,18 +924,18 @@ fn parse_sync_table_result(value: &Value) -> Result<SyncTableResult, String> {
     })
 }
 
-fn parse_sync_conflict_summary(value: &Value) -> Result<SyncConflictSummary, String> {
+fn parse_sync_conflict_summary(value: &Value) -> Result<SyncConflictSummary> {
     Ok(SyncConflictSummary {
         reason: json_string_field(value, "reason")?,
         count: json_usize_field(value, "count")?,
     })
 }
 
-fn json_array_field<'a>(value: &'a Value, field: &str) -> Result<&'a Vec<Value>, String> {
+fn json_array_field<'a>(value: &'a Value, field: &str) -> Result<&'a Vec<Value>> {
     value
         .get(field)
         .and_then(Value::as_array)
-        .ok_or_else(|| format!("Hugr API request missing array field '{field}'"))
+        .ok_or_else(|| Error::msg(format!("Hugr API request missing array field '{field}'")))
 }
 
 fn optional_json_array_field(value: &Value, field: &str) -> Vec<Value> {
@@ -904,45 +946,49 @@ fn optional_json_array_field(value: &Value, field: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn optional_string_array_field(value: &Value, field: &str) -> Result<Vec<String>, String> {
+fn optional_string_array_field(value: &Value, field: &str) -> Result<Vec<String>> {
     let Some(values) = value.get(field) else {
         return Ok(Vec::new());
     };
     let Some(values) = values.as_array() else {
-        return Err(format!("Hugr API request field '{field}' must be an array"));
+        return Err(Error::msg(format!(
+            "Hugr API request field '{field}' must be an array"
+        )));
     };
     values
         .iter()
         .map(|value| {
-            value
-                .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| format!("Hugr API request field '{field}' must contain strings"))
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                Error::msg(format!(
+                    "Hugr API request field '{field}' must contain strings"
+                ))
+            })
         })
         .collect()
 }
 
-fn json_string_field(value: &Value, field: &str) -> Result<String, String> {
+fn json_string_field(value: &Value, field: &str) -> Result<String> {
     value
         .get(field)
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| format!("Hugr API request missing string field '{field}'"))
+        .ok_or_else(|| Error::msg(format!("Hugr API request missing string field '{field}'")))
 }
 
-fn json_usize_field(value: &Value, field: &str) -> Result<usize, String> {
-    let raw = value
-        .get(field)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("Hugr API request missing unsigned integer field '{field}'"))?;
-    usize::try_from(raw).map_err(|error| error.to_string())
+fn json_usize_field(value: &Value, field: &str) -> Result<usize> {
+    let raw = value.get(field).and_then(Value::as_u64).ok_or_else(|| {
+        Error::msg(format!(
+            "Hugr API request missing unsigned integer field '{field}'"
+        ))
+    })?;
+    usize::try_from(raw).map_err(Error::from)
 }
 
-fn json_bool_field(value: &Value, field: &str) -> Result<bool, String> {
+fn json_bool_field(value: &Value, field: &str) -> Result<bool> {
     value
         .get(field)
         .and_then(Value::as_bool)
-        .ok_or_else(|| format!("Hugr API request missing boolean field '{field}'"))
+        .ok_or_else(|| Error::msg(format!("Hugr API request missing boolean field '{field}'")))
 }
 
 fn sync_history_limit(path: &str) -> usize {

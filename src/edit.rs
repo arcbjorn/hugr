@@ -1,5 +1,6 @@
 use crate::code::{self, CodeReference, CodeSymbol};
 use crate::context::json_string;
+use crate::error::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::fs;
@@ -112,14 +113,18 @@ pub(crate) fn plan_replacement(
     name: &str,
     kind: Option<&str>,
     new_body: &str,
-) -> Result<PlannedReplacement, String> {
+) -> Result<PlannedReplacement> {
     let name = name.trim();
     if name.is_empty() {
-        return Err("replace-symbol requires a symbol name".to_string());
+        return Err(Error::msg(
+            "replace-symbol requires a symbol name".to_string(),
+        ));
     }
     let new_body = new_body.trim_end_matches(['\n', '\r']);
     if new_body.trim().is_empty() {
-        return Err("replace-symbol requires a non-empty replacement body".to_string());
+        return Err(Error::msg(
+            "replace-symbol requires a non-empty replacement body".to_string(),
+        ));
     }
 
     let language = language_for_path(path);
@@ -160,10 +165,12 @@ pub(crate) fn resolve_symbol_in_source(
     name: &str,
     kind: Option<&str>,
     action: &str,
-) -> Result<CodeSymbol, String> {
+) -> Result<CodeSymbol> {
     let name = name.trim();
     if name.is_empty() {
-        return Err(format!("{action}-symbol requires a symbol name"));
+        return Err(Error::msg(format!(
+            "{action}-symbol requires a symbol name"
+        )));
     }
 
     let language = language_for_path(path);
@@ -176,23 +183,25 @@ pub(crate) fn plan_rename(
     references: &[CodeReference],
     files: Vec<(String, String)>,
     new_name: &str,
-) -> Result<PlannedRename, String> {
+) -> Result<PlannedRename> {
     let new_name = new_name.trim();
     if !valid_identifier(new_name) {
-        return Err(
+        return Err(Error::msg(
             "rename-symbol requires a valid ASCII identifier for the new symbol name".to_string(),
-        );
+        ));
     }
     if new_name == target.name {
-        return Err("rename-symbol new name must differ from the current name".to_string());
+        return Err(Error::msg(
+            "rename-symbol new name must differ from the current name".to_string(),
+        ));
     }
 
     let mut contents_by_path = files.into_iter().collect::<BTreeMap<_, _>>();
     if !contents_by_path.contains_key(&target.path) {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "rename-symbol requires source contents for target file {}",
             target.path
-        ));
+        )));
     }
 
     reject_target_name_collision(
@@ -221,24 +230,24 @@ pub(crate) fn plan_rename(
     let mut changed_files = Vec::new();
     for (path, line_numbers) in lines_by_path {
         let Some(contents) = contents_by_path.remove(&path) else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "rename-symbol missing source contents for referenced file {path}; rerun hugr index"
-            ));
+            )));
         };
         let (renamed, replacement_count) =
             replace_identifier_on_lines(&path, &contents, &target.name, new_name, &line_numbers)?;
         if replacement_count == 0 {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "rename-symbol found no occurrences of '{}' in selected lines for {path}",
                 target.name
-            ));
+            )));
         }
         let language = language_for_path(&path);
         if !code::parses_cleanly(&path, language, &renamed)? {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "renamed source in {path} is not valid {} code; refusing to write partial refactor",
                 language.unwrap_or("unknown")
-            ));
+            )));
         }
         planned_files.push(PlannedRenameFile {
             path: path.clone(),
@@ -282,23 +291,27 @@ pub(crate) fn plan_move(
     destination_contents: &str,
     reference_files: Vec<(String, String)>,
     rewrite_references: bool,
-) -> Result<PlannedMove, String> {
+) -> Result<PlannedMove> {
     let destination_path = destination_path.trim();
     if destination_path.is_empty() {
-        return Err("move-symbol requires a destination path".to_string());
+        return Err(Error::msg(
+            "move-symbol requires a destination path".to_string(),
+        ));
     }
     if destination_path == target.path {
-        return Err("move-symbol destination must differ from the source path".to_string());
+        return Err(Error::msg(
+            "move-symbol destination must differ from the source path".to_string(),
+        ));
     }
 
     let source_language = language_for_path(&target.path);
     let destination_language = language_for_path(destination_path);
     if source_language != destination_language {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "move-symbol requires source and destination languages to match (source: {}, destination: {})",
             source_language.unwrap_or("unknown"),
             destination_language.unwrap_or("unknown")
-        ));
+        )));
     }
 
     let inbound_references = references
@@ -309,10 +322,10 @@ pub(crate) fn plan_move(
         .collect::<Vec<_>>();
     let inbound_reference_count = inbound_references.len();
     if inbound_reference_count > 0 && !rewrite_references {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "move-symbol refuses to move '{}' because it has {inbound_reference_count} indexed inbound reference(s); pass --rewrite-references to rewrite supported references",
             target.name
-        ));
+        )));
     }
 
     let old_line_start = target.line_start;
@@ -326,8 +339,7 @@ pub(crate) fn plan_move(
     let mut source_after =
         remove_line_range(source_contents, old_line_start, old_line_end, &target.path)?;
     let mut destination_after = append_symbol_body(destination_contents, &moved_body);
-    let moved_line_count =
-        usize::try_from(old_line_end - old_line_start + 1).map_err(|error| error.to_string())?;
+    let moved_line_count = usize::try_from(old_line_end - old_line_start + 1)?;
     let adjusted_inbound_references = adjusted_references_after_move(
         target,
         &inbound_references,
@@ -379,10 +391,10 @@ pub(crate) fn plan_move(
 
     for file in &files {
         if !code::parses_cleanly(&file.path, language_for_path(&file.path), &file.contents)? {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "file {} would not parse after moving '{}'",
                 file.path, target.name
-            ));
+            )));
         }
     }
     let destination_final = files
@@ -649,7 +661,7 @@ fn plan_reference_rewrites(
     destination_language: Option<&str>,
     inbound_references: &[CodeReference],
     reference_files: Vec<(String, String)>,
-) -> Result<PlannedReferenceRewrite, String> {
+) -> Result<PlannedReferenceRewrite> {
     if inbound_references.is_empty() {
         return Ok(PlannedReferenceRewrite::default());
     }
@@ -792,10 +804,8 @@ fn plan_reference_rewrites(
         );
     }
 
-    Err(
-        "move-symbol --rewrite-references currently supports Rust, Python, TypeScript, JavaScript, same-package Go, same-package Java type, same-package Kotlin, and same-module Swift source files only"
-            .to_string(),
-    )
+    Err(Error::msg("move-symbol --rewrite-references currently supports Rust, Python, TypeScript, JavaScript, same-package Go, same-package Java type, same-package Kotlin, and same-module Swift source files only"
+            .to_string()))
 }
 
 fn plan_go_same_package_reference_awareness(
@@ -805,7 +815,7 @@ fn plan_go_same_package_reference_awareness(
     destination_contents: &str,
     references_by_path: BTreeMap<String, Vec<CodeReference>>,
     reference_contents: BTreeMap<String, String>,
-) -> Result<PlannedReferenceRewrite, String> {
+) -> Result<PlannedReferenceRewrite> {
     let source_parent = path_parent_segments(&target.path);
     let destination_parent = path_parent_segments(destination_path);
     let source_package = go_package_name(source_contents).ok_or_else(|| {
@@ -830,34 +840,34 @@ fn plan_go_same_package_reference_awareness(
         );
     }
     if source_package != destination_package {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "move-symbol --rewrite-references requires Go source and destination files to share package '{source_package}'"
-        ));
+        )));
     }
 
     for (path, references) in references_by_path {
         if path_parent_segments(&path) != source_parent {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references cannot keep Go reference {path} valid across package directories"
-            ));
+            )));
         }
         let Some(contents) = reference_contents.get(&path) else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
-            ));
+            )));
         };
         if !code::parses_cleanly(&path, language_for_path(&path), contents)? {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "referencing file {path} is not valid Go code; refusing to trust stale references"
-            ));
+            )));
         }
         let reference_package = go_package_name(contents).ok_or_else(|| {
             format!("move-symbol --rewrite-references cannot determine Go package for {path}")
         })?;
         if reference_package != source_package {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references requires Go reference file {path} to share package '{source_package}'"
-            ));
+            )));
         }
         for reference in references {
             let line = line_at(contents, reference.line_start).ok_or_else(|| {
@@ -868,10 +878,10 @@ fn plan_go_same_package_reference_awareness(
             })?;
             let (_line, matches) = replace_identifier_in_line(line, &target.name, &target.name);
             if matches == 0 {
-                return Err(format!(
+                return Err(Error::msg(format!(
                     "move-symbol --rewrite-references could not verify Go reference '{}' on {path}:{}; rerun hugr index",
                     target.name, reference.line_start
-                ));
+                )));
             }
         }
     }
@@ -899,12 +909,12 @@ fn plan_go_cross_package_reference_rewrites(
     destination_package: &str,
     references_by_path: BTreeMap<String, Vec<CodeReference>>,
     reference_contents: BTreeMap<String, String>,
-) -> Result<PlannedReferenceRewrite, String> {
+) -> Result<PlannedReferenceRewrite> {
     if !starts_with_uppercase(&target.name) {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "move-symbol --rewrite-references cannot move unexported Go symbol '{}' across packages",
             target.name
-        ));
+        )));
     }
     let source_module = go_module_for_path(&target.path).ok_or_else(|| {
         format!(
@@ -934,22 +944,22 @@ fn plan_go_cross_package_reference_rewrites(
     let mut rewritten_reference_count = 0;
     for (path, references) in references_by_path {
         let Some(contents) = reference_contents.get(&path) else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
-            ));
+            )));
         };
         if !code::parses_cleanly(&path, language_for_path(&path), contents)? {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "referencing file {path} is not valid Go code; refusing to trust stale references"
-            ));
+            )));
         }
         let reference_package = go_package_name(contents).ok_or_else(|| {
             format!("move-symbol --rewrite-references cannot determine Go package for {path}")
         })?;
         if go_has_unsupported_import_alias(contents, &old_import) {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references cannot safely rewrite aliased Go import of '{old_import}' in {path}"
-            ));
+            )));
         }
 
         let (rewritten, changes) = go_rewrite_cross_package_references(
@@ -963,15 +973,15 @@ fn plan_go_cross_package_reference_rewrites(
             &reference_package,
         )?;
         if changes == 0 {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references made no Go import or reference change in {path}"
-            ));
+            )));
         }
         if !code::parses_cleanly(&path, language_for_path(&path), &rewritten)? {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "referencing file {path} would not parse after moving '{}'",
                 target.name
-            ));
+            )));
         }
         rewritten_reference_count += references.len();
         files.push(PlannedMoveFile {
@@ -1068,7 +1078,7 @@ fn go_rewrite_cross_package_references(
     old_import: &str,
     new_import: &str,
     reference_package: &str,
-) -> Result<(String, usize), String> {
+) -> Result<(String, usize)> {
     let trailing_newline = contents.ends_with('\n');
     let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
     let mut changes = go_rewrite_import_path(&mut lines, old_import, new_import);
@@ -1080,12 +1090,12 @@ fn go_rewrite_cross_package_references(
     }
 
     for reference in references {
-        let index = usize::try_from(reference.line_start - 1).map_err(|error| error.to_string())?;
+        let index = usize::try_from(reference.line_start - 1)?;
         let Some(line) = lines.get(index).cloned() else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol reference line {} is past end",
                 reference.line_start
-            ));
+            )));
         };
         let (rewritten, replacements) = if reference_package == destination_package {
             replace_go_selector_in_line(&line, source_package, symbol_name, symbol_name)
@@ -1100,10 +1110,10 @@ fn go_rewrite_cross_package_references(
             )
         };
         if replacements == 0 {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references could not rewrite Go reference '{}' on line {}; rerun hugr index",
                 symbol_name, reference.line_start
-            ));
+            )));
         }
         lines[index] = rewritten;
         changes += replacements;
@@ -1224,20 +1234,20 @@ fn plan_java_same_package_type_reference_awareness(
     destination_contents: &str,
     references_by_path: BTreeMap<String, Vec<CodeReference>>,
     reference_contents: BTreeMap<String, String>,
-) -> Result<PlannedReferenceRewrite, String> {
+) -> Result<PlannedReferenceRewrite> {
     if !java_reference_safe_kind(&target.kind) {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "move-symbol --rewrite-references supports Java moves only for type declarations, not {} '{}'",
             target.kind, target.name
-        ));
+        )));
     }
     if java_signature_is_public(&target.signature)
         && path_file_stem(destination_path).as_deref() != Some(target.name.as_str())
     {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "move-symbol --rewrite-references requires public Java type '{}' to move into {}.java",
             target.name, target.name
-        ));
+        )));
     }
 
     let source_package = java_package_name(source_contents).ok_or_else(|| {
@@ -1263,22 +1273,22 @@ fn plan_java_same_package_type_reference_awareness(
 
     for (path, references) in references_by_path {
         let Some(contents) = reference_contents.get(&path) else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
-            ));
+            )));
         };
         if !code::parses_cleanly(&path, language_for_path(&path), contents)? {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "referencing file {path} is not valid Java code; refusing to trust stale references"
-            ));
+            )));
         }
         let reference_package = java_package_name(contents).ok_or_else(|| {
             format!("move-symbol --rewrite-references cannot determine Java package for {path}")
         })?;
         if reference_package != source_package {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references requires Java reference file {path} to share package '{source_package}'"
-            ));
+            )));
         }
         for reference in references {
             let line = line_at(contents, reference.line_start).ok_or_else(|| {
@@ -1289,10 +1299,10 @@ fn plan_java_same_package_type_reference_awareness(
             })?;
             let (_line, matches) = replace_identifier_in_line(line, &target.name, &target.name);
             if matches == 0 {
-                return Err(format!(
+                return Err(Error::msg(format!(
                     "move-symbol --rewrite-references could not verify Java reference '{}' on {path}:{}; rerun hugr index",
                     target.name, reference.line_start
-                ));
+                )));
             }
         }
     }
@@ -1311,7 +1321,7 @@ fn plan_java_cross_package_reference_rewrites(
     destination_package: &str,
     references_by_path: BTreeMap<String, Vec<CodeReference>>,
     reference_contents: BTreeMap<String, String>,
-) -> Result<PlannedReferenceRewrite, String> {
+) -> Result<PlannedReferenceRewrite> {
     let old_import = format!("{source_package}.{}", target.name);
     let new_import = format!("{destination_package}.{}", target.name);
 
@@ -1321,19 +1331,19 @@ fn plan_java_cross_package_reference_rewrites(
 
     for (path, references) in references_by_path {
         let Some(contents) = reference_contents.get(&path) else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
-            ));
+            )));
         };
         if !code::parses_cleanly(&path, language_for_path(&path), contents)? {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "referencing file {path} is not valid Java code; refusing to trust stale references"
-            ));
+            )));
         }
         if java_has_wildcard_import(contents, source_package) {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references cannot safely rewrite a Java wildcard import of '{source_package}.*' in {path}"
-            ));
+            )));
         }
 
         for reference in &references {
@@ -1345,10 +1355,10 @@ fn plan_java_cross_package_reference_rewrites(
             })?;
             let (_line, matches) = replace_identifier_in_line(line, &target.name, &target.name);
             if matches == 0 {
-                return Err(format!(
+                return Err(Error::msg(format!(
                     "move-symbol --rewrite-references could not verify Java reference '{}' on {path}:{}; rerun hugr index",
                     target.name, reference.line_start
-                ));
+                )));
             }
         }
 
@@ -1368,15 +1378,15 @@ fn plan_java_cross_package_reference_rewrites(
             )
         })?;
         if changes == 0 {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references made no Java import change in {path}"
-            ));
+            )));
         }
         if !code::parses_cleanly(&path, language_for_path(&path), &rewritten)? {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "referencing file {path} would not parse after moving '{}'",
                 target.name
-            ));
+            )));
         }
         rewritten_reference_count += references.len();
         files.push(PlannedMoveFile {
@@ -1501,12 +1511,12 @@ fn plan_kotlin_same_package_reference_awareness(
     destination_contents: &str,
     references_by_path: BTreeMap<String, Vec<CodeReference>>,
     reference_contents: BTreeMap<String, String>,
-) -> Result<PlannedReferenceRewrite, String> {
+) -> Result<PlannedReferenceRewrite> {
     if !kotlin_reference_safe_kind(&target.kind) {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "move-symbol --rewrite-references supports Kotlin moves only for top-level type declarations, not {} '{}'",
             target.kind, target.name
-        ));
+        )));
     }
 
     let source_package = kotlin_package_name(source_contents);
@@ -1523,21 +1533,21 @@ fn plan_kotlin_same_package_reference_awareness(
 
     for (path, references) in references_by_path {
         let Some(contents) = reference_contents.get(&path) else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
-            ));
+            )));
         };
         if !code::parses_cleanly(&path, language_for_path(&path), contents)? {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "referencing file {path} is not valid Kotlin code; refusing to trust stale references"
-            ));
+            )));
         }
         let reference_package = kotlin_package_name(contents);
         if reference_package != source_package {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references requires Kotlin reference file {path} to share package '{}'",
                 source_package.as_deref().unwrap_or("<root>")
-            ));
+            )));
         }
         for reference in references {
             let line = line_at(contents, reference.line_start).ok_or_else(|| {
@@ -1548,10 +1558,10 @@ fn plan_kotlin_same_package_reference_awareness(
             })?;
             let (_line, matches) = replace_identifier_in_line(line, &target.name, &target.name);
             if matches == 0 {
-                return Err(format!(
+                return Err(Error::msg(format!(
                     "move-symbol --rewrite-references could not verify Kotlin reference '{}' on {path}:{}; rerun hugr index",
                     target.name, reference.line_start
-                ));
+                )));
             }
         }
     }
@@ -1573,12 +1583,10 @@ fn plan_kotlin_cross_package_reference_rewrites(
     destination_package: Option<&str>,
     references_by_path: BTreeMap<String, Vec<CodeReference>>,
     reference_contents: BTreeMap<String, String>,
-) -> Result<PlannedReferenceRewrite, String> {
+) -> Result<PlannedReferenceRewrite> {
     let Some(destination_package) = destination_package else {
-        return Err(
-            "move-symbol --rewrite-references cannot move a Kotlin type into the root package with inbound references"
-                .to_string(),
-        );
+        return Err(Error::msg("move-symbol --rewrite-references cannot move a Kotlin type into the root package with inbound references"
+                .to_string()));
     };
     let old_import = source_package.map(|pkg| format!("{pkg}.{}", target.name));
     let new_import = format!("{destination_package}.{}", target.name);
@@ -1589,20 +1597,20 @@ fn plan_kotlin_cross_package_reference_rewrites(
 
     for (path, references) in references_by_path {
         let Some(contents) = reference_contents.get(&path) else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
-            ));
+            )));
         };
         if !code::parses_cleanly(&path, language_for_path(&path), contents)? {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "referencing file {path} is not valid Kotlin code; refusing to trust stale references"
-            ));
+            )));
         }
         if kotlin_has_wildcard_or_aliased_import(contents, &target.name) {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references cannot safely rewrite wildcard or aliased Kotlin import for '{}' in {path}",
                 target.name
-            ));
+            )));
         }
 
         // Verify each indexed reference line still names the symbol.
@@ -1615,10 +1623,10 @@ fn plan_kotlin_cross_package_reference_rewrites(
             })?;
             let (_line, matches) = replace_identifier_in_line(line, &target.name, &target.name);
             if matches == 0 {
-                return Err(format!(
+                return Err(Error::msg(format!(
                     "move-symbol --rewrite-references could not verify Kotlin reference '{}' on {path}:{}; rerun hugr index",
                     target.name, reference.line_start
-                ));
+                )));
             }
         }
 
@@ -1636,15 +1644,15 @@ fn plan_kotlin_cross_package_reference_rewrites(
             )
         })?;
         if changes == 0 {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references made no Kotlin import change in {path}"
-            ));
+            )));
         }
         if !code::parses_cleanly(&path, language_for_path(&path), &rewritten)? {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "referencing file {path} would not parse after moving '{}'",
                 target.name
-            ));
+            )));
         }
         rewritten_reference_count += references.len();
         files.push(PlannedMoveFile {
@@ -1798,12 +1806,12 @@ fn plan_swift_same_module_reference_awareness(
     destination_path: &str,
     references_by_path: BTreeMap<String, Vec<CodeReference>>,
     reference_contents: BTreeMap<String, String>,
-) -> Result<PlannedReferenceRewrite, String> {
+) -> Result<PlannedReferenceRewrite> {
     if !swift_reference_safe_kind(&target.kind) {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "move-symbol --rewrite-references supports Swift moves only for type declarations, not {} '{}'",
             target.kind, target.name
-        ));
+        )));
     }
 
     // Swift has no per-file import for same-module symbols, so a move inside one
@@ -1829,10 +1837,8 @@ fn plan_swift_same_module_reference_awareness(
             }
             (Some(_), Some(_)) => {}
             _ => {
-                return Err(
-                    "move-symbol --rewrite-references cannot keep Swift reference valid across module directories without Package.swift"
-                        .to_string(),
-                );
+                return Err(Error::msg("move-symbol --rewrite-references cannot keep Swift reference valid across module directories without Package.swift"
+                        .to_string()));
             }
         }
     }
@@ -1843,24 +1849,24 @@ fn plan_swift_same_module_reference_awareness(
                 format!("move-symbol --rewrite-references cannot resolve Swift module for {path}")
             })?;
             if Some(reference_module) != source_module {
-                return Err(format!(
+                return Err(Error::msg(format!(
                     "move-symbol --rewrite-references cannot keep Swift reference {path} valid across module directories"
-                ));
+                )));
             }
         } else if path_parent_segments(&path) != source_parent {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references cannot keep Swift reference {path} valid across module directories"
-            ));
+            )));
         }
         let Some(contents) = reference_contents.get(&path) else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
-            ));
+            )));
         };
         if !code::parses_cleanly(&path, language_for_path(&path), contents)? {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "referencing file {path} is not valid Swift code; refusing to trust stale references"
-            ));
+            )));
         }
         for reference in references {
             let line = line_at(contents, reference.line_start).ok_or_else(|| {
@@ -1871,10 +1877,10 @@ fn plan_swift_same_module_reference_awareness(
             })?;
             let (_line, matches) = replace_identifier_in_line(line, &target.name, &target.name);
             if matches == 0 {
-                return Err(format!(
+                return Err(Error::msg(format!(
                     "move-symbol --rewrite-references could not verify Swift reference '{}' on {path}:{}; rerun hugr index",
                     target.name, reference.line_start
-                ));
+                )));
             }
         }
     }
@@ -1889,26 +1895,26 @@ fn plan_swift_cross_module_reference_awareness(
     destination_module: Option<String>,
     references_by_path: BTreeMap<String, Vec<CodeReference>>,
     reference_contents: BTreeMap<String, String>,
-) -> Result<PlannedReferenceRewrite, String> {
+) -> Result<PlannedReferenceRewrite> {
     let Some(source_module) = source_module else {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "move-symbol --rewrite-references requires Package.swift to resolve Swift module for {}",
             target.path
-        ));
+        )));
     };
     let Some(destination_module) = destination_module else {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "move-symbol --rewrite-references requires Package.swift to resolve Swift module for {destination_path}"
-        ));
+        )));
     };
     if source_module == destination_module {
         return Ok(PlannedReferenceRewrite::default());
     }
     if !swift_signature_is_public(&target.signature) {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "move-symbol --rewrite-references cannot move internal Swift {} '{}' across modules",
             target.kind, target.name
-        ));
+        )));
     }
 
     let mut files = Vec::new();
@@ -1916,14 +1922,14 @@ fn plan_swift_cross_module_reference_awareness(
     let mut rewritten_reference_count = 0;
     for (path, references) in references_by_path {
         let Some(contents) = reference_contents.get(&path) else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
-            ));
+            )));
         };
         if !code::parses_cleanly(&path, language_for_path(&path), contents)? {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "referencing file {path} is not valid Swift code; refusing to trust stale references"
-            ));
+            )));
         }
         let reference_module = swift_package_module_for_path(&path).ok_or_else(|| {
             format!("move-symbol --rewrite-references cannot resolve Swift module for {path}")
@@ -1937,10 +1943,10 @@ fn plan_swift_cross_module_reference_awareness(
             })?;
             let (_line, matches) = replace_identifier_in_line(line, &target.name, &target.name);
             if matches == 0 {
-                return Err(format!(
+                return Err(Error::msg(format!(
                     "move-symbol --rewrite-references could not verify Swift reference '{}' on {path}:{}; rerun hugr index",
                     target.name, reference.line_start
-                ));
+                )));
             }
         }
         if reference_module == destination_module {
@@ -1951,10 +1957,10 @@ fn plan_swift_cross_module_reference_awareness(
             continue;
         }
         if !code::parses_cleanly(&path, language_for_path(&path), &rewritten)? {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "referencing file {path} would not parse after moving '{}'",
                 target.name
-            ));
+            )));
         }
         rewritten_reference_count += references.len();
         files.push(PlannedMoveFile {
@@ -2048,18 +2054,18 @@ fn rewrite_reference_files<F>(
     reference_contents: BTreeMap<String, String>,
     old_reference_description: &str,
     mut rewrite_file: F,
-) -> Result<PlannedReferenceRewrite, String>
+) -> Result<PlannedReferenceRewrite>
 where
-    F: FnMut(&str, &str, &BTreeSet<i64>) -> Result<(String, usize), String>,
+    F: FnMut(&str, &str, &BTreeSet<i64>) -> Result<(String, usize)>,
 {
     let mut files = Vec::new();
     let mut changed_files = Vec::new();
     let mut rewritten_reference_count = 0;
     for (path, references) in references_by_path {
         let Some(contents) = reference_contents.get(&path) else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references missing source contents for referenced file {path}; rerun hugr index"
-            ));
+            )));
         };
         let mut line_numbers = BTreeSet::new();
         for reference in &references {
@@ -2067,15 +2073,15 @@ where
         }
         let (rewritten, replacement_count) = rewrite_file(&path, contents, &line_numbers)?;
         if replacement_count == 0 {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol --rewrite-references could not rewrite {old_reference_description} in indexed references for {path}"
-            ));
+            )));
         }
         if !code::parses_cleanly(&path, language_for_path(&path), &rewritten)? {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "referencing file {path} would not parse after moving '{}'",
                 target.name
-            ));
+            )));
         }
         rewritten_reference_count += replacement_count;
         files.push(PlannedMoveFile {
@@ -2116,7 +2122,7 @@ fn rewrite_rust_references_on_lines(
     new_module: &str,
     symbol_name: &str,
     line_numbers: &BTreeSet<i64>,
-) -> Result<(String, usize), String> {
+) -> Result<(String, usize)> {
     let trailing_newline = contents.ends_with('\n');
     let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
     let mut replacement_count = 0;
@@ -2127,15 +2133,15 @@ fn rewrite_rust_references_on_lines(
 
     for line_number in line_numbers.iter().rev() {
         if *line_number < 1 {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol reference line {line_number} in {path} is invalid"
-            ));
+            )));
         }
-        let index = usize::try_from(line_number - 1).map_err(|error| error.to_string())?;
+        let index = usize::try_from(line_number - 1)?;
         let Some(line) = lines.get(index) else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol reference line {line_number} is past end of {path}"
-            ));
+            )));
         };
         let (rewritten, line_replacements) = rewrite_rust_reference_line(
             line,
@@ -2665,7 +2671,7 @@ fn rewrite_python_references_on_lines(
     new_module: &str,
     symbol_name: &str,
     line_numbers: &BTreeSet<i64>,
-) -> Result<(String, usize), String> {
+) -> Result<(String, usize)> {
     let trailing_newline = contents.ends_with('\n');
     let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
     let old_module_leaf = python_module_leaf(old_module);
@@ -2681,15 +2687,15 @@ fn rewrite_python_references_on_lines(
 
     for line_number in line_numbers.iter().rev() {
         if *line_number < 1 {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol reference line {line_number} in {path} is invalid"
-            ));
+            )));
         }
-        let index = usize::try_from(line_number - 1).map_err(|error| error.to_string())?;
+        let index = usize::try_from(line_number - 1)?;
         let Some(line) = lines.get(index) else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol reference line {line_number} is past end of {path}"
-            ));
+            )));
         };
         let (rewritten, line_replacements) = rewrite_python_reference_line(
             line,
@@ -3072,7 +3078,7 @@ fn rewrite_javascript_references_on_lines(
     destination_path: &str,
     symbol_name: &str,
     line_numbers: &BTreeSet<i64>,
-) -> Result<(String, usize), String> {
+) -> Result<(String, usize)> {
     let trailing_newline = contents.ends_with('\n');
     let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
     let namespace_aliases = javascript_namespace_aliases_for_source(&lines, path, source_path);
@@ -3098,15 +3104,15 @@ fn rewrite_javascript_references_on_lines(
 
     for line_number in line_numbers.iter().rev() {
         if *line_number < 1 {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol reference line {line_number} in {path} is invalid"
-            ));
+            )));
         }
-        let index = usize::try_from(line_number - 1).map_err(|error| error.to_string())?;
+        let index = usize::try_from(line_number - 1)?;
         let Some(line) = lines.get(index) else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol reference line {line_number} is past end of {path}"
-            ));
+            )));
         };
         let (rewritten, line_replacements) = rewrite_javascript_reference_line(
             line,
@@ -3133,19 +3139,19 @@ fn javascript_used_namespace_aliases(
     line_numbers: &BTreeSet<i64>,
     namespace_aliases: &BTreeSet<String>,
     symbol_name: &str,
-) -> Result<BTreeSet<String>, String> {
+) -> Result<BTreeSet<String>> {
     let mut used_aliases = BTreeSet::new();
     for line_number in line_numbers {
         if *line_number < 1 {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol reference line {line_number} is invalid"
-            ));
+            )));
         }
-        let index = usize::try_from(line_number - 1).map_err(|error| error.to_string())?;
+        let index = usize::try_from(line_number - 1)?;
         let Some(line) = lines.get(index) else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "move-symbol reference line {line_number} is past end"
-            ));
+            )));
         };
         for alias in namespace_aliases {
             if javascript_line_has_member_reference(line, alias, symbol_name) {
@@ -3965,7 +3971,7 @@ fn resolve_target(
     name: &str,
     kind: Option<&str>,
     action: &str,
-) -> Result<CodeSymbol, String> {
+) -> Result<CodeSymbol> {
     let kind = kind.map(str::trim).filter(|kind| !kind.is_empty());
     let matches = symbols
         .iter()
@@ -3981,44 +3987,42 @@ fn resolve_target(
     }
 }
 
-fn no_match_error(symbols: &[CodeSymbol], name: &str, kind: Option<&str>, action: &str) -> String {
+fn no_match_error(symbols: &[CodeSymbol], name: &str, kind: Option<&str>, action: &str) -> Error {
     let known = symbols
         .iter()
         .filter(|symbol| symbol.name == name)
         .map(|symbol| format!("{} at line {}", symbol.kind, symbol.line_start))
         .collect::<Vec<_>>();
 
-    if let Some(kind) = kind {
-        if known.is_empty() {
-            format!("no symbol named '{name}' found to {action}")
-        } else {
-            format!(
-                "no {kind} named '{name}' found to {action}; found {}",
-                known.join(", ")
-            )
-        }
-    } else {
-        format!("no symbol named '{name}' found to {action}")
+    let Some(kind) = kind else {
+        return Error::msg(format!("no symbol named '{name}' found to {action}"));
+    };
+    if known.is_empty() {
+        return Error::msg(format!("no symbol named '{name}' found to {action}"));
     }
+    Error::msg(format!(
+        "no {kind} named '{name}' found to {action}; found {}",
+        known.join(", ")
+    ))
 }
 
-fn ambiguous_error(matches: &[CodeSymbol], name: &str) -> String {
+fn ambiguous_error(matches: &[CodeSymbol], name: &str) -> Error {
     let candidates = matches
         .iter()
         .map(|symbol| format!("{} at line {}", symbol.kind, symbol.line_start))
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
+    Error::msg(format!(
         "symbol '{name}' is ambiguous ({}); pass --kind to select one: {candidates}",
         matches.len()
-    )
+    ))
 }
 
-fn validate_span(line_start: i64, line_end: i64, path: &str) -> Result<(), String> {
+fn validate_span(line_start: i64, line_end: i64, path: &str) -> Result<()> {
     if line_start < 1 || line_end < line_start {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "symbol span {line_start}-{line_end} in {path} is invalid"
-        ));
+        )));
     }
     Ok(())
 }
@@ -4029,12 +4033,12 @@ fn validate_replacement_body(
     language_label: &str,
     new_body: &str,
     target: &CodeSymbol,
-) -> Result<(), String> {
+) -> Result<()> {
     if !code::parses_cleanly(path, language, new_body)? {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "replacement body is not valid {language_label} source; \
              replace-symbol will not write code that fails to parse"
-        ));
+        )));
     }
 
     let produced = code::symbols_in_source(path, language, new_body)?;
@@ -4046,26 +4050,26 @@ fn validate_replacement_body(
         .collect::<Vec<_>>();
 
     match named.as_slice() {
-        [] => Err(format!(
+        [] => Err(Error::msg(format!(
             "replacement body does not define {language_label} symbol '{}'; \
              refusing to rename or remove it via replace-symbol",
             target.name
-        )),
+        ))),
         [single] => {
             if single.kind == target.kind {
                 Ok(())
             } else {
-                Err(format!(
+                Err(Error::msg(format!(
                     "replacement body defines '{}' as {} but the target is {}; \
                      replace-symbol will not change a symbol's kind",
                     target.name, single.kind, target.kind
-                ))
+                )))
             }
         }
-        _ => Err(format!(
+        _ => Err(Error::msg(format!(
             "replacement body defines '{}' more than once",
             target.name
-        )),
+        ))),
     }
 }
 
@@ -4152,17 +4156,17 @@ fn splice_lines(
     line_start: i64,
     line_end: i64,
     replacement: &str,
-) -> Result<(String, i64), String> {
-    let start = usize::try_from(line_start - 1).map_err(|error| error.to_string())?;
-    let end = usize::try_from(line_end - 1).map_err(|error| error.to_string())?;
+) -> Result<(String, i64)> {
+    let start = usize::try_from(line_start - 1)?;
+    let end = usize::try_from(line_end - 1)?;
 
     let trailing_newline = contents.ends_with('\n');
     let lines = contents.lines().collect::<Vec<_>>();
     if end >= lines.len() {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "symbol span ends at line {line_end} but file has {} lines",
             lines.len()
-        ));
+        )));
     }
 
     let replacement_lines = replacement.split('\n').collect::<Vec<_>>();
@@ -4171,9 +4175,7 @@ fn splice_lines(
     result.extend_from_slice(&replacement_lines);
     result.extend_from_slice(&lines[end + 1..]);
 
-    let new_line_end = i64::try_from(start + replacement_lines.len())
-        .map_err(|error| error.to_string())?
-        .max(line_start);
+    let new_line_end = i64::try_from(start + replacement_lines.len())?.max(line_start);
 
     let mut rendered = result.join("\n");
     if trailing_newline {
@@ -4195,34 +4197,29 @@ fn extract_line_range(
     line_start: i64,
     line_end: i64,
     path: &str,
-) -> Result<String, String> {
-    let start = usize::try_from(line_start - 1).map_err(|error| error.to_string())?;
-    let end = usize::try_from(line_end - 1).map_err(|error| error.to_string())?;
+) -> Result<String> {
+    let start = usize::try_from(line_start - 1)?;
+    let end = usize::try_from(line_end - 1)?;
     let lines = contents.lines().collect::<Vec<_>>();
     if end >= lines.len() {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "symbol span ends at line {line_end} but {path} has {} lines",
             lines.len()
-        ));
+        )));
     }
     Ok(lines[start..=end].join("\n"))
 }
 
-fn remove_line_range(
-    contents: &str,
-    line_start: i64,
-    line_end: i64,
-    path: &str,
-) -> Result<String, String> {
-    let start = usize::try_from(line_start - 1).map_err(|error| error.to_string())?;
-    let end = usize::try_from(line_end - 1).map_err(|error| error.to_string())?;
+fn remove_line_range(contents: &str, line_start: i64, line_end: i64, path: &str) -> Result<String> {
+    let start = usize::try_from(line_start - 1)?;
+    let end = usize::try_from(line_end - 1)?;
     let trailing_newline = contents.ends_with('\n');
     let lines = contents.lines().collect::<Vec<_>>();
     if end >= lines.len() {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "symbol span ends at line {line_end} but {path} has {} lines",
             lines.len()
-        ));
+        )));
     }
 
     let mut result = Vec::with_capacity(lines.len().saturating_sub(end - start + 1));
@@ -4262,26 +4259,22 @@ fn reject_destination_symbol_collision(
     destination_path: &str,
     destination_contents: &str,
     target: &CodeSymbol,
-) -> Result<(), String> {
+) -> Result<()> {
     let language = language_for_path(destination_path);
     let symbols = code::symbols_in_source(destination_path, language, destination_contents)?;
     if symbols
         .iter()
         .any(|symbol| symbol.name == target.name && symbol.kind == target.kind)
     {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "move-symbol would collide with existing {} '{}' in {}",
             target.kind, target.name, destination_path
-        ));
+        )));
     }
     Ok(())
 }
 
-fn reject_target_name_collision(
-    target: &CodeSymbol,
-    contents: &str,
-    new_name: &str,
-) -> Result<(), String> {
+fn reject_target_name_collision(target: &CodeSymbol, contents: &str, new_name: &str) -> Result<()> {
     let language = language_for_path(&target.path);
     let symbols = code::symbols_in_source(&target.path, language, contents)?;
     if symbols.iter().any(|symbol| {
@@ -4289,10 +4282,10 @@ fn reject_target_name_collision(
             && symbol.kind == target.kind
             && !(symbol.path == target.path && symbol.line_start == target.line_start)
     }) {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "rename-symbol would collide with existing {} '{}' in {}",
             target.kind, new_name, target.path
-        ));
+        )));
     }
     Ok(())
 }
@@ -4301,7 +4294,7 @@ fn validate_moved_symbol_in_destination(
     destination_path: &str,
     destination_contents: &str,
     target: &CodeSymbol,
-) -> Result<(), String> {
+) -> Result<()> {
     let language = language_for_path(destination_path);
     let symbols = code::symbols_in_source(destination_path, language, destination_contents)?;
     let matches = symbols
@@ -4309,10 +4302,10 @@ fn validate_moved_symbol_in_destination(
         .filter(|symbol| symbol.name == target.name && symbol.kind == target.kind)
         .count();
     if matches != 1 {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "move-symbol could not verify moved {} '{}' in {}",
             target.kind, target.name, destination_path
-        ));
+        )));
     }
     Ok(())
 }
@@ -4323,28 +4316,28 @@ fn replace_identifier_on_lines(
     old_name: &str,
     new_name: &str,
     line_numbers: &BTreeSet<i64>,
-) -> Result<(String, usize), String> {
+) -> Result<(String, usize)> {
     let trailing_newline = contents.ends_with('\n');
     let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
     let mut replacement_count = 0;
 
     for line_number in line_numbers {
         if *line_number < 1 {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "rename-symbol reference line {line_number} in {path} is invalid"
-            ));
+            )));
         }
-        let index = usize::try_from(line_number - 1).map_err(|error| error.to_string())?;
+        let index = usize::try_from(line_number - 1)?;
         let Some(line) = lines.get_mut(index) else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "rename-symbol reference line {line_number} is past end of {path}"
-            ));
+            )));
         };
         let (renamed, line_replacements) = replace_identifier_in_line(line, old_name, new_name);
         if line_replacements == 0 {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "rename-symbol found no '{old_name}' identifier on {path}:{line_number}; rerun hugr index"
-            ));
+            )));
         }
         *line = renamed;
         replacement_count += line_replacements;
@@ -4390,7 +4383,7 @@ fn validate_renamed_target(
     target: &CodeSymbol,
     new_name: &str,
     planned_files: &[PlannedRenameFile],
-) -> Result<(), String> {
+) -> Result<()> {
     let target_file = planned_files
         .iter()
         .find(|file| file.path == target.path)
@@ -4408,20 +4401,20 @@ fn validate_renamed_target(
             && symbol.line_start == target.line_start
     });
     if renamed.count() != 1 {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "rename-symbol could not verify renamed {} '{}' at {}:{}",
             target.kind, new_name, target.path, target.line_start
-        ));
+        )));
     }
     if symbols.iter().any(|symbol| {
         symbol.name == target.name
             && symbol.kind == target.kind
             && symbol.line_start == target.line_start
     }) {
-        return Err(format!(
+        return Err(Error::msg(format!(
             "rename-symbol left old {} '{}' at {}:{}",
             target.kind, target.name, target.path, target.line_start
-        ));
+        )));
     }
     Ok(())
 }
@@ -4655,7 +4648,8 @@ mod tests {
             None,
             "pub fn absent() {}",
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("no symbol named 'absent'"), "{error}");
     }
 
@@ -4668,7 +4662,8 @@ mod tests {
             None,
             "pub fn renamed() -> u8 {\n    42\n}",
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("does not define"), "{error}");
         assert!(error.contains("greet"), "{error}");
     }
@@ -4682,7 +4677,8 @@ mod tests {
             None,
             "pub struct thing;",
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("kind"), "{error}");
     }
 
@@ -4695,7 +4691,8 @@ mod tests {
             None,
             "pub fn greet() -> u8 { 42",
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("not valid rust source"), "{error}");
     }
 
@@ -4718,8 +4715,9 @@ mod tests {
     #[test]
     fn ambiguous_without_kind_is_refused() {
         let source = "pub struct Thing;\n\npub fn Thing() {}\n";
-        let error =
-            plan_replacement("src/lib.rs", source, "Thing", None, "pub fn Thing() {}").unwrap_err();
+        let error = plan_replacement("src/lib.rs", source, "Thing", None, "pub fn Thing() {}")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("ambiguous"), "{error}");
         assert!(error.contains("--kind"), "{error}");
     }
@@ -4875,7 +4873,8 @@ mod tests {
             vec![("src/lib.rs".to_string(), RUST_SOURCE.to_string())],
             "not-valid",
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("valid ASCII identifier"), "{error}");
     }
@@ -4906,7 +4905,8 @@ mod tests {
             ],
             "welcome",
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("rerun hugr index"), "{error}");
     }
@@ -5377,7 +5377,8 @@ mod tests {
             vec![("plugin/caller.go".to_string(), caller.to_string())],
             true,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("unexported Go symbol"), "{error}");
     }
@@ -5464,7 +5465,8 @@ mod tests {
             vec![("src/plugin/Caller.java".to_string(), caller.to_string())],
             true,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("only for type declarations"), "{error}");
     }
@@ -5574,7 +5576,8 @@ mod tests {
             vec![("src/app/Caller.java".to_string(), caller.to_string())],
             true,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("wildcard import"), "{error}");
     }
@@ -5792,7 +5795,8 @@ mod tests {
             vec![("src/app/Caller.kt".to_string(), caller.to_string())],
             true,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("wildcard or aliased"), "{error}");
     }
@@ -5825,7 +5829,8 @@ mod tests {
             vec![("src/plugin/Caller.kt".to_string(), caller.to_string())],
             true,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("top-level type declarations"), "{error}");
     }
@@ -5906,7 +5911,8 @@ mod tests {
             vec![("Sources/App/Caller.swift".to_string(), caller.to_string())],
             true,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("without Package.swift"), "{error}");
     }
@@ -5939,7 +5945,8 @@ mod tests {
             vec![("Sources/App/Caller.swift".to_string(), caller.to_string())],
             true,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("type declarations"), "{error}");
     }
@@ -5968,7 +5975,8 @@ mod tests {
             Vec::new(),
             false,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("indexed inbound reference"), "{error}");
     }
@@ -5986,7 +5994,8 @@ mod tests {
             Vec::new(),
             false,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("would collide"), "{error}");
     }

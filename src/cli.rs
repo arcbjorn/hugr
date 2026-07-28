@@ -1,4 +1,5 @@
 use crate::daemon::DEFAULT_DAEMON_ADDR;
+use crate::error::{Error, Result};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -146,7 +147,7 @@ pub(crate) enum OutputFormat {
 }
 
 impl Command {
-    pub(crate) fn parse(args: &[String]) -> Result<Self, String> {
+    pub(crate) fn parse(args: &[String]) -> Result<Self> {
         let Some(command) = args.get(1).map(String::as_str) else {
             return Ok(Self::Help);
         };
@@ -212,12 +213,12 @@ impl Command {
             "hook" => parse_hook_command(args),
             "doctor" => Ok(Self::Doctor),
             "help" | "--help" | "-h" => Ok(Self::Help),
-            unknown => Err(format!("unknown command '{unknown}'")),
+            unknown => Err(Error::msg(format!("unknown command '{unknown}'"))),
         }
     }
 }
 
-fn parse_remember_command(args: &[String]) -> Result<Command, String> {
+fn parse_remember_command(args: &[String]) -> Result<Command> {
     let mut options = MemoryWriteArgs::default();
     let mut words = Vec::new();
     let mut global = false;
@@ -283,7 +284,7 @@ fn parse_remember_command(args: &[String]) -> Result<Command, String> {
         } else if arg == "--global" {
             global = true;
         } else if arg.starts_with("--") {
-            return Err(format!("unknown option '{arg}'"));
+            return Err(Error::msg(format!("unknown option '{arg}'")));
         } else {
             words.push(arg.clone());
         }
@@ -293,7 +294,7 @@ fn parse_remember_command(args: &[String]) -> Result<Command, String> {
 
     let text = words.join(" ");
     if text.trim().is_empty() {
-        Err("hugr remember requires text".to_string())
+        Err(Error::msg("hugr remember requires text".to_string()))
     } else {
         Ok(Command::Remember {
             text,
@@ -303,24 +304,24 @@ fn parse_remember_command(args: &[String]) -> Result<Command, String> {
     }
 }
 
-fn required_option_value(value: Option<&str>, command: &str) -> Result<String, String> {
+fn required_option_value(value: Option<&str>, command: &str) -> Result<String> {
     value
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
-        .ok_or_else(|| format!("{command} requires a value"))
+        .ok_or_else(|| Error::msg(format!("{command} requires a value")))
 }
 
-fn parse_memory_source(value: Option<&str>, command: &str) -> Result<MemorySourceArg, String> {
+fn parse_memory_source(value: Option<&str>, command: &str) -> Result<MemorySourceArg> {
     let value = value
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| format!("{command} requires a value"))?;
+        .ok_or_else(|| Error::msg(format!("{command} requires a value")))?;
     let Some((kind, locator)) = value.split_once(':') else {
-        return Err(format!("{command} must use kind:locator"));
+        return Err(Error::msg(format!("{command} must use kind:locator")));
     };
     let kind = kind.trim();
     let locator = locator.trim();
     if kind.is_empty() || locator.is_empty() {
-        Err(format!("{command} must use kind:locator"))
+        Err(Error::msg(format!("{command} must use kind:locator")))
     } else {
         Ok(MemorySourceArg {
             kind: kind.to_string(),
@@ -329,15 +330,15 @@ fn parse_memory_source(value: Option<&str>, command: &str) -> Result<MemorySourc
     }
 }
 
-fn parse_observe_command(args: &[String]) -> Result<Command, String> {
+fn parse_observe_command(args: &[String]) -> Result<Command> {
     match args.get(2).map(String::as_str) {
         Some("command") => parse_observe_shell_command(args),
-        Some(unknown) => Err(format!("unknown observe command '{unknown}'")),
-        None => Err("hugr observe requires a subcommand".to_string()),
+        Some(unknown) => Err(Error::msg(format!("unknown observe command '{unknown}'"))),
+        None => Err(Error::msg("hugr observe requires a subcommand".to_string())),
     }
 }
 
-fn parse_observe_shell_command(args: &[String]) -> Result<Command, String> {
+fn parse_observe_shell_command(args: &[String]) -> Result<Command> {
     let mut status = None;
     let mut command = Vec::new();
     let mut index = 3;
@@ -359,7 +360,7 @@ fn parse_observe_shell_command(args: &[String]) -> Result<Command, String> {
                 "hugr observe command --status",
             )?);
         } else if arg.starts_with("--") {
-            return Err(format!("unknown option '{arg}'"));
+            return Err(Error::msg(format!("unknown option '{arg}'")));
         } else {
             command.extend(args.iter().skip(index).cloned());
             break;
@@ -368,40 +369,45 @@ fn parse_observe_shell_command(args: &[String]) -> Result<Command, String> {
         index += 1;
     }
 
-    let status = status.ok_or_else(|| "hugr observe command requires --status".to_string())?;
+    let status =
+        status.ok_or_else(|| Error::msg("hugr observe command requires --status".to_string()))?;
     if command.is_empty() {
-        Err("hugr observe command requires a command".to_string())
+        Err(Error::msg(
+            "hugr observe command requires a command".to_string(),
+        ))
     } else {
         Ok(Command::Observe { status, command })
     }
 }
 
-fn parse_status_code(value: Option<&str>, command: &str) -> Result<i32, String> {
+fn parse_status_code(value: Option<&str>, command: &str) -> Result<i32> {
     value
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| format!("{command} requires a value"))?
+        .ok_or_else(|| Error::msg(format!("{command} requires a value")))?
         .parse::<i32>()
-        .map_err(|_| format!("{command} must be an integer"))
+        .map_err(|_| Error::msg(format!("{command} must be an integer")))
 }
 
-fn parse_shell_hook_command(args: &[String]) -> Result<Command, String> {
+fn parse_shell_hook_command(args: &[String]) -> Result<Command> {
     let shell = args
         .get(2)
         .filter(|value| !value.trim().is_empty())
         .cloned()
-        .ok_or_else(|| "hugr shell-hook requires a shell".to_string())?;
+        .ok_or_else(|| Error::msg("hugr shell-hook requires a shell".to_string()))?;
 
     if args.len() > 3 {
-        return Err(format!("unknown option '{}'", args[3]));
+        return Err(Error::msg(format!("unknown option '{}'", args[3])));
     }
 
     match shell.as_str() {
         "bash" | "zsh" => Ok(Command::ShellHook { shell }),
-        _ => Err("hugr shell-hook supports bash or zsh".to_string()),
+        _ => Err(Error::msg(
+            "hugr shell-hook supports bash or zsh".to_string(),
+        )),
     }
 }
 
-fn parse_daemon_command(args: &[String]) -> Result<Command, String> {
+fn parse_daemon_command(args: &[String]) -> Result<Command> {
     let mut addr = DEFAULT_DAEMON_ADDR.to_string();
     let mut index = 2;
 
@@ -413,14 +419,16 @@ fn parse_daemon_command(args: &[String]) -> Result<Command, String> {
                 .get(index)
                 .filter(|value| !value.trim().is_empty())
                 .cloned()
-                .ok_or_else(|| "hugr daemon --addr requires a value".to_string())?;
+                .ok_or_else(|| Error::msg("hugr daemon --addr requires a value".to_string()))?;
         } else if let Some(value) = arg.strip_prefix("--addr=") {
             if value.trim().is_empty() {
-                return Err("hugr daemon --addr requires a value".to_string());
+                return Err(Error::msg(
+                    "hugr daemon --addr requires a value".to_string(),
+                ));
             }
             addr = value.to_string();
         } else {
-            return Err(format!("unknown option '{arg}'"));
+            return Err(Error::msg(format!("unknown option '{arg}'")));
         }
 
         index += 1;
@@ -429,7 +437,7 @@ fn parse_daemon_command(args: &[String]) -> Result<Command, String> {
     Ok(Command::Daemon { addr })
 }
 
-fn parse_run_command(args: &[String]) -> Result<Command, String> {
+fn parse_run_command(args: &[String]) -> Result<Command> {
     let mut command = args.iter().skip(2);
     if command.clone().next().is_some_and(|arg| arg == "--") {
         command.next();
@@ -437,13 +445,13 @@ fn parse_run_command(args: &[String]) -> Result<Command, String> {
 
     let command = command.cloned().collect::<Vec<_>>();
     if command.is_empty() {
-        Err("hugr run requires a command".to_string())
+        Err(Error::msg("hugr run requires a command".to_string()))
     } else {
         Ok(Command::Run { command })
     }
 }
 
-fn parse_index_command(args: &[String]) -> Result<Command, String> {
+fn parse_index_command(args: &[String]) -> Result<Command> {
     let mut paths = Vec::new();
     let mut index = 2;
 
@@ -455,11 +463,11 @@ fn parse_index_command(args: &[String]) -> Result<Command, String> {
         } else if let Some(value) = arg.strip_prefix("--paths=") {
             required_option_value(Some(value), "hugr index --paths")?
         } else if arg.starts_with("--") {
-            return Err(format!("unknown option '{arg}'"));
+            return Err(Error::msg(format!("unknown option '{arg}'")));
         } else {
-            return Err(format!(
+            return Err(Error::msg(format!(
                 "hugr index does not take positional argument '{arg}'"
-            ));
+            )));
         };
         for path in raw.split(',') {
             let trimmed = path.trim();
@@ -473,7 +481,7 @@ fn parse_index_command(args: &[String]) -> Result<Command, String> {
     Ok(Command::Index { paths })
 }
 
-fn parse_move_symbol_command(args: &[String]) -> Result<Command, String> {
+fn parse_move_symbol_command(args: &[String]) -> Result<Command> {
     let mut positional = Vec::new();
     let mut kind = None;
     let mut rewrite_references = false;
@@ -498,7 +506,7 @@ fn parse_move_symbol_command(args: &[String]) -> Result<Command, String> {
                 "hugr move-symbol --kind",
             )?);
         } else if arg.starts_with("--") {
-            return Err(format!("unknown option '{arg}'"));
+            return Err(Error::msg(format!("unknown option '{arg}'")));
         } else {
             positional.push(arg.clone());
         }
@@ -507,9 +515,9 @@ fn parse_move_symbol_command(args: &[String]) -> Result<Command, String> {
     }
 
     let [source_path, name, destination_path] = positional.as_slice() else {
-        return Err(
+        return Err(Error::msg(
             "hugr move-symbol requires <source-path> <symbol> <destination-path>".to_string(),
-        );
+        ));
     };
 
     Ok(Command::MoveSymbol {
@@ -522,7 +530,7 @@ fn parse_move_symbol_command(args: &[String]) -> Result<Command, String> {
     })
 }
 
-fn parse_rename_symbol_command(args: &[String]) -> Result<Command, String> {
+fn parse_rename_symbol_command(args: &[String]) -> Result<Command> {
     let mut positional = Vec::new();
     let mut kind = None;
     let mut format = OutputFormat::Markdown;
@@ -544,7 +552,7 @@ fn parse_rename_symbol_command(args: &[String]) -> Result<Command, String> {
                 "hugr rename-symbol --kind",
             )?);
         } else if arg.starts_with("--") {
-            return Err(format!("unknown option '{arg}'"));
+            return Err(Error::msg(format!("unknown option '{arg}'")));
         } else {
             positional.push(arg.clone());
         }
@@ -553,7 +561,9 @@ fn parse_rename_symbol_command(args: &[String]) -> Result<Command, String> {
     }
 
     let [path, name, new_name] = positional.as_slice() else {
-        return Err("hugr rename-symbol requires <path> <symbol> <new-symbol>".to_string());
+        return Err(Error::msg(
+            "hugr rename-symbol requires <path> <symbol> <new-symbol>".to_string(),
+        ));
     };
 
     Ok(Command::RenameSymbol {
@@ -565,7 +575,7 @@ fn parse_rename_symbol_command(args: &[String]) -> Result<Command, String> {
     })
 }
 
-fn parse_replace_symbol_command(args: &[String]) -> Result<Command, String> {
+fn parse_replace_symbol_command(args: &[String]) -> Result<Command> {
     let mut positional = Vec::new();
     let mut kind = None;
     let mut body = None;
@@ -590,11 +600,9 @@ fn parse_replace_symbol_command(args: &[String]) -> Result<Command, String> {
             )?);
         } else if arg == "--body" {
             index += 1;
-            body = Some(
-                args.get(index)
-                    .cloned()
-                    .ok_or_else(|| "hugr replace-symbol --body requires a value".to_string())?,
-            );
+            body = Some(args.get(index).cloned().ok_or_else(|| {
+                Error::msg("hugr replace-symbol --body requires a value".to_string())
+            })?);
         } else if let Some(value) = arg.strip_prefix("--body=") {
             body = Some(value.to_string());
         } else if arg == "--body-file" {
@@ -609,7 +617,7 @@ fn parse_replace_symbol_command(args: &[String]) -> Result<Command, String> {
                 "hugr replace-symbol --body-file",
             )?);
         } else if arg.starts_with("--") {
-            return Err(format!("unknown option '{arg}'"));
+            return Err(Error::msg(format!("unknown option '{arg}'")));
         } else {
             positional.push(arg.clone());
         }
@@ -618,23 +626,32 @@ fn parse_replace_symbol_command(args: &[String]) -> Result<Command, String> {
     }
 
     let [path, name] = positional.as_slice() else {
-        return Err("hugr replace-symbol requires <path> <symbol>".to_string());
+        return Err(Error::msg(
+            "hugr replace-symbol requires <path> <symbol>".to_string(),
+        ));
     };
 
     let body = match (body, body_file) {
         (Some(_), Some(_)) => {
-            return Err("hugr replace-symbol accepts --body or --body-file, not both".to_string());
+            return Err(Error::msg(
+                "hugr replace-symbol accepts --body or --body-file, not both".to_string(),
+            ));
         }
         (Some(body), None) => body,
-        (None, Some(file)) => std::fs::read_to_string(&file)
-            .map_err(|error| format!("hugr replace-symbol --body-file: {error}"))?,
+        (None, Some(file)) => std::fs::read_to_string(&file).map_err(|error| {
+            Error::with_source(format!("hugr replace-symbol --body-file: {error}"), error)
+        })?,
         (None, None) => {
-            return Err("hugr replace-symbol requires --body or --body-file".to_string());
+            return Err(Error::msg(
+                "hugr replace-symbol requires --body or --body-file".to_string(),
+            ));
         }
     };
 
     if body.trim().is_empty() {
-        return Err("hugr replace-symbol requires a non-empty body".to_string());
+        return Err(Error::msg(
+            "hugr replace-symbol requires a non-empty body".to_string(),
+        ));
     }
 
     Ok(Command::ReplaceSymbol {
@@ -646,15 +663,15 @@ fn parse_replace_symbol_command(args: &[String]) -> Result<Command, String> {
     })
 }
 
-fn parse_project_command(args: &[String]) -> Result<Command, String> {
+fn parse_project_command(args: &[String]) -> Result<Command> {
     match args.get(2).map(String::as_str) {
         Some("status") => Ok(Command::ProjectStatus),
-        Some(unknown) => Err(format!("unknown project command '{unknown}'")),
-        None => Err("hugr project requires a subcommand".to_string()),
+        Some(unknown) => Err(Error::msg(format!("unknown project command '{unknown}'"))),
+        None => Err(Error::msg("hugr project requires a subcommand".to_string())),
     }
 }
 
-fn parse_session_command(args: &[String]) -> Result<Command, String> {
+fn parse_session_command(args: &[String]) -> Result<Command> {
     match args.get(2).map(String::as_str) {
         Some("start") => Ok(Command::SessionStart {
             task: required_text_from(args, 3, "session start")?,
@@ -664,7 +681,7 @@ fn parse_session_command(args: &[String]) -> Result<Command, String> {
                 .get(3)
                 .filter(|kind| !kind.trim().is_empty())
                 .cloned()
-                .ok_or_else(|| "hugr session event requires kind".to_string())?;
+                .ok_or_else(|| Error::msg("hugr session event requires kind".to_string()))?;
             Ok(Command::SessionEvent {
                 kind,
                 detail: required_text_from(args, 4, "session event")?,
@@ -680,17 +697,17 @@ fn parse_session_command(args: &[String]) -> Result<Command, String> {
                 match arg.as_str() {
                     "--json" => format = OutputFormat::Json,
                     "--llm" => llm = true,
-                    unknown => return Err(format!("unknown option '{unknown}'")),
+                    unknown => return Err(Error::msg(format!("unknown option '{unknown}'"))),
                 }
             }
             Ok(Command::SessionPromote { format, llm })
         }
-        Some(unknown) => Err(format!("unknown session command '{unknown}'")),
-        None => Err("hugr session requires a subcommand".to_string()),
+        Some(unknown) => Err(Error::msg(format!("unknown session command '{unknown}'"))),
+        None => Err(Error::msg("hugr session requires a subcommand".to_string())),
     }
 }
 
-fn parse_sync_command(args: &[String]) -> Result<Command, String> {
+fn parse_sync_command(args: &[String]) -> Result<Command> {
     match args.get(2).map(String::as_str) {
         Some("status") => Ok(Command::SyncStatus {
             format: output_format_from(args, 3)?,
@@ -712,8 +729,8 @@ fn parse_sync_command(args: &[String]) -> Result<Command, String> {
         Some("history") => Ok(Command::SyncHistory {
             format: output_format_from(args, 3)?,
         }),
-        Some(unknown) => Err(format!("unknown sync command '{unknown}'")),
-        None => Err("hugr sync requires a subcommand".to_string()),
+        Some(unknown) => Err(Error::msg(format!("unknown sync command '{unknown}'"))),
+        None => Err(Error::msg("hugr sync requires a subcommand".to_string())),
     }
 }
 
@@ -735,11 +752,12 @@ struct TextOutput {
     global: bool,
 }
 
-fn required_text_from(args: &[String], start: usize, command: &str) -> Result<String, String> {
-    optional_text_from(args, start).ok_or_else(|| format!("hugr {command} requires text"))
+fn required_text_from(args: &[String], start: usize, command: &str) -> Result<String> {
+    optional_text_from(args, start)
+        .ok_or_else(|| Error::msg(format!("hugr {command} requires text")))
 }
 
-fn required_text_output(args: &[String], command: &str) -> Result<TextOutput, String> {
+fn required_text_output(args: &[String], command: &str) -> Result<TextOutput> {
     let mut format = OutputFormat::Markdown;
     let mut global = false;
     let mut words = Vec::new();
@@ -756,7 +774,7 @@ fn required_text_output(args: &[String], command: &str) -> Result<TextOutput, St
 
     let value = words.join(" ");
     if value.trim().is_empty() {
-        Err(format!("hugr {command} requires text"))
+        Err(Error::msg(format!("hugr {command} requires text")))
     } else {
         Ok(TextOutput {
             value,
@@ -780,19 +798,19 @@ fn optional_text_from(args: &[String], start: usize) -> Option<String> {
     }
 }
 
-fn output_format_from(args: &[String], start: usize) -> Result<OutputFormat, String> {
+fn output_format_from(args: &[String], start: usize) -> Result<OutputFormat> {
     let mut format = OutputFormat::Markdown;
     for arg in args.iter().skip(start) {
         if arg == "--json" {
             format = OutputFormat::Json;
         } else {
-            return Err(format!("unknown option '{arg}'"));
+            return Err(Error::msg(format!("unknown option '{arg}'")));
         }
     }
     Ok(format)
 }
 
-fn sync_push_options_from(args: &[String], start: usize) -> Result<SyncPushOptions, String> {
+fn sync_push_options_from(args: &[String], start: usize) -> Result<SyncPushOptions> {
     let mut dry_run = true;
     let mut format = OutputFormat::Markdown;
 
@@ -801,14 +819,14 @@ fn sync_push_options_from(args: &[String], start: usize) -> Result<SyncPushOptio
             "--dry-run" => dry_run = true,
             "--execute" => dry_run = false,
             "--json" => format = OutputFormat::Json,
-            unknown => return Err(format!("unknown option '{unknown}'")),
+            unknown => return Err(Error::msg(format!("unknown option '{unknown}'"))),
         }
     }
 
     Ok(SyncPushOptions { dry_run, format })
 }
 
-fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions, String> {
+fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions> {
     let mut execute = false;
     let mut duplicates = false;
     let mut stale = false;
@@ -820,7 +838,7 @@ fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions,
             "--duplicates" => duplicates = true,
             "--stale" => stale = true,
             "--json" => format = OutputFormat::Json,
-            unknown => return Err(format!("unknown option '{unknown}'")),
+            unknown => return Err(Error::msg(format!("unknown option '{unknown}'"))),
         }
     }
 
@@ -832,7 +850,7 @@ fn improve_options_from(args: &[String], start: usize) -> Result<ImproveOptions,
     })
 }
 
-fn parse_context_command(args: &[String]) -> Result<Command, String> {
+fn parse_context_command(args: &[String]) -> Result<Command> {
     let mut format = OutputFormat::Markdown;
     let mut budget = None;
     let mut words = Vec::new();
@@ -852,7 +870,7 @@ fn parse_context_command(args: &[String]) -> Result<Command, String> {
 
     let task = words.join(" ");
     if task.trim().is_empty() {
-        return Err("hugr context requires text".to_string());
+        return Err(Error::msg("hugr context requires text".to_string()));
     }
     Ok(Command::Context {
         task,
@@ -861,7 +879,7 @@ fn parse_context_command(args: &[String]) -> Result<Command, String> {
     })
 }
 
-fn parse_eval_command(args: &[String]) -> Result<Command, String> {
+fn parse_eval_command(args: &[String]) -> Result<Command> {
     let mut from_git = 30usize;
     let mut max_files = 8usize;
     let mut min_hit_rate = None;
@@ -887,7 +905,7 @@ fn parse_eval_command(args: &[String]) -> Result<Command, String> {
                         .clone(),
                 );
             }
-            unknown => return Err(format!("unknown eval option '{unknown}'")),
+            unknown => return Err(Error::msg(format!("unknown eval option '{unknown}'"))),
         }
         index += 1;
     }
@@ -900,17 +918,17 @@ fn parse_eval_command(args: &[String]) -> Result<Command, String> {
     })
 }
 
-fn parse_positive_usize(value: Option<&String>, flag: &str) -> Result<usize, String> {
-    let value = value.ok_or_else(|| format!("{flag} requires a value"))?;
+fn parse_positive_usize(value: Option<&String>, flag: &str) -> Result<usize> {
+    let value = value.ok_or_else(|| Error::msg(format!("{flag} requires a value")))?;
     let parsed = value
         .parse::<usize>()
         .ok()
         .filter(|parsed| *parsed > 0)
-        .ok_or_else(|| format!("{flag} requires a positive integer, got '{value}'"))?;
+        .ok_or_else(|| Error::msg(format!("{flag} requires a positive integer, got '{value}'")))?;
     Ok(parsed)
 }
 
-fn parse_install_command(args: &[String]) -> Result<Command, String> {
+fn parse_install_command(args: &[String]) -> Result<Command> {
     let mut agent = None;
     let mut shared = false;
 
@@ -920,7 +938,7 @@ fn parse_install_command(args: &[String]) -> Result<Command, String> {
             value if !value.starts_with("--") && agent.is_none() => {
                 agent = Some(value.to_string());
             }
-            unknown => return Err(format!("unknown install option '{unknown}'")),
+            unknown => return Err(Error::msg(format!("unknown install option '{unknown}'"))),
         }
     }
 
@@ -929,7 +947,7 @@ fn parse_install_command(args: &[String]) -> Result<Command, String> {
     Ok(Command::Install { agent, shared })
 }
 
-fn parse_hook_command(args: &[String]) -> Result<Command, String> {
+fn parse_hook_command(args: &[String]) -> Result<Command> {
     let agent = args
         .get(2)
         .cloned()
@@ -958,12 +976,12 @@ mod tests {
             "hooks".into(),
         ];
         assert_eq!(
-            Command::parse(&args),
-            Ok(Command::Context {
+            Command::parse(&args).unwrap(),
+            Command::Context {
                 task: "add hooks".into(),
                 format: OutputFormat::Markdown,
                 budget: None
-            })
+            }
         );
     }
 
@@ -978,12 +996,12 @@ mod tests {
             "hooks".into(),
         ];
         assert_eq!(
-            Command::parse(&args),
-            Ok(Command::Context {
+            Command::parse(&args).unwrap(),
+            Command::Context {
                 task: "add hooks".into(),
                 format: OutputFormat::Markdown,
                 budget: Some(16000)
-            })
+            }
         );
 
         let invalid = vec![
@@ -1006,27 +1024,27 @@ mod tests {
             "hooks".into(),
         ];
         assert_eq!(
-            Command::parse(&args),
-            Ok(Command::Recall {
+            Command::parse(&args).unwrap(),
+            Command::Recall {
                 query: "plugin hooks".into(),
                 format: OutputFormat::Json,
                 global: false,
-            })
+            }
         );
     }
 
     #[test]
     fn parses_project_status() {
         let args = vec!["hugr".into(), "project".into(), "status".into()];
-        assert_eq!(Command::parse(&args), Ok(Command::ProjectStatus));
+        assert_eq!(Command::parse(&args).unwrap(), Command::ProjectStatus);
     }
 
     #[test]
     fn parses_index_command() {
         let args = vec!["hugr".into(), "index".into()];
         assert_eq!(
-            Command::parse(&args),
-            Ok(Command::Index { paths: Vec::new() })
+            Command::parse(&args).unwrap(),
+            Command::Index { paths: Vec::new() }
         );
     }
 
@@ -1039,10 +1057,10 @@ mod tests {
             "src/a.rs, src/b.rs".into(),
         ];
         assert_eq!(
-            Command::parse(&args),
-            Ok(Command::Index {
+            Command::parse(&args).unwrap(),
+            Command::Index {
                 paths: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
-            })
+            }
         );
     }
 
@@ -1061,11 +1079,11 @@ mod tests {
             "PluginHooks".into(),
         ];
         assert_eq!(
-            Command::parse(&args),
-            Ok(Command::Symbols {
+            Command::parse(&args).unwrap(),
+            Command::Symbols {
                 query: "PluginHooks".into(),
                 format: OutputFormat::Json
-            })
+            }
         );
     }
 
@@ -1078,11 +1096,11 @@ mod tests {
             "PluginHooks".into(),
         ];
         assert_eq!(
-            Command::parse(&args),
-            Ok(Command::Impact {
+            Command::parse(&args).unwrap(),
+            Command::Impact {
                 target: "PluginHooks".into(),
                 format: OutputFormat::Json
-            })
+            }
         );
     }
 
@@ -1099,14 +1117,15 @@ mod tests {
                 "greet".into(),
                 "--body".into(),
                 "pub fn greet() {}".into(),
-            ]),
-            Ok(Command::ReplaceSymbol {
+            ])
+            .unwrap(),
+            Command::ReplaceSymbol {
                 path: "src/lib.rs".into(),
                 name: "greet".into(),
                 kind: Some("function".into()),
                 body: "pub fn greet() {}".into(),
                 format: OutputFormat::Json,
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1115,14 +1134,15 @@ mod tests {
                 "src/lib.rs".into(),
                 "greet".into(),
                 "--body=pub fn greet() {}".into(),
-            ]),
-            Ok(Command::ReplaceSymbol {
+            ])
+            .unwrap(),
+            Command::ReplaceSymbol {
                 path: "src/lib.rs".into(),
                 name: "greet".into(),
                 kind: None,
                 body: "pub fn greet() {}".into(),
                 format: OutputFormat::Markdown,
-            })
+            }
         );
     }
 
@@ -1138,14 +1158,15 @@ mod tests {
                 "src/lib.rs".into(),
                 "greet".into(),
                 "welcome".into(),
-            ]),
-            Ok(Command::RenameSymbol {
+            ])
+            .unwrap(),
+            Command::RenameSymbol {
                 path: "src/lib.rs".into(),
                 name: "greet".into(),
                 new_name: "welcome".into(),
                 kind: Some("function".into()),
                 format: OutputFormat::Json,
-            })
+            }
         );
     }
 
@@ -1157,8 +1178,10 @@ mod tests {
                 "rename-symbol".into(),
                 "src/lib.rs".into(),
                 "greet".into(),
-            ]),
-            Err("hugr rename-symbol requires <path> <symbol> <new-symbol>".into())
+            ])
+            .unwrap_err()
+            .to_string(),
+            "hugr rename-symbol requires <path> <symbol> <new-symbol>"
         );
     }
 
@@ -1173,15 +1196,16 @@ mod tests {
                 "src/lib.rs".into(),
                 "helper".into(),
                 "src/helpers.rs".into(),
-            ]),
-            Ok(Command::MoveSymbol {
+            ])
+            .unwrap(),
+            Command::MoveSymbol {
                 source_path: "src/lib.rs".into(),
                 name: "helper".into(),
                 destination_path: "src/helpers.rs".into(),
                 kind: Some("function".into()),
                 rewrite_references: false,
                 format: OutputFormat::Json,
-            })
+            }
         );
     }
 
@@ -1195,15 +1219,16 @@ mod tests {
                 "src/lib.rs".into(),
                 "helper".into(),
                 "src/helpers.rs".into(),
-            ]),
-            Ok(Command::MoveSymbol {
+            ])
+            .unwrap(),
+            Command::MoveSymbol {
                 source_path: "src/lib.rs".into(),
                 name: "helper".into(),
                 destination_path: "src/helpers.rs".into(),
                 kind: None,
                 rewrite_references: true,
                 format: OutputFormat::Markdown,
-            })
+            }
         );
     }
 
@@ -1215,8 +1240,10 @@ mod tests {
                 "move-symbol".into(),
                 "src/lib.rs".into(),
                 "helper".into(),
-            ]),
-            Err("hugr move-symbol requires <source-path> <symbol> <destination-path>".into())
+            ])
+            .unwrap_err()
+            .to_string(),
+            "hugr move-symbol requires <source-path> <symbol> <destination-path>"
         );
     }
 
@@ -1228,8 +1255,10 @@ mod tests {
                 "replace-symbol".into(),
                 "src/lib.rs".into(),
                 "greet".into(),
-            ]),
-            Err("hugr replace-symbol requires --body or --body-file".into())
+            ])
+            .unwrap_err()
+            .to_string(),
+            "hugr replace-symbol requires --body or --body-file"
         );
     }
 
@@ -1245,8 +1274,10 @@ mod tests {
                 "pub fn greet() {}".into(),
                 "--body-file".into(),
                 "body.txt".into(),
-            ]),
-            Err("hugr replace-symbol accepts --body or --body-file, not both".into())
+            ])
+            .unwrap_err()
+            .to_string(),
+            "hugr replace-symbol accepts --body or --body-file, not both"
         );
     }
 
@@ -1259,8 +1290,10 @@ mod tests {
                 "src/lib.rs".into(),
                 "--body".into(),
                 "pub fn greet() {}".into(),
-            ]),
-            Err("hugr replace-symbol requires <path> <symbol>".into())
+            ])
+            .unwrap_err()
+            .to_string(),
+            "hugr replace-symbol requires <path> <symbol>"
         );
     }
 
@@ -1273,10 +1306,11 @@ mod tests {
                 "start".into(),
                 "add".into(),
                 "hooks".into()
-            ]),
-            Ok(Command::SessionStart {
+            ])
+            .unwrap(),
+            Command::SessionStart {
                 task: "add hooks".into()
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1286,17 +1320,19 @@ mod tests {
                 "test".into(),
                 "cargo".into(),
                 "test".into()
-            ]),
-            Ok(Command::SessionEvent {
+            ])
+            .unwrap(),
+            Command::SessionEvent {
                 kind: "test".into(),
                 detail: "cargo test".into()
-            })
+            }
         );
         assert_eq!(
-            Command::parse(&["hugr".into(), "session".into(), "end".into(), "done".into()]),
-            Ok(Command::SessionEnd {
+            Command::parse(&["hugr".into(), "session".into(), "end".into(), "done".into()])
+                .unwrap(),
+            Command::SessionEnd {
                 summary: Some("done".into())
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1304,11 +1340,12 @@ mod tests {
                 "session".into(),
                 "promote".into(),
                 "--json".into()
-            ]),
-            Ok(Command::SessionPromote {
+            ])
+            .unwrap(),
+            Command::SessionPromote {
                 format: OutputFormat::Json,
                 llm: false
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1317,21 +1354,22 @@ mod tests {
                 "promote".into(),
                 "--llm".into(),
                 "--json".into()
-            ]),
-            Ok(Command::SessionPromote {
+            ])
+            .unwrap(),
+            Command::SessionPromote {
                 format: OutputFormat::Json,
                 llm: true
-            })
+            }
         );
     }
 
     #[test]
     fn parses_sync_status() {
         assert_eq!(
-            Command::parse(&["hugr".into(), "sync".into(), "status".into()]),
-            Ok(Command::SyncStatus {
+            Command::parse(&["hugr".into(), "sync".into(), "status".into()]).unwrap(),
+            Command::SyncStatus {
                 format: OutputFormat::Markdown
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1339,21 +1377,22 @@ mod tests {
                 "sync".into(),
                 "status".into(),
                 "--json".into()
-            ]),
-            Ok(Command::SyncStatus {
+            ])
+            .unwrap(),
+            Command::SyncStatus {
                 format: OutputFormat::Json
-            })
+            }
         );
     }
 
     #[test]
     fn parses_sync_push() {
         assert_eq!(
-            Command::parse(&["hugr".into(), "sync".into(), "push".into()]),
-            Ok(Command::SyncPush {
+            Command::parse(&["hugr".into(), "sync".into(), "push".into()]).unwrap(),
+            Command::SyncPush {
                 dry_run: true,
                 format: OutputFormat::Markdown
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1362,22 +1401,23 @@ mod tests {
                 "push".into(),
                 "--execute".into(),
                 "--json".into()
-            ]),
-            Ok(Command::SyncPush {
+            ])
+            .unwrap(),
+            Command::SyncPush {
                 dry_run: false,
                 format: OutputFormat::Json
-            })
+            }
         );
     }
 
     #[test]
     fn parses_sync_pull() {
         assert_eq!(
-            Command::parse(&["hugr".into(), "sync".into(), "pull".into()]),
-            Ok(Command::SyncPull {
+            Command::parse(&["hugr".into(), "sync".into(), "pull".into()]).unwrap(),
+            Command::SyncPull {
                 dry_run: true,
                 format: OutputFormat::Markdown
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1386,21 +1426,22 @@ mod tests {
                 "pull".into(),
                 "--execute".into(),
                 "--json".into()
-            ]),
-            Ok(Command::SyncPull {
+            ])
+            .unwrap(),
+            Command::SyncPull {
                 dry_run: false,
                 format: OutputFormat::Json
-            })
+            }
         );
     }
 
     #[test]
     fn parses_sync_history() {
         assert_eq!(
-            Command::parse(&["hugr".into(), "sync".into(), "history".into()]),
-            Ok(Command::SyncHistory {
+            Command::parse(&["hugr".into(), "sync".into(), "history".into()]).unwrap(),
+            Command::SyncHistory {
                 format: OutputFormat::Markdown
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1408,26 +1449,27 @@ mod tests {
                 "sync".into(),
                 "history".into(),
                 "--json".into()
-            ]),
-            Ok(Command::SyncHistory {
+            ])
+            .unwrap(),
+            Command::SyncHistory {
                 format: OutputFormat::Json
-            })
+            }
         );
     }
 
     #[test]
     fn parses_mcp_command() {
         let args = vec!["hugr".into(), "mcp".into()];
-        assert_eq!(Command::parse(&args), Ok(Command::Mcp));
+        assert_eq!(Command::parse(&args).unwrap(), Command::Mcp);
     }
 
     #[test]
     fn parses_daemon_command() {
         assert_eq!(
-            Command::parse(&["hugr".into(), "daemon".into()]),
-            Ok(Command::Daemon {
+            Command::parse(&["hugr".into(), "daemon".into()]).unwrap(),
+            Command::Daemon {
                 addr: "127.0.0.1:5874".into()
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1435,30 +1477,32 @@ mod tests {
                 "daemon".into(),
                 "--addr".into(),
                 "127.0.0.1:0".into()
-            ]),
-            Ok(Command::Daemon {
+            ])
+            .unwrap(),
+            Command::Daemon {
                 addr: "127.0.0.1:0".into()
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
                 "hugr".into(),
                 "daemon".into(),
                 "--addr=127.0.0.1:9999".into()
-            ]),
-            Ok(Command::Daemon {
+            ])
+            .unwrap(),
+            Command::Daemon {
                 addr: "127.0.0.1:9999".into()
-            })
+            }
         );
     }
 
     #[test]
     fn parses_run_command() {
         assert_eq!(
-            Command::parse(&["hugr".into(), "run".into(), "cargo".into(), "test".into()]),
-            Ok(Command::Run {
+            Command::parse(&["hugr".into(), "run".into(), "cargo".into(), "test".into()]).unwrap(),
+            Command::Run {
                 command: vec!["cargo".into(), "test".into()]
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1467,10 +1511,11 @@ mod tests {
                 "--".into(),
                 "cargo".into(),
                 "test".into()
-            ]),
-            Ok(Command::Run {
+            ])
+            .unwrap(),
+            Command::Run {
                 command: vec!["cargo".into(), "test".into()]
-            })
+            }
         );
     }
 
@@ -1486,11 +1531,12 @@ mod tests {
                 "--".into(),
                 "cargo".into(),
                 "test".into()
-            ]),
-            Ok(Command::Observe {
+            ])
+            .unwrap(),
+            Command::Observe {
                 status: 0,
                 command: vec!["cargo".into(), "test".into()]
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1500,11 +1546,12 @@ mod tests {
                 "--status=1".into(),
                 "cargo".into(),
                 "test".into()
-            ]),
-            Ok(Command::Observe {
+            ])
+            .unwrap(),
+            Command::Observe {
                 status: 1,
                 command: vec!["cargo".into(), "test".into()]
-            })
+            }
         );
     }
 
@@ -1516,12 +1563,13 @@ mod tests {
                 "remember".into(),
                 "plugin".into(),
                 "hooks".into()
-            ]),
-            Ok(Command::Remember {
+            ])
+            .unwrap(),
+            Command::Remember {
                 text: "plugin hooks".into(),
                 options: MemoryWriteArgs::default(),
                 global: false,
-            })
+            }
         );
     }
 
@@ -1534,12 +1582,13 @@ mod tests {
                 "--global".into(),
                 "prefer".into(),
                 "rebase".into()
-            ]),
-            Ok(Command::Remember {
+            ])
+            .unwrap(),
+            Command::Remember {
                 text: "prefer rebase".into(),
                 options: MemoryWriteArgs::default(),
                 global: true,
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1548,12 +1597,13 @@ mod tests {
                 "--global".into(),
                 "--json".into(),
                 "rebase".into()
-            ]),
-            Ok(Command::Recall {
+            ])
+            .unwrap(),
+            Command::Recall {
                 query: "rebase".into(),
                 format: OutputFormat::Json,
                 global: true,
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1561,12 +1611,13 @@ mod tests {
                 "forget".into(),
                 "--global".into(),
                 "rebase".into()
-            ]),
-            Ok(Command::Forget {
+            ])
+            .unwrap(),
+            Command::Forget {
                 query: "rebase".into(),
                 format: OutputFormat::Markdown,
                 global: true,
-            })
+            }
         );
     }
 
@@ -1580,8 +1631,9 @@ mod tests {
                 "file:src/lib.rs".into(),
                 "plugin".into(),
                 "hooks".into(),
-            ]),
-            Ok(Command::Remember {
+            ])
+            .unwrap(),
+            Command::Remember {
                 text: "plugin hooks".into(),
                 options: MemoryWriteArgs {
                     source: Some(MemorySourceArg {
@@ -1591,7 +1643,7 @@ mod tests {
                     ..MemoryWriteArgs::default()
                 },
                 global: false,
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1600,8 +1652,9 @@ mod tests {
                 "--source=url:https://example.test/docs".into(),
                 "remote".into(),
                 "docs".into(),
-            ]),
-            Ok(Command::Remember {
+            ])
+            .unwrap(),
+            Command::Remember {
                 text: "remote docs".into(),
                 options: MemoryWriteArgs {
                     source: Some(MemorySourceArg {
@@ -1611,7 +1664,7 @@ mod tests {
                     ..MemoryWriteArgs::default()
                 },
                 global: false,
-            })
+            }
         );
     }
 
@@ -1629,8 +1682,9 @@ mod tests {
                 "--valid-to=2026-12-31".into(),
                 "plugin".into(),
                 "hooks".into(),
-            ]),
-            Ok(Command::Remember {
+            ])
+            .unwrap(),
+            Command::Remember {
                 text: "plugin hooks".into(),
                 options: MemoryWriteArgs {
                     confidence: Some("0.75".into()),
@@ -1640,36 +1694,36 @@ mod tests {
                     ..MemoryWriteArgs::default()
                 },
                 global: false,
-            })
+            }
         );
     }
 
     #[test]
     fn parses_shell_hook_command() {
         assert_eq!(
-            Command::parse(&["hugr".into(), "shell-hook".into(), "zsh".into()]),
-            Ok(Command::ShellHook {
+            Command::parse(&["hugr".into(), "shell-hook".into(), "zsh".into()]).unwrap(),
+            Command::ShellHook {
                 shell: "zsh".into()
-            })
+            }
         );
         assert_eq!(
-            Command::parse(&["hugr".into(), "shell-hook".into(), "bash".into()]),
-            Ok(Command::ShellHook {
+            Command::parse(&["hugr".into(), "shell-hook".into(), "bash".into()]).unwrap(),
+            Command::ShellHook {
                 shell: "bash".into()
-            })
+            }
         );
     }
 
     #[test]
     fn parses_memory_maintenance_commands() {
         assert_eq!(
-            Command::parse(&["hugr".into(), "improve".into(), "--json".into()]),
-            Ok(Command::Improve {
+            Command::parse(&["hugr".into(), "improve".into(), "--json".into()]).unwrap(),
+            Command::Improve {
                 execute: false,
                 duplicates: false,
                 stale: false,
                 format: OutputFormat::Json
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1678,13 +1732,14 @@ mod tests {
                 "--execute".into(),
                 "--duplicates".into(),
                 "--json".into()
-            ]),
-            Ok(Command::Improve {
+            ])
+            .unwrap(),
+            Command::Improve {
                 execute: true,
                 duplicates: true,
                 stale: false,
                 format: OutputFormat::Json
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1693,13 +1748,14 @@ mod tests {
                 "--execute".into(),
                 "--stale".into(),
                 "--json".into()
-            ]),
-            Ok(Command::Improve {
+            ])
+            .unwrap(),
+            Command::Improve {
                 execute: true,
                 duplicates: false,
                 stale: true,
                 format: OutputFormat::Json
-            })
+            }
         );
         assert_eq!(
             Command::parse(&[
@@ -1708,12 +1764,13 @@ mod tests {
                 "--json".into(),
                 "plugin".into(),
                 "hooks".into()
-            ]),
-            Ok(Command::Forget {
+            ])
+            .unwrap(),
+            Command::Forget {
                 query: "plugin hooks".into(),
                 format: OutputFormat::Json,
                 global: false,
-            })
+            }
         );
     }
 
@@ -1721,14 +1778,14 @@ mod tests {
     fn rejects_missing_text() {
         let args = vec!["hugr".into(), "remember".into()];
         assert_eq!(
-            Command::parse(&args),
-            Err("hugr remember requires text".into())
+            Command::parse(&args).unwrap_err().to_string(),
+            "hugr remember requires text"
         );
 
         let args = vec!["hugr".into(), "forget".into()];
         assert_eq!(
-            Command::parse(&args),
-            Err("hugr forget requires text".into())
+            Command::parse(&args).unwrap_err().to_string(),
+            "hugr forget requires text"
         );
     }
 }
