@@ -11896,7 +11896,7 @@ async fn local_source_embedding_file_candidates(
 }
 
 fn f32_blob_to_vector(blob: &[u8]) -> Result<Vec<f32>, String> {
-    if !blob.len().is_multiple_of(4) {
+    if blob.len() % 4 != 0 {
         return Err("source embedding blob length is not divisible by 4".to_string());
     }
 
