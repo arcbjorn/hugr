@@ -1681,10 +1681,10 @@ fn kotlin_has_wildcard_or_aliased_import(contents: &str, symbol: &str) -> bool {
         if rest.ends_with(".*") {
             return true;
         }
-        if let Some((path, _alias)) = rest.split_once(" as ") {
-            if path.trim().rsplit('.').next() == Some(symbol) {
-                return true;
-            }
+        if let Some((path, _alias)) = rest.split_once(" as ")
+            && path.trim().rsplit('.').next() == Some(symbol)
+        {
+            return true;
         }
     }
     false

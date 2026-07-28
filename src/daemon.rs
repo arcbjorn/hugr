@@ -156,10 +156,10 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<String, String> {
         if buffer.len() > MAX_HTTP_REQUEST_BYTES {
             return Err("HTTP request exceeded maximum size".to_string());
         }
-        if let Some(expected_len) = expected_http_request_len(&buffer)? {
-            if buffer.len() >= expected_len {
-                break;
-            }
+        if let Some(expected_len) = expected_http_request_len(&buffer)?
+            && buffer.len() >= expected_len
+        {
+            break;
         }
     }
 
@@ -400,10 +400,10 @@ fn relevant_watch_paths(event: &Event) -> Vec<String> {
 }
 
 fn display_watch_path(path: &Path) -> String {
-    if let Ok(current_dir) = std::env::current_dir() {
-        if let Ok(relative) = path.strip_prefix(current_dir) {
-            return relative.display().to_string();
-        }
+    if let Ok(current_dir) = std::env::current_dir()
+        && let Ok(relative) = path.strip_prefix(current_dir)
+    {
+        return relative.display().to_string();
     }
     path.display().to_string()
 }

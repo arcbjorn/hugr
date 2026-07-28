@@ -4796,10 +4796,10 @@ fn diagnostic_score(
     paths: &HashSet<String>,
 ) -> usize {
     let mut relevance = 0;
-    if let Some(path) = &record.path {
-        if paths.contains(path) {
-            relevance += 120;
-        }
+    if let Some(path) = &record.path
+        && paths.contains(path)
+    {
+        relevance += 120;
     }
 
     let searchable = format!(
@@ -5808,10 +5808,9 @@ fn promoted_memory_for_session_records(
         .filter(|promotion| promotion.session_id == session_id)
         .max_by(|left, right| left.promoted_at_ms.cmp(&right.promoted_at_ms))
         .map(|promotion| promotion.memory_id.as_str())
+        && let Some(record) = records.iter().find(|record| record.id == memory_id)
     {
-        if let Some(record) = records.iter().find(|record| record.id == memory_id) {
-            return Some(memory_from_sync_record(record));
-        }
+        return Some(memory_from_sync_record(record));
     }
 
     records
@@ -11321,10 +11320,10 @@ fn memory_write_payload(
 fn normalize_memory_write_options(
     options: MemoryWriteOptions,
 ) -> Result<MemoryWriteOptions, String> {
-    if let Some(confidence) = options.confidence {
-        if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
-            return Err("memory confidence must be between 0.0 and 1.0".to_string());
-        }
+    if let Some(confidence) = options.confidence
+        && (!confidence.is_finite() || !(0.0..=1.0).contains(&confidence))
+    {
+        return Err("memory confidence must be between 0.0 and 1.0".to_string());
     }
 
     let source = options.source.map(normalize_memory_source).transpose()?;

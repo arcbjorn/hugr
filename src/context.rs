@@ -1435,16 +1435,16 @@ fn build_risk_signals(
         ));
     }
 
-    if let Some((node, count)) = most_connected_graph_node(graph_neighbors) {
-        if count >= 4 {
-            signals.push(context_risk_signal(
-                "medium",
-                "high_graph_coupling",
-                format!("{node} has {count} nearby graph reference(s) in this context"),
-                680 + count * 15,
-                "graph neighborhood has concentrated references",
-            ));
-        }
+    if let Some((node, count)) = most_connected_graph_node(graph_neighbors)
+        && count >= 4
+    {
+        signals.push(context_risk_signal(
+            "medium",
+            "high_graph_coupling",
+            format!("{node} has {count} nearby graph reference(s) in this context"),
+            680 + count * 15,
+            "graph neighborhood has concentrated references",
+        ));
     }
 
     if let Some(signal) = refactor_surface_signal(graph_neighbors) {
@@ -2522,11 +2522,11 @@ fn remove_lowest_priority_context_item(
     pack: &mut ContextPack,
     truncated_sections: &mut Vec<ContextBudgetTruncation>,
 ) -> bool {
-    if let Some(branch) = &mut pack.branch_state {
-        if branch.changed_files.pop().is_some() {
-            record_truncation(truncated_sections, "branch_state.changed_files");
-            return true;
-        }
+    if let Some(branch) = &mut pack.branch_state
+        && branch.changed_files.pop().is_some()
+    {
+        record_truncation(truncated_sections, "branch_state.changed_files");
+        return true;
     }
     if pack.suggested_path.pop().is_some() {
         record_truncation(truncated_sections, "suggested_path");

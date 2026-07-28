@@ -167,10 +167,10 @@ pub(crate) fn extract_references(
                 matched_target_indices(trimmed, &targets, &targets_by_name, &irregular_targets)
             {
                 let target = &targets[target_index];
-                if let Some(resolution) = resolutions.get(target.name.as_str()) {
-                    if !resolution.allows(trimmed, target_index, &target.name) {
-                        continue;
-                    }
+                if let Some(resolution) = resolutions.get(target.name.as_str())
+                    && !resolution.allows(trimmed, target_index, &target.name)
+                {
+                    continue;
                 }
                 if declaration_lines.contains(&(
                     file.path.as_str(),
@@ -1317,11 +1317,11 @@ fn strip_prefix_words<'a>(mut line: &'a str, prefixes: &[&str]) -> &'a str {
         let trimmed = line.trim_start();
         let mut stripped = false;
 
-        if let Some(rest) = trimmed.strip_prefix("pub(") {
-            if let Some(end) = rest.find(')') {
-                line = rest[end + 1..].trim_start();
-                stripped = true;
-            }
+        if let Some(rest) = trimmed.strip_prefix("pub(")
+            && let Some(end) = rest.find(')')
+        {
+            line = rest[end + 1..].trim_start();
+            stripped = true;
         }
 
         if !stripped {

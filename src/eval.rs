@@ -204,10 +204,10 @@ fn parse_git_log(text: &str) -> Vec<CommitCase> {
                 subject: subject.trim().to_string(),
                 files: Vec::new(),
             });
-        } else if !line.trim().is_empty() {
-            if let Some(case) = cases.last_mut() {
-                case.files.push(line.trim().to_string());
-            }
+        } else if !line.trim().is_empty()
+            && let Some(case) = cases.last_mut()
+        {
+            case.files.push(line.trim().to_string());
         }
     }
 

@@ -289,18 +289,18 @@ pub(crate) async fn compile_context_pack_with_file_candidates(
     let mut memories = store.recall(task, 5).await?;
     // User-level memories join project recall best-effort: a missing HOME or
     // absent global store must never fail project context compilation.
-    if let Ok(global_store) = Store::open_global() {
-        if let Ok(global_memories) = global_store.recall(task, 3).await {
-            let seen = memories
-                .iter()
-                .map(|memory| memory.id.clone())
-                .collect::<HashSet<_>>();
-            memories.extend(
-                global_memories
-                    .into_iter()
-                    .filter(|memory| !seen.contains(&memory.id)),
-            );
-        }
+    if let Ok(global_store) = Store::open_global()
+        && let Ok(global_memories) = global_store.recall(task, 3).await
+    {
+        let seen = memories
+            .iter()
+            .map(|memory| memory.id.clone())
+            .collect::<HashSet<_>>();
+        memories.extend(
+            global_memories
+                .into_iter()
+                .filter(|memory| !seen.contains(&memory.id)),
+        );
     }
     let relevant_memory_ids = memories
         .iter()
