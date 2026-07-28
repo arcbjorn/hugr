@@ -109,7 +109,7 @@ pub(crate) struct SyncExecutionPlan {
     pub status: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SyncPushResult {
     pub run_id: Option<String>,
     pub dry_run: bool,
@@ -118,7 +118,7 @@ pub(crate) struct SyncPushResult {
     pub tables: Vec<SyncTableResult>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SyncPullResult {
     pub run_id: Option<String>,
     pub dry_run: bool,
@@ -127,7 +127,7 @@ pub(crate) struct SyncPullResult {
     pub tables: Vec<SyncTableResult>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SyncTableResult {
     pub class: String,
     pub table: String,
@@ -140,13 +140,13 @@ pub(crate) struct SyncTableResult {
     pub conflicts: Vec<SyncConflictSummary>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SyncConflictSummary {
     pub reason: String,
     pub count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SyncRunHistory {
     pub id: String,
     pub operation: String,
@@ -204,7 +204,7 @@ pub(crate) struct MemoryWriteOptions {
     pub valid_to: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SessionPromotionResult {
     pub session_id: String,
     pub task: String,
@@ -229,7 +229,7 @@ pub(crate) struct SessionSynthesis {
 pub(crate) type SessionSynthesizerFn<'a> =
     &'a (dyn Fn(&str, &[SessionFact]) -> Result<SessionSynthesis> + Send + Sync);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ForgetResult {
     pub query: String,
     pub forgotten_count: usize,

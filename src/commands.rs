@@ -15,8 +15,8 @@ use crate::mcp;
 use crate::store::{
     DiagnosticInput, ForgetResult, Memory, MemoryConsolidationResult, MemoryMaintenanceReport,
     MemorySource, MemoryWriteOptions, SessionFact, SessionPromotionResult, SessionSynthesis,
-    StaleRetirementResult, Store, SyncConflictSummary, SyncExecutionPlan, SyncPullResult,
-    SyncPushResult, SyncRunHistory, SyncTableResult,
+    StaleRetirementResult, Store, SyncExecutionPlan, SyncPullResult, SyncPushResult,
+    SyncRunHistory, SyncTableResult,
 };
 use crate::worktree;
 use serde::Serialize;
@@ -1231,15 +1231,7 @@ fn render_recall_json(query: &str, memories: &[Memory]) -> String {
 }
 
 fn render_memory_list_json(memories: &[Memory]) -> String {
-    let mut rendered = String::from("[");
-    for (index, memory) in memories.iter().enumerate() {
-        if index > 0 {
-            rendered.push(',');
-        }
-        rendered.push_str(&render_memory_json(memory));
-    }
-    rendered.push(']');
-    rendered
+    json::render(memories)
 }
 
 fn render_symbols_text(query: &str, symbols: &[CodeSymbol]) -> String {
@@ -1293,13 +1285,7 @@ fn render_session_promotion_text(result: &SessionPromotionResult) -> String {
 }
 
 fn render_session_promotion_json(result: &SessionPromotionResult) -> String {
-    format!(
-        "{{\"session_id\":{},\"task\":{},\"fact_count\":{},\"memory\":{}}}",
-        json_string(&result.session_id),
-        json_string(&result.task),
-        result.fact_count,
-        render_memory_json(&result.memory)
-    )
+    json::render(result)
 }
 
 fn render_forget_text(result: &ForgetResult) -> String {
@@ -1320,13 +1306,7 @@ fn render_forget_text(result: &ForgetResult) -> String {
 }
 
 fn render_forget_json(result: &ForgetResult) -> String {
-    format!(
-        "{{\"query\":{},\"forgotten_count\":{},\"forgotten_at\":{},\"memories\":{}}}",
-        json_string(&result.query),
-        result.forgotten_count,
-        json_string(&result.forgotten_at),
-        render_memory_list_json(&result.memories)
-    )
+    json::render(result)
 }
 
 fn render_improve_text(report: &MemoryMaintenanceReport) -> String {
@@ -1576,12 +1556,6 @@ fn render_string_array_json(values: &[String]) -> String {
     rendered
 }
 
-fn render_run_id_json(run_id: &Option<String>) -> String {
-    run_id
-        .as_ref()
-        .map_or_else(|| "null".to_string(), |id| json_string(id))
-}
-
 fn render_sync_table_text(rendered: &mut String, table: &SyncTableResult, action: &str) {
     let _ = writeln!(
         rendered,
@@ -1602,50 +1576,6 @@ fn render_sync_table_text(rendered: &mut String, table: &SyncTableResult, action
             conflict.reason, conflict.count
         );
     }
-}
-
-fn render_sync_table_json(table: &SyncTableResult) -> String {
-    format!(
-        "{{\"class\":{},\"table\":{},\"row_count\":{},\"inserted_count\":{},\"updated_count\":{},\"skipped_count\":{},\"conflict_count\":{},\"executed\":{},\"conflicts\":{}}}",
-        json_string(&table.class),
-        json_string(&table.table),
-        table.row_count,
-        table.inserted_count,
-        table.updated_count,
-        table.skipped_count,
-        table.conflict_count,
-        table.executed,
-        render_sync_conflicts_json(&table.conflicts)
-    )
-}
-
-fn render_sync_conflicts_json(conflicts: &[SyncConflictSummary]) -> String {
-    let mut rendered = String::from("[");
-    for (index, conflict) in conflicts.iter().enumerate() {
-        if index > 0 {
-            rendered.push(',');
-        }
-        let _ = write!(
-            rendered,
-            "{{\"reason\":{},\"count\":{}}}",
-            json_string(&conflict.reason),
-            conflict.count
-        );
-    }
-    rendered.push(']');
-    rendered
-}
-
-fn render_sync_tables_json(tables: &[SyncTableResult]) -> String {
-    let mut rendered = String::from("[");
-    for (index, table) in tables.iter().enumerate() {
-        if index > 0 {
-            rendered.push(',');
-        }
-        rendered.push_str(&render_sync_table_json(table));
-    }
-    rendered.push(']');
-    rendered
 }
 
 fn render_sync_push_text(result: &SyncPushResult) -> String {
@@ -1671,14 +1601,7 @@ fn render_sync_push_text(result: &SyncPushResult) -> String {
 }
 
 fn render_sync_push_json(result: &SyncPushResult) -> String {
-    format!(
-        "{{\"run_id\":{},\"dry_run\":{},\"backend\":{},\"status\":{},\"tables\":{}}}",
-        render_run_id_json(&result.run_id),
-        result.dry_run,
-        json_string(&result.backend),
-        json_string(&result.status),
-        render_sync_tables_json(&result.tables)
-    )
+    json::render(result)
 }
 
 fn render_sync_pull_text(result: &SyncPullResult) -> String {
@@ -1704,14 +1627,7 @@ fn render_sync_pull_text(result: &SyncPullResult) -> String {
 }
 
 fn render_sync_pull_json(result: &SyncPullResult) -> String {
-    format!(
-        "{{\"run_id\":{},\"dry_run\":{},\"backend\":{},\"status\":{},\"tables\":{}}}",
-        render_run_id_json(&result.run_id),
-        result.dry_run,
-        json_string(&result.backend),
-        json_string(&result.status),
-        render_sync_tables_json(&result.tables)
-    )
+    json::render(result)
 }
 
 fn render_sync_history_text(history: &[SyncRunHistory]) -> String {
@@ -1735,26 +1651,15 @@ fn render_sync_history_text(history: &[SyncRunHistory]) -> String {
     rendered
 }
 
+/// The `sync history --json` envelope; a struct so `runs` stays the only
+/// key and the field order is explicit.
+#[derive(Serialize)]
+struct SyncHistoryJson<'a> {
+    runs: &'a [SyncRunHistory],
+}
+
 fn render_sync_history_json(history: &[SyncRunHistory]) -> String {
-    let mut rendered = String::from("{\"runs\":[");
-    for (index, run) in history.iter().enumerate() {
-        if index > 0 {
-            rendered.push(',');
-        }
-        let _ = write!(
-            rendered,
-            "{{\"id\":{},\"operation\":{},\"backend\":{},\"status\":{},\"started_at_ms\":{},\"ended_at_ms\":{},\"tables\":{}}}",
-            json_string(&run.id),
-            json_string(&run.operation),
-            json_string(&run.backend),
-            json_string(&run.status),
-            run.started_at_ms,
-            run.ended_at_ms,
-            render_sync_tables_json(&run.tables)
-        );
-    }
-    rendered.push_str("]}");
-    rendered
+    json::render(&SyncHistoryJson { runs: history })
 }
 
 #[cfg(test)]
@@ -2299,4 +2204,82 @@ mod tests {
     const RECALL_SNAPSHOT: &str = r#"{"query":"plugin \"hooks\"","memories":[{"id":"mem_1","created_at_ms":10,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":{"source":{"type":"session"}}},{"id":"mem_2","created_at_ms":20,"kind":"note","text":"","structured_payload":null},{"id":"mem_3","created_at_ms":30,"kind":"fact","text":"plain","structured_payload":"not json at all"}]}"#;
 
     const SYMBOLS_SNAPSHOT: &str = r#"{"query":"PluginHooks","symbols":[{"path":"src/plugin_hooks.rs","language":"rust","name":"run_after_config","kind":"function","line_start":12,"line_end":40,"signature":"pub fn run_after_config()"},{"path":"src/other.rs","language":null,"name":"helper","kind":"function","line_start":1,"line_end":null,"signature":""}]}"#;
+
+    fn snapshot_tables() -> Vec<SyncTableResult> {
+        vec![
+            SyncTableResult {
+                class: "memories".to_string(),
+                table: "memories".to_string(),
+                row_count: 2,
+                inserted_count: 1,
+                updated_count: 0,
+                skipped_count: 1,
+                conflict_count: 1,
+                executed: true,
+                conflicts: vec![SyncConflictSummary {
+                    reason: "local_row_preserved".to_string(),
+                    count: 1,
+                }],
+            },
+            SyncTableResult {
+                class: "embeddings".to_string(),
+                table: "memory_embeddings".to_string(),
+                row_count: 0,
+                inserted_count: 0,
+                updated_count: 0,
+                skipped_count: 0,
+                conflict_count: 0,
+                executed: false,
+                conflicts: Vec::new(),
+            },
+        ]
+    }
+
+    /// Pins the bytes of the sync and forget `--json` output, which is a CLI
+    /// contract agents parse.
+    #[test]
+    fn renders_stable_sync_and_forget_json() {
+        let push = SyncPushResult {
+            run_id: None,
+            dry_run: true,
+            backend: "direct_libsql".to_string(),
+            status: "dry_run".to_string(),
+            tables: snapshot_tables(),
+        };
+        let pull = SyncPullResult {
+            run_id: Some("sync_pull_7".to_string()),
+            dry_run: false,
+            backend: "hugr_api".to_string(),
+            status: "executed".to_string(),
+            tables: snapshot_tables(),
+        };
+        let history = vec![SyncRunHistory {
+            id: "run_1".to_string(),
+            operation: "push".to_string(),
+            backend: "direct_libsql".to_string(),
+            status: "executed".to_string(),
+            started_at_ms: 10,
+            ended_at_ms: 20,
+            tables: snapshot_tables(),
+        }];
+        let forget = ForgetResult {
+            query: "plugin \"hooks\"".to_string(),
+            forgotten_count: 1,
+            forgotten_at: "2026-01-01T00:00:00Z".to_string(),
+            memories: snapshot_memories(),
+        };
+
+        assert_eq!(render_sync_push_json(&push), PUSH_SNAPSHOT);
+        assert_eq!(render_sync_pull_json(&pull), PULL_SNAPSHOT);
+        assert_eq!(render_sync_history_json(&history), HISTORY_SNAPSHOT);
+        assert_eq!(render_forget_json(&forget), FORGET_SNAPSHOT);
+    }
+
+    const PUSH_SNAPSHOT: &str = r#"{"run_id":null,"dry_run":true,"backend":"direct_libsql","status":"dry_run","tables":[{"class":"memories","table":"memories","row_count":2,"inserted_count":1,"updated_count":0,"skipped_count":1,"conflict_count":1,"executed":true,"conflicts":[{"reason":"local_row_preserved","count":1}]},{"class":"embeddings","table":"memory_embeddings","row_count":0,"inserted_count":0,"updated_count":0,"skipped_count":0,"conflict_count":0,"executed":false,"conflicts":[]}]}"#;
+
+    const PULL_SNAPSHOT: &str = r#"{"run_id":"sync_pull_7","dry_run":false,"backend":"hugr_api","status":"executed","tables":[{"class":"memories","table":"memories","row_count":2,"inserted_count":1,"updated_count":0,"skipped_count":1,"conflict_count":1,"executed":true,"conflicts":[{"reason":"local_row_preserved","count":1}]},{"class":"embeddings","table":"memory_embeddings","row_count":0,"inserted_count":0,"updated_count":0,"skipped_count":0,"conflict_count":0,"executed":false,"conflicts":[]}]}"#;
+
+    const HISTORY_SNAPSHOT: &str = r#"{"runs":[{"id":"run_1","operation":"push","backend":"direct_libsql","status":"executed","started_at_ms":10,"ended_at_ms":20,"tables":[{"class":"memories","table":"memories","row_count":2,"inserted_count":1,"updated_count":0,"skipped_count":1,"conflict_count":1,"executed":true,"conflicts":[{"reason":"local_row_preserved","count":1}]},{"class":"embeddings","table":"memory_embeddings","row_count":0,"inserted_count":0,"updated_count":0,"skipped_count":0,"conflict_count":0,"executed":false,"conflicts":[]}]}]}"#;
+
+    const FORGET_SNAPSHOT: &str = r#"{"query":"plugin \"hooks\"","forgotten_count":1,"forgotten_at":"2026-01-01T00:00:00Z","memories":[{"id":"mem_1","created_at_ms":10,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":{"source":{"type":"session"}}},{"id":"mem_2","created_at_ms":20,"kind":"note","text":"","structured_payload":null},{"id":"mem_3","created_at_ms":30,"kind":"fact","text":"plain","structured_payload":"not json at all"}]}"#;
 }

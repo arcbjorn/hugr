@@ -35,7 +35,7 @@ where
 /// and vectors of the same, and the one custom serializer above falls back to
 /// a string rather than erroring — so a failure here is a bug in this crate,
 /// not a runtime condition a caller could handle.
-pub(crate) fn render<T: Serialize>(value: &T) -> String {
+pub(crate) fn render<T: Serialize + ?Sized>(value: &T) -> String {
     serde_json::to_string(value)
         .unwrap_or_else(|error| unreachable!("json rendering cannot fail: {error}"))
 }
