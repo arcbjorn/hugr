@@ -2020,7 +2020,7 @@ fn swift_insert_import(contents: &str, module: &str) -> (String, usize) {
         .enumerate()
         .filter(|(_, line)| line.trim_start().starts_with("import "))
         .map(|(index, _)| index + 1)
-        .last()
+        .next_back()
         .unwrap_or(0);
     lines.insert(insert_at, format!("import {module}"));
     let mut rendered = lines.join("\n");
@@ -4301,9 +4301,7 @@ fn reject_target_name_collision(
     if symbols.iter().any(|symbol| {
         symbol.name == new_name
             && symbol.kind == target.kind
-            && !(symbol.path == target.path
-                && symbol.line_start == target.line_start
-                && symbol.kind == target.kind)
+            && !(symbol.path == target.path && symbol.line_start == target.line_start)
     }) {
         return Err(format!(
             "rename-symbol would collide with existing {} '{}' in {}",
