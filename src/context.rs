@@ -5,6 +5,7 @@ use crate::store::{
 };
 use crate::testmap::TestCandidate;
 use crate::worktree::WorktreeState;
+use serde::{Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::fs;
@@ -21,7 +22,7 @@ const VERY_DEEP_NESTING_THRESHOLD: usize = 6;
 const CYCLOMATIC_COMPLEXITY_THRESHOLD: usize = 10;
 const HIGH_CYCLOMATIC_COMPLEXITY_THRESHOLD: usize = 16;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ContextPack {
     pub task: String,
     pub budget: ContextBudget,
@@ -39,20 +40,20 @@ pub(crate) struct ContextPack {
     pub citations: Vec<Citation>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ContextBudget {
     pub max_tokens: usize,
     pub estimated_tokens: usize,
     pub truncated_sections: Vec<ContextBudgetTruncation>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ContextBudgetTruncation {
     pub section: String,
     pub removed_items: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ContextFile {
     pub path: String,
     pub citation_id: String,
@@ -60,7 +61,7 @@ pub(crate) struct ContextFile {
     pub evidence_reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ContextSymbol {
     pub path: String,
     pub language: Option<String>,
@@ -74,7 +75,7 @@ pub(crate) struct ContextSymbol {
     pub evidence_reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ContextGraphNeighbor {
     pub kind: String,
     pub label: String,
@@ -89,7 +90,7 @@ pub(crate) struct ContextGraphNeighbor {
     pub evidence_reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ContextTest {
     pub path: String,
     pub reason: String,
@@ -98,19 +99,20 @@ pub(crate) struct ContextTest {
     pub evidence_reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ContextMemory {
     pub id: String,
     pub created_at_ms: i64,
     pub kind: String,
     pub text: String,
+    #[serde(serialize_with = "serialize_embedded_json")]
     pub structured_payload: Option<String>,
     pub citation_id: String,
     pub evidence_score: usize,
     pub evidence_reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ContextStaleMemoryRisk {
     pub reason: String,
     pub signal: String,
@@ -122,7 +124,7 @@ pub(crate) struct ContextStaleMemoryRisk {
     pub evidence_reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ContextDiagnostic {
     pub id: String,
     pub source: String,
@@ -139,7 +141,7 @@ pub(crate) struct ContextDiagnostic {
     pub evidence_reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ContextRiskSignal {
     pub severity: String,
     pub kind: String,
@@ -149,7 +151,7 @@ pub(crate) struct ContextRiskSignal {
     pub evidence_reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ContextSessionFact {
     pub session_id: String,
     pub kind: String,
@@ -160,7 +162,7 @@ pub(crate) struct ContextSessionFact {
     pub evidence_reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ContextBranchState {
     pub root_path: Option<String>,
     pub branch: Option<String>,
@@ -170,7 +172,7 @@ pub(crate) struct ContextBranchState {
     pub changed_files: Vec<ContextChangedFile>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ContextChangedFile {
     pub path: String,
     pub original_path: Option<String>,
@@ -178,7 +180,7 @@ pub(crate) struct ContextChangedFile {
     pub unstaged_status: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Citation {
     pub id: String,
     pub source_type: String,
@@ -776,261 +778,16 @@ impl ContextPack {
         rendered
     }
 
+    /// Renders the pack as compact JSON for agent consumers.
+    ///
+    /// Field order follows the struct declarations, which is what the
+    /// snapshot test pins; adding a field here is a wire change.
     pub(crate) fn render_json(&self) -> String {
-        let mut rendered = String::new();
-
-        rendered.push('{');
-        let _ = write!(rendered, "\"task\":{},", json_string(&self.task));
-
-        rendered.push_str("\"budget\":{");
-        let _ = write!(
-            rendered,
-            "\"max_tokens\":{},\"estimated_tokens\":{},\"truncated_sections\":[",
-            self.budget.max_tokens, self.budget.estimated_tokens
-        );
-        for (index, truncation) in self.budget.truncated_sections.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            let _ = write!(
-                rendered,
-                "{{\"section\":{},\"removed_items\":{}}}",
-                json_string(&truncation.section),
-                truncation.removed_items
-            );
-        }
-        rendered.push_str("]},");
-
-        rendered.push_str("\"relevant_files\":[");
-        for (index, file) in self.relevant_files.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            let _ = write!(
-                rendered,
-                "{{\"path\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
-                json_string(&file.path),
-                json_string(&file.citation_id),
-                file.evidence_score,
-                json_string(&file.evidence_reason)
-            );
-        }
-        rendered.push_str("],");
-
-        rendered.push_str("\"important_symbols\":[");
-        for (index, symbol) in self.important_symbols.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            let _ = write!(
-                rendered,
-                "{{\"path\":{},\"language\":{},\"name\":{},\"kind\":{},\"line_start\":{},\"line_end\":{},\"signature\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
-                json_string(&symbol.path),
-                json_option_string(symbol.language.as_deref()),
-                json_string(&symbol.name),
-                json_string(&symbol.kind),
-                symbol.line_start,
-                json_optional_i64(symbol.line_end),
-                json_string(&symbol.signature),
-                json_string(&symbol.citation_id),
-                symbol.evidence_score,
-                json_string(&symbol.evidence_reason)
-            );
-        }
-        rendered.push_str("],");
-
-        rendered.push_str("\"graph_neighbors\":[");
-        for (index, neighbor) in self.graph_neighbors.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            let _ = write!(
-                rendered,
-                "{{\"kind\":{},\"label\":{},\"detail\":{},\"path\":{},\"target_path\":{},\"target_name\":{},\"line_start\":{},\"site_count\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
-                json_string(&neighbor.kind),
-                json_string(&neighbor.label),
-                json_string(&neighbor.detail),
-                json_option_string(neighbor.path.as_deref()),
-                json_option_string(neighbor.target_path.as_deref()),
-                json_option_string(neighbor.target_name.as_deref()),
-                json_optional_i64(neighbor.line_start),
-                neighbor.site_count,
-                json_string(&neighbor.citation_id),
-                neighbor.evidence_score,
-                json_string(&neighbor.evidence_reason)
-            );
-        }
-        rendered.push_str("],");
-
-        rendered.push_str("\"affected_tests\":[");
-        for (index, test) in self.affected_tests.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            let _ = write!(
-                rendered,
-                "{{\"path\":{},\"reason\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
-                json_string(&test.path),
-                json_string(&test.reason),
-                json_string(&test.citation_id),
-                test.evidence_score,
-                json_string(&test.evidence_reason)
-            );
-        }
-        rendered.push_str("],");
-
-        rendered.push_str("\"relevant_memories\":[");
-        for (index, memory) in self.relevant_memories.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            rendered.push_str(&render_context_memory_json(memory));
-        }
-        rendered.push_str("],");
-
-        rendered.push_str("\"stale_memory_risks\":[");
-        for (index, risk) in self.stale_memory_risks.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            let shared_terms = risk
-                .shared_terms
-                .iter()
-                .map(|term| json_string(term))
-                .collect::<Vec<_>>()
-                .join(",");
-            let _ = write!(
-                rendered,
-                "{{\"reason\":{},\"signal\":{},\"shared_terms\":[{}],\"newer_memory\":{},\"older_memory\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
-                json_string(&risk.reason),
-                json_string(&risk.signal),
-                shared_terms,
-                render_context_memory_json(&risk.newer_memory),
-                render_context_memory_json(&risk.older_memory),
-                json_string(&risk.citation_id),
-                risk.evidence_score,
-                json_string(&risk.evidence_reason)
-            );
-        }
-        rendered.push_str("],");
-
-        rendered.push_str("\"diagnostics\":[");
-        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            let _ = write!(
-                rendered,
-                "{{\"id\":{},\"source\":{},\"path\":{},\"line_start\":{},\"line_end\":{},\"severity\":{},\"code\":{},\"message\":{},\"command\":{},\"created_at_ms\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
-                json_string(&diagnostic.id),
-                json_string(&diagnostic.source),
-                json_option_string(diagnostic.path.as_deref()),
-                json_optional_i64(diagnostic.line_start),
-                json_optional_i64(diagnostic.line_end),
-                json_string(&diagnostic.severity),
-                json_option_string(diagnostic.code.as_deref()),
-                json_string(&diagnostic.message),
-                json_option_string(diagnostic.command.as_deref()),
-                diagnostic.created_at_ms,
-                json_string(&diagnostic.citation_id),
-                diagnostic.evidence_score,
-                json_string(&diagnostic.evidence_reason)
-            );
-        }
-        rendered.push_str("],");
-
-        rendered.push_str("\"risk_signals\":[");
-        for (index, risk) in self.risk_signals.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            let _ = write!(
-                rendered,
-                "{{\"severity\":{},\"kind\":{},\"summary\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
-                json_string(&risk.severity),
-                json_string(&risk.kind),
-                json_string(&risk.summary),
-                json_string(&risk.citation_id),
-                risk.evidence_score,
-                json_string(&risk.evidence_reason)
-            );
-        }
-        rendered.push_str("],");
-
-        rendered.push_str("\"recent_sessions\":[");
-        for (index, fact) in self.recent_sessions.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            let _ = write!(
-                rendered,
-                "{{\"session_id\":{},\"kind\":{},\"detail\":{},\"created_at_ms\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
-                json_string(&fact.session_id),
-                json_string(&fact.kind),
-                json_string(&fact.detail),
-                fact.created_at_ms,
-                json_string(&fact.citation_id),
-                fact.evidence_score,
-                json_string(&fact.evidence_reason)
-            );
-        }
-        rendered.push_str("],");
-
-        rendered.push_str("\"branch_state\":");
-        if let Some(branch) = &self.branch_state {
-            rendered.push('{');
-            let _ = write!(
-                rendered,
-                "\"root_path\":{},\"branch\":{},\"upstream\":{},\"ahead\":{},\"behind\":{},\"changed_files\":[",
-                json_option_string(branch.root_path.as_deref()),
-                json_option_string(branch.branch.as_deref()),
-                json_option_string(branch.upstream.as_deref()),
-                branch.ahead,
-                branch.behind
-            );
-            for (index, file) in branch.changed_files.iter().enumerate() {
-                if index > 0 {
-                    rendered.push(',');
-                }
-                let _ = write!(
-                    rendered,
-                    "{{\"path\":{},\"original_path\":{},\"staged_status\":{},\"unstaged_status\":{}}}",
-                    json_string(&file.path),
-                    json_option_string(file.original_path.as_deref()),
-                    json_option_string(file.staged_status.as_deref()),
-                    json_option_string(file.unstaged_status.as_deref())
-                );
-            }
-            rendered.push_str("]},");
-        } else {
-            rendered.push_str("null,");
-        }
-
-        rendered.push_str("\"suggested_path\":[");
-        for (index, step) in self.suggested_path.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            rendered.push_str(&json_string(step));
-        }
-        rendered.push_str("],");
-
-        rendered.push_str("\"citations\":[");
-        for (index, citation) in self.citations.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
-            }
-            let _ = write!(
-                rendered,
-                "{{\"id\":{},\"source_type\":{},\"label\":{}}}",
-                json_string(&citation.id),
-                json_string(&citation.source_type),
-                json_string(&citation.label)
-            );
-        }
-        rendered.push_str("]}");
-
-        rendered
+        // Serialising these types cannot fail: every field is a string,
+        // integer, option, or vector of the same, and the one custom
+        // serialiser falls back to a string rather than erroring.
+        serde_json::to_string(self)
+            .unwrap_or_else(|error| unreachable!("context pack serialisation cannot fail: {error}"))
     }
 
     fn apply_token_budget(&mut self, max_tokens: usize) {
@@ -1169,25 +926,21 @@ fn graph_neighbor_citation_id(neighbor: &GraphNeighbor) -> String {
     )
 }
 
-fn render_context_memory_json(memory: &ContextMemory) -> String {
-    format!(
-        "{{\"id\":{},\"created_at_ms\":{},\"kind\":{},\"text\":{},\"structured_payload\":{},\"citation_id\":{},\"evidence_score\":{},\"evidence_reason\":{}}}",
-        json_string(&memory.id),
-        memory.created_at_ms,
-        json_string(&memory.kind),
-        json_string(&memory.text),
-        render_optional_json_payload(memory.structured_payload.as_deref()),
-        json_string(&memory.citation_id),
-        memory.evidence_score,
-        json_string(&memory.evidence_reason)
-    )
-}
-
-fn render_optional_json_payload(payload: Option<&str>) -> String {
+/// Serialises a memory's `structured_payload`, which already holds serialised
+/// JSON. Splicing the parsed value in keeps consumers able to walk into it
+/// (`structured_payload.source.type`) instead of handing them a quoted blob.
+/// Payloads that do not parse fall back to a plain string so a malformed row
+/// can never produce malformed output.
+fn serialize_embedded_json<S>(payload: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
     match payload {
-        Some(payload) => serde_json::from_str::<serde_json::Value>(payload)
-            .map_or_else(|_| json_string(payload), |value| value.to_string()),
-        None => "null".to_string(),
+        Some(payload) => match serde_json::from_str::<serde_json::Value>(payload) {
+            Ok(value) => value.serialize(serializer),
+            Err(_) => serializer.serialize_str(payload),
+        },
+        None => serializer.serialize_none(),
     }
 }
 
@@ -2870,14 +2623,6 @@ pub(crate) fn json_string(value: &str) -> String {
     }
     escaped.push('"');
     escaped
-}
-
-fn json_option_string(value: Option<&str>) -> String {
-    value.map_or_else(|| "null".to_string(), json_string)
-}
-
-fn json_optional_i64(value: Option<i64>) -> String {
-    value.map_or_else(|| "null".to_string(), |value| value.to_string())
 }
 
 fn symbol_location(symbol: &ContextSymbol) -> String {
