@@ -1,0 +1,11 @@
+# Pins the toolchain so a local `cargo clippy` sees exactly the lints CI
+# sees. Without this, `stable` floats and a new Rust release turns unrelated
+# pull requests red. Bump this deliberately, in its own commit, alongside any
+# lint fixes the new release brings.
+#
+# This is the development toolchain, not the support floor: the crate's
+# minimum supported version is `rust-version` in Cargo.toml, and CI checks it
+# separately by overriding this file with RUSTUP_TOOLCHAIN.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]

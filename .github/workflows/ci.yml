@@ -13,10 +13,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      # rust-toolchain.toml pins the version and components; installing from
+      # it keeps CI on exactly the toolchain contributors run locally.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -38,10 +38,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      # rust-toolchain.toml pins the version and components; installing from
+      # it keeps CI on exactly the toolchain contributors run locally.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -57,6 +57,9 @@ jobs:
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest
+    # Outranks rust-toolchain.toml, so this job really does build on 1.88.
+    env:
+      RUSTUP_TOOLCHAIN: "1.88"
 
     steps:
       - name: Checkout
@@ -84,8 +87,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      # rust-toolchain.toml pins the version and components; installing from
+      # it keeps CI on exactly the toolchain contributors run locally.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
