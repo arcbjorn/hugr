@@ -1085,6 +1085,7 @@ dependencies = [
  "libsql",
  "notify",
  "regex",
+ "serde",
  "serde_json",
  "tokio",
  "tree-sitter",
