@@ -1654,7 +1654,7 @@ impl Store {
     }
 
     pub async fn end_session(&self, summary: Option<&str>) -> Result<Session, String> {
-        let summary = summary.map(|summary| redact::redact_secrets(summary));
+        let summary = summary.map(redact::redact_secrets);
         let summary = summary.as_deref();
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
@@ -2017,7 +2017,7 @@ impl Store {
             .await?
             .into_iter()
             .filter_map(|memory| {
-                let score = recall_score(&memory, &terms, query);
+                let score = recall_score(&memory, terms, query);
                 (score > 0).then_some((score, memory))
             })
             .collect::<Vec<_>>();
@@ -4586,7 +4586,7 @@ fn diagnostic_records_from_inputs(
     let now = now_ms()?;
     diagnostics
         .iter()
-        .filter_map(|diagnostic| normalize_diagnostic_input(diagnostic))
+        .filter_map(normalize_diagnostic_input)
         .map(|diagnostic| {
             Ok(DiagnosticSyncRecord {
                 id: diagnostic_id(now),
@@ -14374,7 +14374,7 @@ mod tests {
 
         let likely = test
             .store
-            .likely_tests_for_files(&[source_file.path.clone()], 5)
+            .likely_tests_for_files(std::slice::from_ref(&source_file.path), 5)
             .await
             .unwrap();
         assert_eq!(likely[0].path, "tests/plugin_hooks.rs");
