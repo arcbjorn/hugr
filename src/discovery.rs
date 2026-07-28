@@ -14,7 +14,7 @@ const SOURCE_EMBEDDING_SCORE_OFFSET: usize = 10_000;
 const SOURCE_EMBEDDING_RANK_WINDOW: usize = 1_000;
 
 pub(crate) fn source_embedding_score(rank: usize) -> usize {
-    let rank = rank.max(1).min(SOURCE_EMBEDDING_RANK_WINDOW);
+    let rank = rank.clamp(1, SOURCE_EMBEDDING_RANK_WINDOW);
     SOURCE_EMBEDDING_SCORE_OFFSET + SOURCE_EMBEDDING_RANK_WINDOW - rank
 }
 
