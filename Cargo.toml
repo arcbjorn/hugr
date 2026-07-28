@@ -10,6 +10,14 @@ readme = "README.md"
 keywords = ["agent", "memory", "mcp", "code-intelligence", "context"]
 categories = ["command-line-utilities", "development-tools"]
 
+[lints.clippy]
+# A handful of internal helpers (reference rewriting, risk scoring, sync run
+# recording) thread a wide but flat set of inputs through a single call site.
+# Wrapping those in single-use parameter structs adds indirection without
+# making the code clearer, so this one lint is allowed crate-wide; CI denies
+# every other clippy warning.
+too_many_arguments = "allow"
+
 [features]
 default = ["local-embeddings"]
 # In-process ONNX text embeddings (fastembed). Disable for a slim binary:

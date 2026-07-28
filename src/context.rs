@@ -305,7 +305,6 @@ impl ContextPack {
         ContextPackBuilder::new(task)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_inputs_and_budget(
         task: &str,
         file_candidates: Vec<FileCandidate>,
