@@ -25,6 +25,11 @@ const IDLE_DEBOUNCE: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 const MEMORY_JOB_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const SESSION_PROMOTION_JOB_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const MAX_HTTP_REQUEST_BYTES: usize = 1024 * 1024;
+/// Ceiling on how long one client may take to deliver a complete request.
+/// Without it a connection that opens and then stalls pins a task forever,
+/// so a handful of idle peers can accumulate until the daemon runs out of
+/// descriptors.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DaemonConfig {
@@ -120,7 +125,9 @@ async fn handle_client(
     peer_addr: SocketAddr,
     state: Arc<DaemonState>,
 ) -> Result<(), String> {
-    let request = read_http_request(&mut stream).await?;
+    let request = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, read_http_request(&mut stream))
+        .await
+        .map_err(|_| "timed out reading HTTP request".to_string())??;
     if request.is_empty() {
         return Ok(());
     }
