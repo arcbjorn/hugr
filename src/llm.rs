@@ -29,7 +29,7 @@ pub(crate) struct ChatSynthesizer {
 }
 
 impl ChatSynthesizer {
-    pub fn from_env() -> Result<Self, String> {
+    pub(crate) fn from_env() -> Result<Self, String> {
         Self::from_lookup(|key| env::var(key).ok())
     }
 
@@ -68,15 +68,15 @@ impl ChatSynthesizer {
         }
     }
 
-    pub fn provider(&self) -> &str {
+    pub(crate) fn provider(&self) -> &str {
         &self.provider
     }
 
-    pub fn model(&self) -> &str {
+    pub(crate) fn model(&self) -> &str {
         &self.model
     }
 
-    pub fn synthesize(&self, task: &str, facts: &[String]) -> Result<String, String> {
+    pub(crate) fn synthesize(&self, task: &str, facts: &[String]) -> Result<String, String> {
         let prompt = synthesis_prompt(task, facts);
         let body = chat_request(&self.model, &prompt);
         let response = post_json_with_curl(&self.url, &self.api_key, &body)?;

@@ -28,7 +28,7 @@ const TEST_MAPPINGS_NAME: &str = "test_mappings";
 const SOURCE_EMBEDDINGS_VERSION: i64 = 12;
 const SOURCE_EMBEDDINGS_NAME: &str = "source_embeddings";
 
-pub async fn migrate(conn: &Connection) -> Result<(), String> {
+pub(crate) async fn migrate(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS schema_migrations (

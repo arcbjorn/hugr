@@ -22,7 +22,7 @@ const CYCLOMATIC_COMPLEXITY_THRESHOLD: usize = 10;
 const HIGH_CYCLOMATIC_COMPLEXITY_THRESHOLD: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextPack {
+pub(crate) struct ContextPack {
     pub task: String,
     pub budget: ContextBudget,
     pub relevant_files: Vec<ContextFile>,
@@ -40,20 +40,20 @@ pub struct ContextPack {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextBudget {
+pub(crate) struct ContextBudget {
     pub max_tokens: usize,
     pub estimated_tokens: usize,
     pub truncated_sections: Vec<ContextBudgetTruncation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextBudgetTruncation {
+pub(crate) struct ContextBudgetTruncation {
     pub section: String,
     pub removed_items: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextFile {
+pub(crate) struct ContextFile {
     pub path: String,
     pub citation_id: String,
     pub evidence_score: usize,
@@ -61,7 +61,7 @@ pub struct ContextFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextSymbol {
+pub(crate) struct ContextSymbol {
     pub path: String,
     pub language: Option<String>,
     pub name: String,
@@ -75,7 +75,7 @@ pub struct ContextSymbol {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextGraphNeighbor {
+pub(crate) struct ContextGraphNeighbor {
     pub kind: String,
     pub label: String,
     pub detail: String,
@@ -90,7 +90,7 @@ pub struct ContextGraphNeighbor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextTest {
+pub(crate) struct ContextTest {
     pub path: String,
     pub reason: String,
     pub citation_id: String,
@@ -99,7 +99,7 @@ pub struct ContextTest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextMemory {
+pub(crate) struct ContextMemory {
     pub id: String,
     pub created_at_ms: i64,
     pub kind: String,
@@ -111,7 +111,7 @@ pub struct ContextMemory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextStaleMemoryRisk {
+pub(crate) struct ContextStaleMemoryRisk {
     pub reason: String,
     pub signal: String,
     pub shared_terms: Vec<String>,
@@ -123,7 +123,7 @@ pub struct ContextStaleMemoryRisk {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextDiagnostic {
+pub(crate) struct ContextDiagnostic {
     pub id: String,
     pub source: String,
     pub path: Option<String>,
@@ -140,7 +140,7 @@ pub struct ContextDiagnostic {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextRiskSignal {
+pub(crate) struct ContextRiskSignal {
     pub severity: String,
     pub kind: String,
     pub summary: String,
@@ -150,7 +150,7 @@ pub struct ContextRiskSignal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextSessionFact {
+pub(crate) struct ContextSessionFact {
     pub session_id: String,
     pub kind: String,
     pub detail: String,
@@ -161,7 +161,7 @@ pub struct ContextSessionFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextBranchState {
+pub(crate) struct ContextBranchState {
     pub root_path: Option<String>,
     pub branch: Option<String>,
     pub upstream: Option<String>,
@@ -171,7 +171,7 @@ pub struct ContextBranchState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextChangedFile {
+pub(crate) struct ContextChangedFile {
     pub path: String,
     pub original_path: Option<String>,
     pub staged_status: Option<String>,
@@ -179,7 +179,7 @@ pub struct ContextChangedFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Citation {
+pub(crate) struct Citation {
     pub id: String,
     pub source_type: String,
     pub label: String,
@@ -515,7 +515,7 @@ impl ContextPack {
         pack
     }
 
-    pub fn render_markdown(&self) -> String {
+    pub(crate) fn render_markdown(&self) -> String {
         let mut rendered = String::new();
 
         rendered.push_str("# Hugr Context Pack\n\n");
@@ -776,7 +776,7 @@ impl ContextPack {
         rendered
     }
 
-    pub fn render_json(&self) -> String {
+    pub(crate) fn render_json(&self) -> String {
         let mut rendered = String::new();
 
         rendered.push('{');

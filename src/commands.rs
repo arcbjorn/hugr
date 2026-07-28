@@ -23,7 +23,7 @@ use std::io::{self, Write as IoWrite};
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 
-pub async fn execute(command: Command) -> Result<(), String> {
+pub(crate) async fn execute(command: Command) -> Result<(), String> {
     match command {
         Command::Init => init().await,
         Command::Status => status().await,

@@ -1,7 +1,7 @@
 use crate::daemon::DEFAULT_DAEMON_ADDR;
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Command {
+pub(crate) enum Command {
     Init,
     Status,
     Remember {
@@ -125,13 +125,13 @@ pub enum Command {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemorySourceArg {
+pub(crate) struct MemorySourceArg {
     pub kind: String,
     pub locator: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MemoryWriteArgs {
+pub(crate) struct MemoryWriteArgs {
     pub source: Option<MemorySourceArg>,
     pub confidence: Option<String>,
     pub sensitivity: Option<String>,
@@ -140,13 +140,13 @@ pub struct MemoryWriteArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputFormat {
+pub(crate) enum OutputFormat {
     Markdown,
     Json,
 }
 
 impl Command {
-    pub fn parse(args: &[String]) -> Result<Self, String> {
+    pub(crate) fn parse(args: &[String]) -> Result<Self, String> {
         let Some(command) = args.get(1).map(String::as_str) else {
             return Ok(Self::Help);
         };
@@ -941,7 +941,7 @@ fn parse_hook_command(args: &[String]) -> Result<Command, String> {
     Ok(Command::Hook { agent, event })
 }
 
-pub fn help_text() -> &'static str {
+pub(crate) fn help_text() -> &'static str {
     "Hugr\n\nUsage:\n  hugr init\n  hugr status\n  hugr remember [--global] [--source <kind:locator>] [--confidence <0.0-1.0>] [--sensitivity <label>] [--valid-from <value>] [--valid-to <value>] <text>\n  hugr recall [--global] [--json] <query>\n  hugr context [--json] [--budget <tokens>] <task>\n  hugr index [--paths <p1,p2,...>]\n  hugr symbols [--json] <query>\n  hugr impact [--json] <file-or-symbol>\n  hugr replace-symbol [--json] [--kind <kind>] <path> <symbol> (--body <source> | --body-file <path>)\n  hugr rename-symbol [--json] [--kind <kind>] <path> <symbol> <new-symbol>\n  hugr move-symbol [--json] [--kind <kind>] [--rewrite-references] <source-path> <symbol> <destination-path>\n  hugr project status\n  hugr sync status [--json]\n  hugr sync push [--dry-run|--execute] [--json]\n  hugr sync pull [--dry-run|--execute] [--json]\n  hugr sync history [--json]\n  hugr session start <task>\n  hugr session event <kind> <detail>\n  hugr session end [summary]\n  hugr session promote [--llm] [--json]\n  hugr mcp\n  hugr daemon [--addr <host:port>]\n  hugr run [--] <command> [args...]\n  hugr observe command --status <code> -- <command> [args...]\n  hugr shell-hook <bash|zsh>\n  hugr improve [--execute] [--duplicates|--stale] [--json]\n  hugr forget [--global] [--json] <query>\n  hugr eval [--json] [--from-git <n>] [--max-files <n>] [--min-hit-rate <0.0-1.0>]\n  hugr install <claude-code|cursor> [--shared]\n  hugr doctor\n"
 }
 

@@ -12,7 +12,7 @@ use std::io::{self, BufRead, Write};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
-pub async fn serve_stdio() -> Result<(), String> {
+pub(crate) async fn serve_stdio() -> Result<(), String> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 

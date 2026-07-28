@@ -91,7 +91,7 @@ struct StorageConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncExecutionPlan {
+pub(crate) struct SyncExecutionPlan {
     pub storage_mode: String,
     pub backend: String,
     pub local_writes_enabled: bool,
@@ -108,7 +108,7 @@ pub struct SyncExecutionPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncPushResult {
+pub(crate) struct SyncPushResult {
     pub run_id: Option<String>,
     pub dry_run: bool,
     pub backend: String,
@@ -117,7 +117,7 @@ pub struct SyncPushResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncPullResult {
+pub(crate) struct SyncPullResult {
     pub run_id: Option<String>,
     pub dry_run: bool,
     pub backend: String,
@@ -126,7 +126,7 @@ pub struct SyncPullResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncTableResult {
+pub(crate) struct SyncTableResult {
     pub class: String,
     pub table: String,
     pub row_count: usize,
@@ -139,13 +139,13 @@ pub struct SyncTableResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncConflictSummary {
+pub(crate) struct SyncConflictSummary {
     pub reason: String,
     pub count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncRunHistory {
+pub(crate) struct SyncRunHistory {
     pub id: String,
     pub operation: String,
     pub backend: String,
@@ -162,7 +162,7 @@ pub(crate) struct SyncApiTablePayload {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PruneSummary {
+pub(crate) struct PruneSummary {
     pub missing_paths: usize,
     pub discovered_files: u64,
     pub symbols: u64,
@@ -172,13 +172,13 @@ pub struct PruneSummary {
 }
 
 impl PruneSummary {
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.missing_paths == 0
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Memory {
+pub(crate) struct Memory {
     pub id: String,
     pub created_at_ms: i64,
     pub kind: String,
@@ -187,13 +187,13 @@ pub struct Memory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemorySource {
+pub(crate) struct MemorySource {
     pub kind: String,
     pub locator: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct MemoryWriteOptions {
+pub(crate) struct MemoryWriteOptions {
     pub source: Option<MemorySource>,
     pub confidence: Option<f64>,
     pub sensitivity: Option<String>,
@@ -202,7 +202,7 @@ pub struct MemoryWriteOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionPromotionResult {
+pub(crate) struct SessionPromotionResult {
     pub session_id: String,
     pub task: String,
     pub fact_count: usize,
@@ -213,7 +213,7 @@ pub struct SessionPromotionResult {
 /// records which provider and model produced the text so the promoted memory
 /// carries synthesis provenance next to its session facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionSynthesis {
+pub(crate) struct SessionSynthesis {
     pub text: String,
     pub provider: String,
     pub model: String,
@@ -223,11 +223,11 @@ pub struct SessionSynthesis {
 /// because the session facts only become known inside the store; any error
 /// falls back to the deterministic digest so promotion never fails because a
 /// model was unreachable.
-pub type SessionSynthesizerFn<'a> =
+pub(crate) type SessionSynthesizerFn<'a> =
     &'a (dyn Fn(&str, &[SessionFact]) -> Result<SessionSynthesis, String> + Send + Sync);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForgetResult {
+pub(crate) struct ForgetResult {
     pub query: String,
     pub forgotten_count: usize,
     pub forgotten_at: String,
@@ -235,7 +235,7 @@ pub struct ForgetResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoryMaintenanceReport {
+pub(crate) struct MemoryMaintenanceReport {
     pub active_count: usize,
     pub retired_count: usize,
     pub duplicate_groups: Vec<DuplicateMemoryGroup>,
@@ -243,13 +243,13 @@ pub struct MemoryMaintenanceReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DuplicateMemoryGroup {
+pub(crate) struct DuplicateMemoryGroup {
     pub normalized_text: String,
     pub memories: Vec<Memory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StaleMemoryCandidate {
+pub(crate) struct StaleMemoryCandidate {
     pub reason: String,
     pub signal: String,
     pub shared_terms: Vec<String>,
@@ -258,7 +258,7 @@ pub struct StaleMemoryCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoryConsolidationResult {
+pub(crate) struct MemoryConsolidationResult {
     pub executed_at: String,
     pub duplicate_groups: Vec<DuplicateMemoryGroup>,
     pub kept_memories: Vec<Memory>,
@@ -266,14 +266,14 @@ pub struct MemoryConsolidationResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StaleRetirementResult {
+pub(crate) struct StaleRetirementResult {
     pub executed_at: String,
     pub stale_candidates: Vec<StaleMemoryCandidate>,
     pub kept_memories: Vec<Memory>,
     pub retired_memories: Vec<Memory>,
 }
 
-pub struct Store {
+pub(crate) struct Store {
     root: PathBuf,
     embedding_provider: Result<SelectedEmbeddingProvider, String>,
     storage_config: Result<StorageConfig, String>,
@@ -283,7 +283,7 @@ pub struct Store {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Project {
+pub(crate) struct Project {
     pub id: String,
     pub name: String,
     pub root_path: String,
@@ -294,7 +294,7 @@ pub struct Project {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Session {
+pub(crate) struct Session {
     pub id: String,
     pub task: String,
     pub branch: Option<String>,
@@ -304,7 +304,7 @@ pub struct Session {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionEvent {
+pub(crate) struct SessionEvent {
     pub id: String,
     pub session_id: String,
     pub kind: String,
@@ -313,7 +313,7 @@ pub struct SessionEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionFact {
+pub(crate) struct SessionFact {
     pub session_id: String,
     pub kind: String,
     pub detail: String,
@@ -321,7 +321,7 @@ pub struct SessionFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GraphNeighbor {
+pub(crate) struct GraphNeighbor {
     pub kind: String,
     pub label: String,
     pub detail: String,
@@ -336,7 +336,7 @@ pub struct GraphNeighbor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FreshnessSignal {
+pub(crate) struct FreshnessSignal {
     pub path: String,
     pub kind: String,
     pub detail: String,
@@ -345,7 +345,7 @@ pub struct FreshnessSignal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Diagnostic {
+pub(crate) struct Diagnostic {
     pub id: String,
     pub source: String,
     pub path: Option<String>,
@@ -359,7 +359,7 @@ pub struct Diagnostic {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiagnosticInput {
+pub(crate) struct DiagnosticInput {
     pub source: String,
     pub path: Option<String>,
     pub line_start: Option<i64>,
@@ -379,7 +379,7 @@ struct ProjectInput {
 }
 
 impl Store {
-    pub fn open_current() -> Self {
+    pub(crate) fn open_current() -> Self {
         Self {
             root: PathBuf::from(HUGR_DIR),
             embedding_provider: SelectedEmbeddingProvider::from_env(),
@@ -391,7 +391,7 @@ impl Store {
     /// Opens the user-level memory store shared across projects. Global
     /// memory is deliberately device-local: it ignores remote storage modes
     /// and is never part of project sync classes.
-    pub fn open_global() -> Result<Self, String> {
+    pub(crate) fn open_global() -> Result<Self, String> {
         Ok(Self {
             root: global_root(|name| env::var(name).ok())?,
             embedding_provider: SelectedEmbeddingProvider::from_env(),
@@ -418,7 +418,7 @@ impl Store {
         }
     }
 
-    pub async fn init(&self) -> Result<(), String> {
+    pub(crate) async fn init(&self) -> Result<(), String> {
         let storage_config = self.storage_config()?;
         if !matches!(storage_config.mode, StorageMode::Remote) {
             fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
@@ -444,15 +444,15 @@ impl Store {
         Ok(conn)
     }
 
-    pub fn exists(&self) -> bool {
+    pub(crate) fn exists(&self) -> bool {
         self.db_path().exists()
     }
 
-    pub async fn remember(&self, text: &str) -> Result<Memory, String> {
+    pub(crate) async fn remember(&self, text: &str) -> Result<Memory, String> {
         self.remember_with_source(text, None).await
     }
 
-    pub async fn remember_with_source(
+    pub(crate) async fn remember_with_source(
         &self,
         text: &str,
         source: Option<MemorySource>,
@@ -467,7 +467,7 @@ impl Store {
         .await
     }
 
-    pub async fn remember_with_options(
+    pub(crate) async fn remember_with_options(
         &self,
         text: &str,
         options: MemoryWriteOptions,
@@ -500,7 +500,7 @@ impl Store {
         .await
     }
 
-    pub async fn memories(&self) -> Result<Vec<Memory>, String> {
+    pub(crate) async fn memories(&self) -> Result<Vec<Memory>, String> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return hugr_api_active_memories(&storage_config);
@@ -515,7 +515,7 @@ impl Store {
         active_memories(&conn).await
     }
 
-    pub async fn forget(&self, query: &str, limit: usize) -> Result<ForgetResult, String> {
+    pub(crate) async fn forget(&self, query: &str, limit: usize) -> Result<ForgetResult, String> {
         let query = query.trim();
         if query.is_empty() {
             return Err("hugr forget requires a query".to_string());
@@ -577,7 +577,9 @@ impl Store {
         })
     }
 
-    pub async fn memory_maintenance_report(&self) -> Result<MemoryMaintenanceReport, String> {
+    pub(crate) async fn memory_maintenance_report(
+        &self,
+    ) -> Result<MemoryMaintenanceReport, String> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return memory_maintenance_report_via_hugr_api(&storage_config);
@@ -633,7 +635,7 @@ impl Store {
         })
     }
 
-    pub async fn consolidate_duplicate_memories(
+    pub(crate) async fn consolidate_duplicate_memories(
         &self,
     ) -> Result<MemoryConsolidationResult, String> {
         let storage_config = self.storage_config()?.clone();
@@ -678,7 +680,7 @@ impl Store {
         })
     }
 
-    pub async fn retire_stale_memories(&self) -> Result<StaleRetirementResult, String> {
+    pub(crate) async fn retire_stale_memories(&self) -> Result<StaleRetirementResult, String> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return retire_stale_memories_via_hugr_api(&storage_config);
@@ -728,7 +730,7 @@ impl Store {
         })
     }
 
-    pub async fn sync_current_project(&self) -> Result<Project, String> {
+    pub(crate) async fn sync_current_project(&self) -> Result<Project, String> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return sync_current_project_via_hugr_api(&storage_config);
@@ -740,7 +742,7 @@ impl Store {
             .ok_or_else(|| "project registry is empty after initialization".to_string())
     }
 
-    pub async fn project(&self) -> Result<Option<Project>, String> {
+    pub(crate) async fn project(&self) -> Result<Option<Project>, String> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return project_via_hugr_api(&storage_config);
@@ -755,7 +757,10 @@ impl Store {
         project_from_conn(&conn).await
     }
 
-    pub async fn record_discovered_files(&self, files: &[FileCandidate]) -> Result<(), String> {
+    pub(crate) async fn record_discovered_files(
+        &self,
+        files: &[FileCandidate],
+    ) -> Result<(), String> {
         if files.is_empty() {
             return Ok(());
         }
@@ -806,7 +811,7 @@ impl Store {
         Ok(())
     }
 
-    pub async fn record_code_index(
+    pub(crate) async fn record_code_index(
         &self,
         files: &[FileCandidate],
         symbols: &[CodeSymbol],
@@ -875,7 +880,10 @@ impl Store {
     /// after a file is deleted or renamed. Paths are resolved against `root`;
     /// a row is pruned only when its file is genuinely missing, so files merely
     /// truncated out of a ranked discovery pass are left untouched.
-    pub async fn prune_missing_index_rows(&self, root: &Path) -> Result<PruneSummary, String> {
+    pub(crate) async fn prune_missing_index_rows(
+        &self,
+        root: &Path,
+    ) -> Result<PruneSummary, String> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) || !self.exists() {
             return Ok(PruneSummary::default());
@@ -1059,7 +1067,7 @@ impl Store {
         Ok(())
     }
 
-    pub async fn symbols_for_target(
+    pub(crate) async fn symbols_for_target(
         &self,
         target: &str,
         limit: usize,
@@ -1114,7 +1122,7 @@ impl Store {
         Ok(symbols)
     }
 
-    pub async fn references_to_symbols(
+    pub(crate) async fn references_to_symbols(
         &self,
         symbols: &[CodeSymbol],
         limit: usize,
@@ -1171,7 +1179,7 @@ impl Store {
         Ok(references)
     }
 
-    pub async fn references_from_symbols(
+    pub(crate) async fn references_from_symbols(
         &self,
         symbols: &[CodeSymbol],
         limit: usize,
@@ -1224,7 +1232,7 @@ impl Store {
         Ok(references)
     }
 
-    pub async fn references_from_path(
+    pub(crate) async fn references_from_path(
         &self,
         path: &str,
         limit: usize,
@@ -1277,7 +1285,7 @@ impl Store {
         Ok(references)
     }
 
-    pub async fn context_graph_neighbors(
+    pub(crate) async fn context_graph_neighbors(
         &self,
         query: &str,
         files: &[String],
@@ -1352,7 +1360,7 @@ impl Store {
         Ok(finalize_graph_neighbors(query, neighbors, limit))
     }
 
-    pub async fn context_freshness_signals(
+    pub(crate) async fn context_freshness_signals(
         &self,
         files: &[String],
         symbols: &[CodeSymbol],
@@ -1407,7 +1415,7 @@ impl Store {
         Ok(finalize_freshness_signals(signals, limit))
     }
 
-    pub async fn record_diagnostics(
+    pub(crate) async fn record_diagnostics(
         &self,
         diagnostics: &[DiagnosticInput],
     ) -> Result<Vec<Diagnostic>, String> {
@@ -1440,7 +1448,7 @@ impl Store {
             .collect())
     }
 
-    pub async fn recent_diagnostics(
+    pub(crate) async fn recent_diagnostics(
         &self,
         query: &str,
         files: &[String],
@@ -1462,7 +1470,7 @@ impl Store {
         Ok(rank_diagnostics(records, query, files, symbols, limit))
     }
 
-    pub async fn likely_tests_for_files(
+    pub(crate) async fn likely_tests_for_files(
         &self,
         files: &[String],
         limit: usize,
@@ -1488,7 +1496,7 @@ impl Store {
         Ok(finalize_test_candidates(candidates, limit))
     }
 
-    pub async fn source_embedding_file_candidates(
+    pub(crate) async fn source_embedding_file_candidates(
         &self,
         query: &str,
         limit: usize,
@@ -1517,7 +1525,7 @@ impl Store {
             .await
     }
 
-    pub async fn recall_symbols(
+    pub(crate) async fn recall_symbols(
         &self,
         query: &str,
         limit: usize,
@@ -1576,7 +1584,7 @@ impl Store {
         Ok(matches.into_iter().map(|(_, symbol)| symbol).collect())
     }
 
-    pub async fn start_session(&self, task: &str) -> Result<Session, String> {
+    pub(crate) async fn start_session(&self, task: &str) -> Result<Session, String> {
         let storage_config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&storage_config) {
             return start_session_via_hugr_api(&storage_config, task);
@@ -1613,7 +1621,7 @@ impl Store {
         Ok(session)
     }
 
-    pub async fn record_session_event(
+    pub(crate) async fn record_session_event(
         &self,
         kind: &str,
         detail: &str,
@@ -1654,7 +1662,7 @@ impl Store {
             .map(Some)
     }
 
-    pub async fn end_session(&self, summary: Option<&str>) -> Result<Session, String> {
+    pub(crate) async fn end_session(&self, summary: Option<&str>) -> Result<Session, String> {
         let summary = summary.map(redact::redact_secrets);
         let summary = summary.as_deref();
         let storage_config = self.storage_config()?.clone();
@@ -1687,11 +1695,11 @@ impl Store {
             .ok_or_else(|| "ended session was not found".to_string())
     }
 
-    pub async fn promote_latest_session(&self) -> Result<SessionPromotionResult, String> {
+    pub(crate) async fn promote_latest_session(&self) -> Result<SessionPromotionResult, String> {
         self.promote_latest_session_with_synthesis(None).await
     }
 
-    pub async fn promote_latest_session_with_synthesis(
+    pub(crate) async fn promote_latest_session_with_synthesis(
         &self,
         synthesizer: Option<SessionSynthesizerFn<'_>>,
     ) -> Result<SessionPromotionResult, String> {
@@ -1778,7 +1786,7 @@ impl Store {
         })
     }
 
-    pub async fn recent_session_facts(
+    pub(crate) async fn recent_session_facts(
         &self,
         query: &str,
         limit: usize,
@@ -1860,7 +1868,7 @@ impl Store {
         insert_context_pack(&conn, task, payload_json).await
     }
 
-    pub async fn recall(&self, query: &str, limit: usize) -> Result<Vec<Memory>, String> {
+    pub(crate) async fn recall(&self, query: &str, limit: usize) -> Result<Vec<Memory>, String> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -2033,15 +2041,15 @@ impl Store {
         Ok(matches.into_iter().map(|(_, memory)| memory).collect())
     }
 
-    pub fn root(&self) -> &Path {
+    pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 
-    pub fn db_path(&self) -> PathBuf {
+    pub(crate) fn db_path(&self) -> PathBuf {
         self.root.join(HUGR_DB)
     }
 
-    pub fn embedding_provider_summary(&self) -> String {
+    pub(crate) fn embedding_provider_summary(&self) -> String {
         match self.embedding_provider() {
             Ok(provider) => format!(
                 "{} ({} dimensions)",
@@ -2052,7 +2060,7 @@ impl Store {
         }
     }
 
-    pub fn storage_summary(&self) -> String {
+    pub(crate) fn storage_summary(&self) -> String {
         match self.storage_config() {
             Ok(config) => config.summary(),
             Err(error) => format!("configuration error: {error}"),
@@ -2062,16 +2070,16 @@ impl Store {
     /// Whether structural edits against the local working tree are available. Remote-only
     /// Hugr API mode has no working tree, so source-editing commands must refuse instead
     /// of silently doing nothing.
-    pub fn supports_local_source_edits(&self) -> Result<bool, String> {
+    pub(crate) fn supports_local_source_edits(&self) -> Result<bool, String> {
         Ok(!uses_remote_only_hugr_api_transport(self.storage_config()?))
     }
 
-    pub fn sync_execution_plan(&self) -> Result<SyncExecutionPlan, String> {
+    pub(crate) fn sync_execution_plan(&self) -> Result<SyncExecutionPlan, String> {
         self.storage_config()
             .map(StorageConfig::sync_execution_plan)
     }
 
-    pub async fn sync_history(&self, limit: usize) -> Result<Vec<SyncRunHistory>, String> {
+    pub(crate) async fn sync_history(&self, limit: usize) -> Result<Vec<SyncRunHistory>, String> {
         let config = self.storage_config()?.clone();
         if uses_hugr_api_transport(&config) {
             return fetch_hugr_api_history(&config, limit.max(1));
@@ -2459,7 +2467,7 @@ impl Store {
         ))
     }
 
-    pub async fn sync_push(&self, dry_run: bool) -> Result<SyncPushResult, String> {
+    pub(crate) async fn sync_push(&self, dry_run: bool) -> Result<SyncPushResult, String> {
         let config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&config) {
             return execute_hugr_api_push(&config, dry_run, &[]);
@@ -2526,7 +2534,7 @@ impl Store {
         })
     }
 
-    pub async fn sync_pull(&self, dry_run: bool) -> Result<SyncPullResult, String> {
+    pub(crate) async fn sync_pull(&self, dry_run: bool) -> Result<SyncPullResult, String> {
         let config = self.storage_config()?.clone();
         if uses_remote_only_hugr_api_transport(&config) {
             return execute_hugr_api_pull(&config, dry_run, &[], None).await;
@@ -2644,7 +2652,7 @@ impl Store {
 
     /// True when this store routes all operations through a hosted Hugr API
     /// endpoint instead of a local database.
-    pub fn is_remote_only(&self) -> Result<bool, String> {
+    pub(crate) fn is_remote_only(&self) -> Result<bool, String> {
         Ok(uses_remote_only_hugr_api_transport(self.storage_config()?))
     }
 

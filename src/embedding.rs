@@ -24,7 +24,7 @@ pub(crate) struct Embedding {
 }
 
 impl Embedding {
-    pub fn dimensions(&self) -> usize {
+    pub(crate) fn dimensions(&self) -> usize {
         self.vector.len()
     }
 
@@ -37,7 +37,7 @@ impl Embedding {
         vector
     }
 
-    pub fn to_f32_blob(&self) -> Vec<u8> {
+    pub(crate) fn to_f32_blob(&self) -> Vec<u8> {
         let vector = self.storage_vector();
         let mut blob = Vec::with_capacity(vector.len() * 4);
         for value in &vector {
@@ -46,7 +46,7 @@ impl Embedding {
         blob
     }
 
-    pub fn to_vector_literal(&self) -> String {
+    pub(crate) fn to_vector_literal(&self) -> String {
         format!(
             "[{}]",
             self.storage_vector()
@@ -73,7 +73,7 @@ pub(crate) enum SelectedEmbeddingProvider {
 }
 
 impl SelectedEmbeddingProvider {
-    pub fn from_env() -> Result<Self, String> {
+    pub(crate) fn from_env() -> Result<Self, String> {
         EmbeddingProviderConfig::from_env()?.provider()
     }
 }
@@ -131,7 +131,7 @@ pub(crate) enum EmbeddingProviderConfig {
 }
 
 impl EmbeddingProviderConfig {
-    pub fn from_env() -> Result<Self, String> {
+    pub(crate) fn from_env() -> Result<Self, String> {
         Self::from_lookup(|key| env::var(key).ok())
     }
 
@@ -256,7 +256,7 @@ pub(crate) struct DeterministicEmbeddingProvider {
 }
 
 impl DeterministicEmbeddingProvider {
-    pub fn new(dimensions: usize) -> Result<Self, String> {
+    pub(crate) fn new(dimensions: usize) -> Result<Self, String> {
         if dimensions == 0 {
             return Err("embedding dimensions must be greater than zero".to_string());
         }
