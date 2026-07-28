@@ -5,7 +5,7 @@
 </p>
 
 [![CI](https://github.com/arcbjorn/hugr/actions/workflows/ci.yml/badge.svg)](https://github.com/arcbjorn/hugr/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 
 **Hugr is a project memory and intelligence system for coding agents**, built on a local semantic code graph and a temporal, provenance-tracked memory store. It gives an agent a durable, structured understanding of a codebase — what the code does, what changed, what was learned, what failed before, and which decisions still matter — and compiles that understanding into concise, citation-grounded context for the task at hand.
 
@@ -204,4 +204,7 @@ Hugr draws inspiration from [Cognee](https://github.com/topoteretes/cognee), [Tr
 
 ## License
 
-[MIT](LICENSE)
+[GNU AGPL-3.0](LICENSE). Hugr is free to use, modify, and self-host. If you
+run a modified version as a network service, section 13 requires you to offer
+that version's source to its users. Copyright is held by a single author, so a
+commercial license without the copyleft terms is available on request.
