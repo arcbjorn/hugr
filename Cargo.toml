@@ -18,6 +18,9 @@ unsafe_code = "forbid"
 # surface. Keeping this on means the real public API stays legible.
 unreachable_pub = "warn"
 missing_debug_implementations = "warn"
+# The public surface is `run`, `Error`, and `Result`; keeping it documented
+# is cheap and the lint stops that from silently drifting.
+missing_docs = "warn"
 
 [lints.clippy]
 # A handful of internal helpers (reference rewriting, risk scoring, sync run
