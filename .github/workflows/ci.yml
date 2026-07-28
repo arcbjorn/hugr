@@ -30,6 +30,30 @@ jobs:
       - name: Run live Hugr API contract smoke
         run: cargo test --test hugr_api_live -- --ignored --nocapture
 
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # The slim build is linted separately so the non-default feature
+      # combination cannot rot behind the default one.
+      - name: Lint without local embeddings
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      - name: Lint with default features
+        run: cargo clippy --all-targets -- -D warnings
+
   context-eval:
     name: Context eval baseline
     runs-on: ubuntu-latest
