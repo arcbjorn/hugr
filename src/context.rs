@@ -2915,7 +2915,10 @@ fn change_label(file: &ContextChangedFile) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextPack, context_query_terms, count_signature_parameters, json_string, symbol_evidence,
+        Citation, ContextBranchState, ContextBudget, ContextBudgetTruncation, ContextChangedFile,
+        ContextDiagnostic, ContextFile, ContextGraphNeighbor, ContextMemory, ContextPack,
+        ContextRiskSignal, ContextSessionFact, ContextStaleMemoryRisk, ContextSymbol, ContextTest,
+        context_query_terms, count_signature_parameters, json_string, symbol_evidence,
     };
     use crate::code::CodeSymbol;
     use crate::discovery::{FileCandidate, source_embedding_score};
@@ -3909,4 +3912,178 @@ pub fn small(input: i32) -> i32 {
         assert!(json.contains("\"citation_id\":\"stale:mem_old:mem_new\""));
         assert!(markdown.contains("stale:mem_old:mem_new [stale_memory]"));
     }
+
+    /// A pack with every field populated, both `Some` and `None` variants of
+    /// each option, and text that needs escaping. Used to pin the exact JSON
+    /// the pack renders, since agents and the MCP server parse that output.
+    fn fully_populated_pack() -> ContextPack {
+        let memory = |id: &str, payload: Option<&str>| ContextMemory {
+            id: id.to_string(),
+            created_at_ms: 42,
+            kind: "fact".to_string(),
+            text: "quote \" backslash \\ newline \n tab \t unicode ✓".to_string(),
+            structured_payload: payload.map(str::to_string),
+            citation_id: "mem_1".to_string(),
+            evidence_score: 7,
+            evidence_reason: "term overlap".to_string(),
+        };
+
+        ContextPack {
+            task: "add \"lifecycle\" hooks\nto plugins".to_string(),
+            budget: ContextBudget {
+                max_tokens: 4000,
+                estimated_tokens: 1234,
+                truncated_sections: vec![ContextBudgetTruncation {
+                    section: "relevant_files".to_string(),
+                    removed_items: 3,
+                }],
+            },
+            relevant_files: vec![ContextFile {
+                path: "src/plugin_hooks.rs".to_string(),
+                citation_id: "file_1".to_string(),
+                evidence_score: 12,
+                evidence_reason: "path match".to_string(),
+            }],
+            important_symbols: vec![
+                ContextSymbol {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    language: Some("rust".to_string()),
+                    name: "run_after_config".to_string(),
+                    kind: "function".to_string(),
+                    line_start: 12,
+                    line_end: Some(40),
+                    signature: "pub fn run_after_config()".to_string(),
+                    citation_id: "sym_1".to_string(),
+                    evidence_score: 9,
+                    evidence_reason: "name match".to_string(),
+                },
+                ContextSymbol {
+                    path: "src/other.rs".to_string(),
+                    language: None,
+                    name: "helper".to_string(),
+                    kind: "function".to_string(),
+                    line_start: 1,
+                    line_end: None,
+                    signature: String::new(),
+                    citation_id: "sym_2".to_string(),
+                    evidence_score: 1,
+                    evidence_reason: String::new(),
+                },
+            ],
+            graph_neighbors: vec![
+                ContextGraphNeighbor {
+                    kind: "incoming_reference".to_string(),
+                    label: "src/main.rs:8 references run_after_config".to_string(),
+                    detail: "call reference".to_string(),
+                    path: Some("src/main.rs".to_string()),
+                    target_path: Some("src/plugin_hooks.rs".to_string()),
+                    target_name: Some("run_after_config".to_string()),
+                    line_start: Some(8),
+                    site_count: 2,
+                    citation_id: "graph_1".to_string(),
+                    evidence_score: 5,
+                    evidence_reason: "inbound edge".to_string(),
+                },
+                ContextGraphNeighbor {
+                    kind: "outgoing_reference".to_string(),
+                    label: "unresolved".to_string(),
+                    detail: String::new(),
+                    path: None,
+                    target_path: None,
+                    target_name: None,
+                    line_start: None,
+                    site_count: 0,
+                    citation_id: "graph_2".to_string(),
+                    evidence_score: 0,
+                    evidence_reason: String::new(),
+                },
+            ],
+            affected_tests: vec![ContextTest {
+                path: "tests/plugin_hooks.rs".to_string(),
+                reason: "matching test filename".to_string(),
+                citation_id: "test_1".to_string(),
+                evidence_score: 4,
+                evidence_reason: "test mapping".to_string(),
+            }],
+            relevant_memories: vec![
+                memory("mem_structured", Some(r#"{"source":{"type":"session"}}"#)),
+                memory("mem_plain", None),
+                memory("mem_unparseable", Some("not json at all")),
+            ],
+            stale_memory_risks: vec![ContextStaleMemoryRisk {
+                reason: "contradicted".to_string(),
+                signal: "before/after".to_string(),
+                shared_terms: vec!["plugin".to_string(), "hooks".to_string()],
+                newer_memory: memory("mem_new", None),
+                older_memory: memory("mem_old", None),
+                citation_id: "risk_1".to_string(),
+                evidence_score: 6,
+                evidence_reason: "shared terms".to_string(),
+            }],
+            diagnostics: vec![ContextDiagnostic {
+                id: "diag_1".to_string(),
+                source: "command_stderr".to_string(),
+                path: Some("src/plugin_hooks.rs".to_string()),
+                line_start: Some(12),
+                line_end: None,
+                severity: "error".to_string(),
+                code: Some("E0425".to_string()),
+                message: "cannot find value hook".to_string(),
+                command: Some("cargo test".to_string()),
+                created_at_ms: 99,
+                citation_id: "diag_1".to_string(),
+                evidence_score: 8,
+                evidence_reason: "recent failure".to_string(),
+            }],
+            risk_signals: vec![ContextRiskSignal {
+                severity: "medium".to_string(),
+                kind: "missing_tests".to_string(),
+                summary: "no test covers this path".to_string(),
+                citation_id: "risk:missing_tests".to_string(),
+                evidence_score: 3,
+                evidence_reason: "coverage gap".to_string(),
+            }],
+            recent_sessions: vec![ContextSessionFact {
+                session_id: "sess_1".to_string(),
+                kind: "command".to_string(),
+                detail: "cargo test".to_string(),
+                created_at_ms: 7,
+                citation_id: "sess_1".to_string(),
+                evidence_score: 2,
+                evidence_reason: "recent session".to_string(),
+            }],
+            branch_state: Some(ContextBranchState {
+                root_path: Some("/repo".to_string()),
+                branch: Some("main".to_string()),
+                upstream: None,
+                ahead: 2,
+                behind: 0,
+                changed_files: vec![ContextChangedFile {
+                    path: "src/plugin_hooks.rs".to_string(),
+                    original_path: None,
+                    staged_status: Some("M".to_string()),
+                    unstaged_status: None,
+                }],
+            }),
+            suggested_path: vec!["read src/plugin_hooks.rs".to_string()],
+            citations: vec![Citation {
+                id: "file_1".to_string(),
+                source_type: "file".to_string(),
+                label: "src/plugin_hooks.rs".to_string(),
+            }],
+        }
+    }
+
+    /// Pins the exact bytes the pack renders. Agents and the MCP server parse
+    /// this output, so a field rename, a reordering, or a change in how a
+    /// value is escaped is a breaking change and should fail loudly here.
+    #[test]
+    fn renders_a_stable_json_snapshot() {
+        let rendered = fully_populated_pack().render_json();
+
+        assert_eq!(rendered, SNAPSHOT);
+        serde_json::from_str::<serde_json::Value>(&rendered).expect("snapshot must be valid JSON");
+    }
+
+    const SNAPSHOT: &str = r#"{"task":"add \"lifecycle\" hooks\nto plugins","budget":{"max_tokens":4000,"estimated_tokens":1234,"truncated_sections":[{"section":"relevant_files","removed_items":3}]},"relevant_files":[{"path":"src/plugin_hooks.rs","citation_id":"file_1","evidence_score":12,"evidence_reason":"path match"}],"important_symbols":[{"path":"src/plugin_hooks.rs","language":"rust","name":"run_after_config","kind":"function","line_start":12,"line_end":40,"signature":"pub fn run_after_config()","citation_id":"sym_1","evidence_score":9,"evidence_reason":"name match"},{"path":"src/other.rs","language":null,"name":"helper","kind":"function","line_start":1,"line_end":null,"signature":"","citation_id":"sym_2","evidence_score":1,"evidence_reason":""}],"graph_neighbors":[{"kind":"incoming_reference","label":"src/main.rs:8 references run_after_config","detail":"call reference","path":"src/main.rs","target_path":"src/plugin_hooks.rs","target_name":"run_after_config","line_start":8,"site_count":2,"citation_id":"graph_1","evidence_score":5,"evidence_reason":"inbound edge"},{"kind":"outgoing_reference","label":"unresolved","detail":"","path":null,"target_path":null,"target_name":null,"line_start":null,"site_count":0,"citation_id":"graph_2","evidence_score":0,"evidence_reason":""}],"affected_tests":[{"path":"tests/plugin_hooks.rs","reason":"matching test filename","citation_id":"test_1","evidence_score":4,"evidence_reason":"test mapping"}],"relevant_memories":[{"id":"mem_structured","created_at_ms":42,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":{"source":{"type":"session"}},"citation_id":"mem_1","evidence_score":7,"evidence_reason":"term overlap"},{"id":"mem_plain","created_at_ms":42,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":null,"citation_id":"mem_1","evidence_score":7,"evidence_reason":"term overlap"},{"id":"mem_unparseable","created_at_ms":42,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":"not json at all","citation_id":"mem_1","evidence_score":7,"evidence_reason":"term overlap"}],"stale_memory_risks":[{"reason":"contradicted","signal":"before/after","shared_terms":["plugin","hooks"],"newer_memory":{"id":"mem_new","created_at_ms":42,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":null,"citation_id":"mem_1","evidence_score":7,"evidence_reason":"term overlap"},"older_memory":{"id":"mem_old","created_at_ms":42,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":null,"citation_id":"mem_1","evidence_score":7,"evidence_reason":"term overlap"},"citation_id":"risk_1","evidence_score":6,"evidence_reason":"shared terms"}],"diagnostics":[{"id":"diag_1","source":"command_stderr","path":"src/plugin_hooks.rs","line_start":12,"line_end":null,"severity":"error","code":"E0425","message":"cannot find value hook","command":"cargo test","created_at_ms":99,"citation_id":"diag_1","evidence_score":8,"evidence_reason":"recent failure"}],"risk_signals":[{"severity":"medium","kind":"missing_tests","summary":"no test covers this path","citation_id":"risk:missing_tests","evidence_score":3,"evidence_reason":"coverage gap"}],"recent_sessions":[{"session_id":"sess_1","kind":"command","detail":"cargo test","created_at_ms":7,"citation_id":"sess_1","evidence_score":2,"evidence_reason":"recent session"}],"branch_state":{"root_path":"/repo","branch":"main","upstream":null,"ahead":2,"behind":0,"changed_files":[{"path":"src/plugin_hooks.rs","original_path":null,"staged_status":"M","unstaged_status":null}]},"suggested_path":["read src/plugin_hooks.rs"],"citations":[{"id":"file_1","source_type":"file","label":"src/plugin_hooks.rs"}]}"#;
 }
