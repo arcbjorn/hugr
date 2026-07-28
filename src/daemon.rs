@@ -1,4 +1,3 @@
-use crate::context::json_string;
 use crate::error::{Error, Result};
 use crate::indexer;
 use crate::store::{
@@ -7,6 +6,7 @@ use crate::store::{
 };
 use crate::worktree;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::env;
@@ -1183,28 +1183,53 @@ fn render_error_json(message: &str) -> String {
     .to_string()
 }
 
+/// The `/status` payload. A struct rather than `json!` because
+/// `serde_json::Map` sorts its keys and this response has a deliberate
+/// order, and because the fields come from several sources rather than one
+/// value that could be serialised directly.
+#[derive(Serialize)]
+struct StatusJson {
+    status: &'static str,
+    service: &'static str,
+    peer_addr: String,
+    current_dir: String,
+    store_exists: bool,
+    store_root: String,
+    storage: String,
+    watcher_enabled: bool,
+    indexing: bool,
+    last_index_status: String,
+    memory_job_running: bool,
+    last_memory_job_status: String,
+    session_observation_running: bool,
+    last_session_observation_status: String,
+    session_promotion_running: bool,
+    last_session_promotion_status: String,
+}
+
 fn render_status_json(peer_addr: SocketAddr, state: &DaemonState) -> String {
     let store = Store::open_current();
     let current_dir = std::env::current_dir()
         .map_or_else(|_| "unknown".to_string(), |path| path.display().to_string());
 
-    format!(
-        "{{\"status\":\"running\",\"service\":\"hugr-daemon\",\"peer_addr\":{},\"current_dir\":{},\"store_exists\":{},\"store_root\":{},\"storage\":{},\"watcher_enabled\":{},\"indexing\":{},\"last_index_status\":{},\"memory_job_running\":{},\"last_memory_job_status\":{},\"session_observation_running\":{},\"last_session_observation_status\":{},\"session_promotion_running\":{},\"last_session_promotion_status\":{}}}",
-        json_string(&peer_addr.to_string()),
-        json_string(&current_dir),
-        store.exists(),
-        json_string(&store.root().display().to_string()),
-        json_string(&store.storage_summary()),
-        state.watcher_enabled.load(Ordering::SeqCst),
-        state.indexing.load(Ordering::SeqCst),
-        json_string(&state.last_index_status()),
-        state.memory_job_running.load(Ordering::SeqCst),
-        json_string(&state.last_memory_job_status()),
-        state.session_observation_running.load(Ordering::SeqCst),
-        json_string(&state.last_session_observation_status()),
-        state.session_promotion_running.load(Ordering::SeqCst),
-        json_string(&state.last_session_promotion_status())
-    )
+    crate::json::render(&StatusJson {
+        status: "running",
+        service: "hugr-daemon",
+        peer_addr: peer_addr.to_string(),
+        current_dir,
+        store_exists: store.exists(),
+        store_root: store.root().display().to_string(),
+        storage: store.storage_summary(),
+        watcher_enabled: state.watcher_enabled.load(Ordering::SeqCst),
+        indexing: state.indexing.load(Ordering::SeqCst),
+        last_index_status: state.last_index_status(),
+        memory_job_running: state.memory_job_running.load(Ordering::SeqCst),
+        last_memory_job_status: state.last_memory_job_status(),
+        session_observation_running: state.session_observation_running.load(Ordering::SeqCst),
+        last_session_observation_status: state.last_session_observation_status(),
+        session_promotion_running: state.session_promotion_running.load(Ordering::SeqCst),
+        last_session_promotion_status: state.last_session_promotion_status(),
+    })
 }
 
 fn http_response(status_code: u16, content_type: &str, body: &str) -> String {
