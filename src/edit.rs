@@ -1,6 +1,6 @@
 use crate::code::{self, CodeReference, CodeSymbol};
-use crate::context::json_string;
 use crate::error::{Error, Result};
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::fs;
@@ -43,7 +43,7 @@ pub(crate) struct PlannedMoveFile {
     pub contents: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SymbolReplacement {
     pub path: String,
     pub language: Option<String>,
@@ -55,7 +55,7 @@ pub(crate) struct SymbolReplacement {
     pub new_line_end: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SymbolRename {
     pub target_path: String,
     pub language: Option<String>,
@@ -68,13 +68,13 @@ pub(crate) struct SymbolRename {
     pub changed_files: Vec<SymbolRenameFile>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SymbolRenameFile {
     pub path: String,
     pub replacement_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SymbolMove {
     pub source_path: String,
     pub destination_path: String,
@@ -88,7 +88,7 @@ pub(crate) struct SymbolMove {
     pub changed_files: Vec<SymbolMoveFile>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SymbolMoveFile {
     pub path: String,
     pub action: String,
@@ -4442,22 +4442,10 @@ impl SymbolReplacement {
         rendered
     }
 
+    /// Renders the summary as compact JSON; field order follows the struct
+    /// declaration, which the snapshot test pins.
     pub(crate) fn render_json(&self) -> String {
-        format!(
-            "{{\"path\":{},\"language\":{},\"name\":{},\"kind\":{},\
-             \"old_line_start\":{},\"old_line_end\":{},\
-             \"new_line_start\":{},\"new_line_end\":{}}}",
-            json_string(&self.path),
-            self.language
-                .as_deref()
-                .map_or_else(|| "null".to_string(), json_string),
-            json_string(&self.name),
-            json_string(&self.kind),
-            self.old_line_start,
-            self.old_line_end,
-            self.new_line_start,
-            self.new_line_end
-        )
+        crate::json::render(self)
     }
 }
 
@@ -4496,35 +4484,10 @@ impl SymbolRename {
         rendered
     }
 
+    /// Renders the summary as compact JSON; field order follows the struct
+    /// declaration, which the snapshot test pins.
     pub(crate) fn render_json(&self) -> String {
-        let changed_files = self
-            .changed_files
-            .iter()
-            .map(|file| {
-                format!(
-                    "{{\"path\":{},\"replacement_count\":{}}}",
-                    json_string(&file.path),
-                    file.replacement_count
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            "{{\"target_path\":{},\"language\":{},\"old_name\":{},\"new_name\":{},\
-             \"kind\":{},\"line_start\":{},\"line_end\":{},\"reference_count\":{},\
-             \"changed_files\":[{}]}}",
-            json_string(&self.target_path),
-            self.language
-                .as_deref()
-                .map_or_else(|| "null".to_string(), json_string),
-            json_string(&self.old_name),
-            json_string(&self.new_name),
-            json_string(&self.kind),
-            self.line_start,
-            self.line_end,
-            self.reference_count,
-            changed_files
-        )
+        crate::json::render(self)
     }
 }
 
@@ -4556,43 +4519,19 @@ impl SymbolMove {
         rendered
     }
 
+    /// Renders the summary as compact JSON; field order follows the struct
+    /// declaration, which the snapshot test pins.
     pub(crate) fn render_json(&self) -> String {
-        let changed_files = self
-            .changed_files
-            .iter()
-            .map(|file| {
-                format!(
-                    "{{\"path\":{},\"action\":{}}}",
-                    json_string(&file.path),
-                    json_string(&file.action)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            "{{\"source_path\":{},\"destination_path\":{},\"language\":{},\"name\":{},\
-             \"kind\":{},\"old_line_start\":{},\"old_line_end\":{},\
-             \"moved_line_count\":{},\"rewritten_reference_count\":{},\
-             \"changed_files\":[{}]}}",
-            json_string(&self.source_path),
-            json_string(&self.destination_path),
-            self.language
-                .as_deref()
-                .map_or_else(|| "null".to_string(), json_string),
-            json_string(&self.name),
-            json_string(&self.kind),
-            self.old_line_start,
-            self.old_line_end,
-            self.moved_line_count,
-            self.rewritten_reference_count,
-            changed_files
-        )
+        crate::json::render(self)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{plan_move, plan_rename, plan_replacement, resolve_symbol_in_source};
+    use super::{
+        SymbolMove, SymbolMoveFile, SymbolRename, SymbolRenameFile, SymbolReplacement, plan_move,
+        plan_rename, plan_replacement, resolve_symbol_in_source,
+    };
     use crate::code::CodeReference;
 
     const RUST_SOURCE: &str =
@@ -6269,4 +6208,66 @@ mod tests {
         assert!(!caller_file.contents.contains("hooks::helper"));
         assert_eq!(planned.summary.rewritten_reference_count, 2);
     }
+
+    fn snapshot_replacement() -> SymbolReplacement {
+        SymbolReplacement {
+            path: "src/plugin_hooks.rs".to_string(),
+            language: Some("rust".to_string()),
+            name: "run_after_config".to_string(),
+            kind: "function".to_string(),
+            old_line_start: 12,
+            old_line_end: 20,
+            new_line_start: 12,
+            new_line_end: 24,
+        }
+    }
+
+    fn snapshot_rename() -> SymbolRename {
+        SymbolRename {
+            target_path: "src/plugin_hooks.rs".to_string(),
+            language: None,
+            old_name: "run_after_config".to_string(),
+            new_name: "run_\"before\"_config".to_string(),
+            kind: "function".to_string(),
+            line_start: 12,
+            line_end: 20,
+            reference_count: 3,
+            changed_files: vec![SymbolRenameFile {
+                path: "src/main.rs".to_string(),
+                replacement_count: 2,
+            }],
+        }
+    }
+
+    fn snapshot_move() -> SymbolMove {
+        SymbolMove {
+            source_path: "src/plugin_hooks.rs".to_string(),
+            destination_path: "src/hooks/mod.rs".to_string(),
+            language: Some("rust".to_string()),
+            name: "run_after_config".to_string(),
+            kind: "function".to_string(),
+            old_line_start: 12,
+            old_line_end: 20,
+            moved_line_count: 9,
+            rewritten_reference_count: 4,
+            changed_files: vec![SymbolMoveFile {
+                path: "src/main.rs".to_string(),
+                action: "rewrote_references".to_string(),
+            }],
+        }
+    }
+
+    /// Pins the `--json` bytes of the three structural-edit summaries.
+    #[test]
+    fn renders_stable_edit_summary_json() {
+        assert_eq!(snapshot_replacement().render_json(), REPLACEMENT_SNAPSHOT);
+        assert_eq!(snapshot_rename().render_json(), RENAME_SNAPSHOT);
+        assert_eq!(snapshot_move().render_json(), MOVE_SNAPSHOT);
+    }
+
+    const REPLACEMENT_SNAPSHOT: &str = r#"{"path":"src/plugin_hooks.rs","language":"rust","name":"run_after_config","kind":"function","old_line_start":12,"old_line_end":20,"new_line_start":12,"new_line_end":24}"#;
+
+    const RENAME_SNAPSHOT: &str = r#"{"target_path":"src/plugin_hooks.rs","language":null,"old_name":"run_after_config","new_name":"run_\"before\"_config","kind":"function","line_start":12,"line_end":20,"reference_count":3,"changed_files":[{"path":"src/main.rs","replacement_count":2}]}"#;
+
+    const MOVE_SNAPSHOT: &str = r#"{"source_path":"src/plugin_hooks.rs","destination_path":"src/hooks/mod.rs","language":"rust","name":"run_after_config","kind":"function","old_line_start":12,"old_line_end":20,"moved_line_count":9,"rewritten_reference_count":4,"changed_files":[{"path":"src/main.rs","action":"rewrote_references"}]}"#;
 }
