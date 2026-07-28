@@ -1544,9 +1544,7 @@ fn declaration_line_set(targets: &[CodeSymbol]) -> HashSet<(&str, &str, &str, i6
         .collect()
 }
 
-fn index_targets_by_name<'targets>(
-    targets: &'targets [CodeSymbol],
-) -> (HashMap<&'targets str, Vec<usize>>, Vec<usize>) {
+fn index_targets_by_name(targets: &[CodeSymbol]) -> (HashMap<&str, Vec<usize>>, Vec<usize>) {
     let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
     let mut irregular = Vec::new();
 
