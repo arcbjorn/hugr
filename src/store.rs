@@ -1761,10 +1761,10 @@ impl Store {
         }
 
         let synthesis = apply_session_synthesizer(synthesizer, &session.task, &facts);
-        let memory_text = synthesis
-            .as_ref()
-            .map(|synthesis| synthesis.text.clone())
-            .unwrap_or_else(|| session_promotion_text(&session, &facts));
+        let memory_text = synthesis.as_ref().map_or_else(
+            || session_promotion_text(&session, &facts),
+            |synthesis| synthesis.text.clone(),
+        );
         let project = project_from_conn(conn).await?;
         let structured_payload =
             session_promotion_payload(&session, &facts, project.as_ref(), synthesis.as_ref());
@@ -2485,40 +2485,39 @@ impl Store {
                     .sync_api_table_payloads(&local_conn, &tables, true)
                     .await?;
                 return execute_hugr_api_push(&config, false, &payloads);
-            } else {
-                self.ensure_sync_push_execution_allowed(&config)?;
-                let started_at_ms = now_ms()?;
-                let remote_url = config
-                    .remote_url
-                    .as_ref()
-                    .ok_or_else(|| "remote database URL is not configured".to_string())?;
-                let remote_auth_token = config
-                    .remote_auth_token
-                    .as_ref()
-                    .ok_or_else(|| "remote auth token is not configured".to_string())?;
-                let remote_db = Builder::new_remote(remote_url.clone(), remote_auth_token.clone())
-                    .build()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let remote_conn = remote_db.connect().map_err(|error| error.to_string())?;
-                migrations::migrate(&remote_conn).await?;
-                tables = self
-                    .copy_sync_tables(&local_conn, &remote_conn, &config)
-                    .await?;
-                let ended_at_ms = now_ms()?;
-                run_id = Some(
-                    self.record_sync_run(
-                        &local_conn,
-                        "push",
-                        config.backend.as_str(),
-                        "executed",
-                        started_at_ms,
-                        ended_at_ms,
-                        &tables,
-                    )
-                    .await?,
-                );
             }
+            self.ensure_sync_push_execution_allowed(&config)?;
+            let started_at_ms = now_ms()?;
+            let remote_url = config
+                .remote_url
+                .as_ref()
+                .ok_or_else(|| "remote database URL is not configured".to_string())?;
+            let remote_auth_token = config
+                .remote_auth_token
+                .as_ref()
+                .ok_or_else(|| "remote auth token is not configured".to_string())?;
+            let remote_db = Builder::new_remote(remote_url.clone(), remote_auth_token.clone())
+                .build()
+                .await
+                .map_err(|error| error.to_string())?;
+            let remote_conn = remote_db.connect().map_err(|error| error.to_string())?;
+            migrations::migrate(&remote_conn).await?;
+            tables = self
+                .copy_sync_tables(&local_conn, &remote_conn, &config)
+                .await?;
+            let ended_at_ms = now_ms()?;
+            run_id = Some(
+                self.record_sync_run(
+                    &local_conn,
+                    "push",
+                    config.backend.as_str(),
+                    "executed",
+                    started_at_ms,
+                    ended_at_ms,
+                    &tables,
+                )
+                .await?,
+            );
         }
 
         Ok(SyncPushResult {
@@ -2552,40 +2551,39 @@ impl Store {
                     .sync_api_table_payloads(&local_conn, &tables, false)
                     .await?;
                 return execute_hugr_api_pull(&config, false, &payloads, Some(&local_conn)).await;
-            } else {
-                self.ensure_sync_execute_allowed(&config, "pull")?;
-                let started_at_ms = now_ms()?;
-                let remote_url = config
-                    .remote_url
-                    .as_ref()
-                    .ok_or_else(|| "remote database URL is not configured".to_string())?;
-                let remote_auth_token = config
-                    .remote_auth_token
-                    .as_ref()
-                    .ok_or_else(|| "remote auth token is not configured".to_string())?;
-                let remote_db = Builder::new_remote(remote_url.clone(), remote_auth_token.clone())
-                    .build()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let remote_conn = remote_db.connect().map_err(|error| error.to_string())?;
-                migrations::migrate(&remote_conn).await?;
-                tables = self
-                    .copy_pull_tables(&remote_conn, &local_conn, &config)
-                    .await?;
-                let ended_at_ms = now_ms()?;
-                run_id = Some(
-                    self.record_sync_run(
-                        &local_conn,
-                        "pull",
-                        config.backend.as_str(),
-                        "executed",
-                        started_at_ms,
-                        ended_at_ms,
-                        &tables,
-                    )
-                    .await?,
-                );
             }
+            self.ensure_sync_execute_allowed(&config, "pull")?;
+            let started_at_ms = now_ms()?;
+            let remote_url = config
+                .remote_url
+                .as_ref()
+                .ok_or_else(|| "remote database URL is not configured".to_string())?;
+            let remote_auth_token = config
+                .remote_auth_token
+                .as_ref()
+                .ok_or_else(|| "remote auth token is not configured".to_string())?;
+            let remote_db = Builder::new_remote(remote_url.clone(), remote_auth_token.clone())
+                .build()
+                .await
+                .map_err(|error| error.to_string())?;
+            let remote_conn = remote_db.connect().map_err(|error| error.to_string())?;
+            migrations::migrate(&remote_conn).await?;
+            tables = self
+                .copy_pull_tables(&remote_conn, &local_conn, &config)
+                .await?;
+            let ended_at_ms = now_ms()?;
+            run_id = Some(
+                self.record_sync_run(
+                    &local_conn,
+                    "pull",
+                    config.backend.as_str(),
+                    "executed",
+                    started_at_ms,
+                    ended_at_ms,
+                    &tables,
+                )
+                .await?,
+            );
         }
 
         Ok(SyncPullResult {
@@ -2643,11 +2641,13 @@ impl Store {
     fn embedding_provider(&self) -> Result<&SelectedEmbeddingProvider, String> {
         self.embedding_provider
             .as_ref()
-            .map_err(|error| error.clone())
+            .map_err(std::clone::Clone::clone)
     }
 
     fn storage_config(&self) -> Result<&StorageConfig, String> {
-        self.storage_config.as_ref().map_err(|error| error.clone())
+        self.storage_config
+            .as_ref()
+            .map_err(std::clone::Clone::clone)
     }
 
     /// True when this store routes all operations through a hosted Hugr API
@@ -2804,7 +2804,7 @@ impl Store {
                     i64::try_from(table.updated_count).map_err(|error| error.to_string())?,
                     i64::try_from(table.skipped_count).map_err(|error| error.to_string())?,
                     i64::try_from(table.conflict_count).map_err(|error| error.to_string())?,
-                    if table.executed { 1_i64 } else { 0_i64 }
+                    i64::from(table.executed)
                 ],
             )
             .await
@@ -2876,9 +2876,8 @@ impl SyncTableKind {
         match self {
             Self::Projects => "project_metadata",
             Self::Memories => "memories",
-            Self::MemoryEmbeddings => "embeddings",
             Self::Sources | Self::DiscoveredFiles | Self::TestMappings => "sources",
-            Self::SourceEmbeddings => "embeddings",
+            Self::MemoryEmbeddings | Self::SourceEmbeddings => "embeddings",
             Self::Entities | Self::CodeSymbols => "entities",
             Self::Edges | Self::CodeReferences => "edges",
             Self::Sessions => "session_summaries",
@@ -2914,13 +2913,13 @@ fn sync_tables_for_config(config: &StorageConfig) -> Vec<SyncTableKind> {
                 push_sync_table(&mut tables, &mut seen, SyncTableKind::SourceEmbeddings);
             }
             SyncClass::SessionSummaries => {
-                push_sync_table(&mut tables, &mut seen, SyncTableKind::Sessions)
+                push_sync_table(&mut tables, &mut seen, SyncTableKind::Sessions);
             }
             SyncClass::ContextPacks => {
-                push_sync_table(&mut tables, &mut seen, SyncTableKind::ContextPacks)
+                push_sync_table(&mut tables, &mut seen, SyncTableKind::ContextPacks);
             }
             SyncClass::Diagnostics => {
-                push_sync_table(&mut tables, &mut seen, SyncTableKind::Diagnostics)
+                push_sync_table(&mut tables, &mut seen, SyncTableKind::Diagnostics);
             }
             SyncClass::FullSource
             | SyncClass::RawCommandOutput
@@ -3065,9 +3064,10 @@ fn hugr_api_session_promotion_payloads(
         id: format!("mem_{now}"),
         created_at_ms: now,
         kind: "fact".to_string(),
-        text: synthesis
-            .map(|synthesis| synthesis.text.clone())
-            .unwrap_or_else(|| session_promotion_text(session, facts)),
+        text: synthesis.map_or_else(
+            || session_promotion_text(session, facts),
+            |synthesis| synthesis.text.clone(),
+        ),
         structured_payload: structured_payload.clone(),
     };
     let memory_record = MemorySyncRecord {
@@ -3866,7 +3866,7 @@ fn append_record_graph_neighbors(
                 || matched_entity_ids.contains(&edge.to_id);
             let searchable = format!("{} {} {} {}", edge.id, edge.from_id, edge.kind, edge.to_id);
             let score =
-                graph_text_match_score(&searchable, &selector_terms) + if adjacent { 1 } else { 0 };
+                graph_text_match_score(&searchable, &selector_terms) + usize::from(adjacent);
             (score > 0).then_some((score, edge))
         })
         .collect::<Vec<_>>();
@@ -4340,11 +4340,7 @@ fn storage_latest_context_pack_updated_at_ms(
         .map(|value| context_pack_sync_record_from_value(&value).map(|record| record.updated_at_ms))
         .try_fold(None, |latest, updated_at_ms| {
             updated_at_ms.map(|updated_at_ms| {
-                Some(
-                    latest
-                        .map(|latest: i64| latest.max(updated_at_ms))
-                        .unwrap_or(updated_at_ms),
-                )
+                Some(latest.map_or(updated_at_ms, |latest: i64| latest.max(updated_at_ms)))
             })
         })
 }
@@ -10504,7 +10500,7 @@ impl StorageConfig {
             api_routes: if self.backend == SyncBackend::HugrApi {
                 HUGR_API_ROUTES
                     .iter()
-                    .map(|route| route.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect()
             } else {
                 Vec::new()
@@ -11525,11 +11521,8 @@ impl RankedMemory {
 
     fn ranking_score(&self) -> f64 {
         let text_score = self.term_score as f64 * 10.0;
-        let fts_score = self
-            .fts_rank
-            .map(|rank| 1.0 / (1.0 + rank.abs()))
-            .unwrap_or(0.0);
-        let vector_score = self.vector_rank.map(vector_rank_score).unwrap_or(0.0);
+        let fts_score = self.fts_rank.map_or(0.0, |rank| 1.0 / (1.0 + rank.abs()));
+        let vector_score = self.vector_rank.map_or(0.0, vector_rank_score);
 
         text_score + fts_score + vector_score
     }
@@ -11580,7 +11573,7 @@ fn query_terms(query: &str) -> Vec<String> {
     query
         .split(|char: char| !char.is_alphanumeric() && char != '_' && char != '-')
         .filter(|term| term.len() > 2)
-        .map(|term| term.to_lowercase())
+        .map(str::to_lowercase)
         .collect()
 }
 
@@ -12144,10 +12137,10 @@ fn source_embedding_summary(input: &SourceEmbeddingInput, symbols: &[CodeSymbol]
 }
 
 fn source_embedding_content_key(value: &str) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in value.as_bytes() {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{hash:016x}")
 }
@@ -12500,7 +12493,7 @@ mod tests {
             config.sync_execution_plan().api_routes,
             HUGR_API_ROUTES
                 .iter()
-                .map(|route| route.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
         );
     }
@@ -15267,7 +15260,7 @@ mod tests {
                 id.to_string(),
                 kind.to_string(),
                 name.to_string(),
-                locator.map(|value| value.to_string()),
+                locator.map(std::string::ToString::to_string),
                 created_at_ms
             ],
         )

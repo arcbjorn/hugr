@@ -201,8 +201,10 @@ fn hugr_executable() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|path| path.canonicalize().ok())
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "hugr".to_string())
+        .map_or_else(
+            || "hugr".to_string(),
+            |path| path.to_string_lossy().into_owned(),
+        )
 }
 
 fn shell_quoted(value: &str) -> String {

@@ -345,7 +345,7 @@ fn query_terms(query: &str) -> Vec<String> {
     query
         .split(|char: char| !char.is_alphanumeric() && char != '_' && char != '-')
         .filter(|term| term.len() > 2)
-        .map(|term| term.to_lowercase())
+        .map(str::to_lowercase)
         .collect()
 }
 
@@ -362,19 +362,15 @@ pub(crate) fn language_for(path: &Path) -> Option<&'static str> {
         "toml" => Some("toml"),
         "md" => Some("markdown"),
         "json" => Some("json"),
-        "js" => Some("javascript"),
-        "jsx" => Some("javascript"),
-        "ts" => Some("typescript"),
-        "tsx" => Some("typescript"),
+        "js" | "jsx" => Some("javascript"),
+        "ts" | "tsx" => Some("typescript"),
         "py" => Some("python"),
         "go" => Some("go"),
         "swift" => Some("swift"),
         "java" => Some("java"),
         "kt" => Some("kotlin"),
-        "c" => Some("c"),
-        "h" => Some("c"),
-        "cpp" => Some("cpp"),
-        "hpp" => Some("cpp"),
+        "c" | "h" => Some("c"),
+        "cpp" | "hpp" => Some("cpp"),
         "html" => Some("html"),
         "css" => Some("css"),
         "sql" => Some("sql"),

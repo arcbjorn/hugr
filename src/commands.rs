@@ -253,7 +253,7 @@ async fn context(task: &str, format: OutputFormat, budget: Option<usize>) -> Res
 const MIN_CONTEXT_TOKEN_BUDGET: usize = 500;
 
 /// Budgets come from the explicit flag/tool argument first, then the
-/// HUGR_CONTEXT_TOKEN_BUDGET environment variable, then the default. Budgets
+/// `HUGR_CONTEXT_TOKEN_BUDGET` environment variable, then the default. Budgets
 /// below the minimum would trim every section and produce useless packs, so
 /// they are rejected rather than clamped silently.
 pub(crate) fn resolve_context_token_budget(
@@ -790,8 +790,7 @@ async fn run_observed_command(command: &[String]) -> Result<(), String> {
             output
                 .status
                 .code()
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "signal".to_string())
+                .map_or_else(|| "signal".to_string(), |code| code.to_string())
         ))
     }
 }
@@ -873,9 +872,7 @@ fn command_observation_detail(
     let mut detail = format!(
         "command: {}; status: {}",
         command.join(" "),
-        status_code
-            .map(|code| code.to_string())
-            .unwrap_or_else(|| "signal".to_string())
+        status_code.map_or_else(|| "signal".to_string(), |code| code.to_string())
     );
     if let Some(stdout_tail) = output_tail(stdout) {
         let _ = write!(detail, "; stdout_tail: {stdout_tail}");
@@ -1221,8 +1218,7 @@ fn render_memory_json(memory: &Memory) -> String {
 fn render_optional_json_payload(payload: Option<&str>) -> String {
     match payload {
         Some(payload) => serde_json::from_str::<serde_json::Value>(payload)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|_| json_string(payload)),
+            .map_or_else(|_| json_string(payload), |value| value.to_string()),
         None => "null".to_string(),
     }
 }
@@ -1293,13 +1289,11 @@ fn code_symbol_location(symbol: &CodeSymbol) -> String {
 }
 
 fn render_optional_json_string(value: Option<&str>) -> String {
-    value.map(json_string).unwrap_or_else(|| "null".to_string())
+    value.map_or_else(|| "null".to_string(), json_string)
 }
 
 fn render_optional_i64(value: Option<i64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "null".to_string())
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
 }
 
 fn render_session_promotion_text(result: &SessionPromotionResult) -> String {
@@ -1578,7 +1572,7 @@ fn render_sync_status_json(plan: &SyncExecutionPlan) -> String {
 }
 
 fn render_optional_string_json(value: Option<&str>) -> String {
-    value.map(json_string).unwrap_or_else(|| "null".to_string())
+    value.map_or_else(|| "null".to_string(), json_string)
 }
 
 fn render_string_array_json(values: &[String]) -> String {
@@ -1596,8 +1590,7 @@ fn render_string_array_json(values: &[String]) -> String {
 fn render_run_id_json(run_id: &Option<String>) -> String {
     run_id
         .as_ref()
-        .map(|id| json_string(id))
-        .unwrap_or_else(|| "null".to_string())
+        .map_or_else(|| "null".to_string(), |id| json_string(id))
 }
 
 fn render_sync_table_text(rendered: &mut String, table: &SyncTableResult, action: &str) {

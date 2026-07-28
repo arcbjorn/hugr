@@ -79,8 +79,9 @@ struct BranchHeader {
 fn parse_branch_header(header: &str) -> BranchHeader {
     let (names, counts) = header
         .split_once(" [")
-        .map(|(names, counts)| (names, counts.trim_end_matches(']')))
-        .unwrap_or((header, ""));
+        .map_or((header, ""), |(names, counts)| {
+            (names, counts.trim_end_matches(']'))
+        });
     let (branch, upstream) = names
         .split_once("...")
         .map(|(branch, upstream)| (branch, Some(upstream.to_string())))

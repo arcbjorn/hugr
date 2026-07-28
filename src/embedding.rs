@@ -4,7 +4,7 @@ use std::io::Write as _;
 use std::process::{Command as ProcessCommand, Stdio};
 
 pub(crate) const DEFAULT_EMBEDDING_DIMENSIONS: usize = 1536;
-/// Width of the F32_BLOB vector columns in the schema. Every stored blob and
+/// Width of the `F32_BLOB` vector columns in the schema. Every stored blob and
 /// query literal is normalized to this width so providers with other native
 /// dimensionalities still work against the fixed-width vector indexes.
 pub(crate) const STORAGE_EMBEDDING_DIMENSIONS: usize = 1536;
@@ -51,7 +51,7 @@ impl Embedding {
             "[{}]",
             self.storage_vector()
                 .iter()
-                .map(|value| value.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(",")
         )
@@ -559,15 +559,15 @@ fn parse_dimensions(value: &str) -> Result<usize, String> {
 fn embedding_terms(text: &str) -> Vec<String> {
     text.split(|char: char| !char.is_alphanumeric() && char != '_' && char != '-')
         .filter(|term| !term.is_empty())
-        .map(|term| term.to_lowercase())
+        .map(str::to_lowercase)
         .collect()
 }
 
 fn stable_hash(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325;
+    let mut hash = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
 }

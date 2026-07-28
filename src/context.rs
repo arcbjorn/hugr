@@ -1186,8 +1186,7 @@ fn render_context_memory_json(memory: &ContextMemory) -> String {
 fn render_optional_json_payload(payload: Option<&str>) -> String {
     match payload {
         Some(payload) => serde_json::from_str::<serde_json::Value>(payload)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|_| json_string(payload)),
+            .map_or_else(|_| json_string(payload), |value| value.to_string()),
         None => "null".to_string(),
     }
 }
@@ -1197,12 +1196,10 @@ fn file_evidence(candidate: &FileCandidate, terms: &[String]) -> (usize, String)
         .language
         .as_ref()
         .filter(|language| terms.iter().any(|term| term == &language.to_lowercase()))
-        .map(|_| 30)
-        .unwrap_or(0);
+        .map_or(0, |_| 30);
     let size_bonus = candidate
         .size_bytes
-        .map(|bytes| if bytes <= 128_000 { 10 } else { 0 })
-        .unwrap_or(0);
+        .map_or(0, |bytes| if bytes <= 128_000 { 10 } else { 0 });
     if let Some(rank) = discovery::source_embedding_rank(candidate.score) {
         let rank_bonus = 25usize.saturating_sub(rank.min(25)) * 8;
         return (
@@ -1256,13 +1253,12 @@ fn memory_evidence(
     terms: &[String],
     recall_rank: Option<(usize, usize)>,
 ) -> (usize, String) {
-    let rank_bonus = recall_rank
-        .map(|(index, total)| total.saturating_sub(index) * 20)
-        .unwrap_or(0);
+    let rank_bonus = recall_rank.map_or(0, |(index, total)| total.saturating_sub(index) * 20);
     let score = 700 + rank_bonus + text_match_score(&memory.text, terms);
-    let reason = recall_rank
-        .map(|(index, _)| format!("memory recall rank {}", index + 1))
-        .unwrap_or_else(|| "memory included as stale evidence".to_string());
+    let reason = recall_rank.map_or_else(
+        || "memory included as stale evidence".to_string(),
+        |(index, _)| format!("memory recall rank {}", index + 1),
+    );
     (score, reason)
 }
 
@@ -1332,7 +1328,7 @@ fn diagnostic_evidence(diagnostic: &Diagnostic, terms: &[String]) -> (usize, Str
         "warning" => 60,
         _ => 20,
     };
-    let location_bonus = diagnostic.path.as_ref().map(|_| 40).unwrap_or(0);
+    let location_bonus = diagnostic.path.as_ref().map_or(0, |_| 40);
     let score = 760 + severity_bonus + location_bonus + text_match_score(&searchable, terms);
     let reason = if diagnostic.path.is_some() {
         "structured diagnostic with source location".to_string()
@@ -2160,7 +2156,7 @@ fn max_symbol_body_nesting(language: Option<&str>, lines: &[String]) -> usize {
 fn max_python_indentation_nesting(lines: &[String]) -> usize {
     let significant = lines
         .iter()
-        .map(|line| line.as_str())
+        .map(std::string::String::as_str)
         .filter(|line| {
             let trimmed = line.trim();
             !trimmed.is_empty() && !trimmed.starts_with('#')
@@ -2429,7 +2425,7 @@ pub(crate) fn context_query_terms(query: &str) -> Vec<String> {
     query
         .split(|char: char| !char.is_alphanumeric() && char != '_' && char != '-')
         .filter(|term| term.len() > 2)
-        .map(|term| term.to_lowercase())
+        .map(str::to_lowercase)
         .collect()
 }
 
@@ -2721,8 +2717,7 @@ fn estimate_symbol_tokens(symbol: &ContextSymbol) -> usize {
         + symbol
             .language
             .as_ref()
-            .map(|language| estimate_tokens(language))
-            .unwrap_or(0)
+            .map_or(0, |language| estimate_tokens(language))
         + estimate_tokens(&symbol.name)
         + estimate_tokens(&symbol.kind)
         + estimate_tokens(&symbol.signature)
@@ -2737,18 +2732,15 @@ fn estimate_graph_neighbor_tokens(neighbor: &ContextGraphNeighbor) -> usize {
         + neighbor
             .path
             .as_ref()
-            .map(|path| estimate_tokens(path))
-            .unwrap_or(0)
+            .map_or(0, |path| estimate_tokens(path))
         + neighbor
             .target_path
             .as_ref()
-            .map(|path| estimate_tokens(path))
-            .unwrap_or(0)
+            .map_or(0, |path| estimate_tokens(path))
         + neighbor
             .target_name
             .as_ref()
-            .map(|name| estimate_tokens(name))
-            .unwrap_or(0)
+            .map_or(0, |name| estimate_tokens(name))
         + estimate_tokens(&neighbor.citation_id)
         + estimate_tokens(&neighbor.evidence_reason)
 }
@@ -2788,20 +2780,17 @@ fn estimate_diagnostic_tokens(diagnostic: &ContextDiagnostic) -> usize {
         + diagnostic
             .path
             .as_ref()
-            .map(|path| estimate_tokens(path))
-            .unwrap_or(0)
+            .map_or(0, |path| estimate_tokens(path))
         + estimate_tokens(&diagnostic.severity)
         + diagnostic
             .code
             .as_ref()
-            .map(|code| estimate_tokens(code))
-            .unwrap_or(0)
+            .map_or(0, |code| estimate_tokens(code))
         + estimate_tokens(&diagnostic.message)
         + diagnostic
             .command
             .as_ref()
-            .map(|command| estimate_tokens(command))
-            .unwrap_or(0)
+            .map_or(0, |command| estimate_tokens(command))
         + estimate_tokens(&diagnostic.citation_id)
         + estimate_tokens(&diagnostic.evidence_reason)
 }
@@ -2842,18 +2831,15 @@ fn estimate_branch_tokens(branch: &ContextBranchState) -> usize {
                     + file
                         .original_path
                         .as_ref()
-                        .map(|path| estimate_tokens(path))
-                        .unwrap_or(0)
+                        .map_or(0, |path| estimate_tokens(path))
                     + file
                         .staged_status
                         .as_ref()
-                        .map(|status| estimate_tokens(status))
-                        .unwrap_or(0)
+                        .map_or(0, |status| estimate_tokens(status))
                     + file
                         .unstaged_status
                         .as_ref()
-                        .map(|status| estimate_tokens(status))
-                        .unwrap_or(0)
+                        .map_or(0, |status| estimate_tokens(status))
             })
             .sum::<usize>()
 }
@@ -2887,13 +2873,11 @@ pub(crate) fn json_string(value: &str) -> String {
 }
 
 fn json_option_string(value: Option<&str>) -> String {
-    value.map(json_string).unwrap_or_else(|| "null".to_string())
+    value.map_or_else(|| "null".to_string(), json_string)
 }
 
 fn json_optional_i64(value: Option<i64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "null".to_string())
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
 }
 
 fn symbol_location(symbol: &ContextSymbol) -> String {

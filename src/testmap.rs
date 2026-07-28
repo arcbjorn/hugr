@@ -171,9 +171,7 @@ fn same_directory(left: &str, right: &str) -> bool {
 }
 
 fn directory(path: &str) -> &str {
-    path.rsplit_once('/')
-        .map(|(directory, _)| directory)
-        .unwrap_or("")
+    path.rsplit_once('/').map_or("", |(directory, _)| directory)
 }
 
 #[cfg(test)]

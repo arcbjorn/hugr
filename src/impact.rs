@@ -279,13 +279,11 @@ impl ImpactReport {
 }
 
 fn json_option_string(value: Option<&str>) -> String {
-    value.map(json_string).unwrap_or_else(|| "null".to_string())
+    value.map_or_else(|| "null".to_string(), json_string)
 }
 
 fn json_optional_i64(value: Option<i64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "null".to_string())
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
 }
 
 fn symbol_location(symbol: &CodeSymbol) -> String {

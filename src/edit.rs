@@ -432,9 +432,7 @@ pub(crate) fn plan_move(
             old_line_end,
             moved_line_count,
             rewritten_reference_count: reference_rewrite.rewritten_reference_count
-                + commonjs_export_rewrite
-                    .map(|(removed, added)| removed + added)
-                    .unwrap_or(0),
+                + commonjs_export_rewrite.map_or(0, |(removed, added)| removed + added),
             changed_files,
         },
     })
@@ -591,8 +589,7 @@ fn commonjs_object_export_items(line: &str) -> Vec<String> {
 
 fn commonjs_object_export_item_name(item: &str) -> String {
     item.split_once(':')
-        .map(|(name, _value)| name.trim())
-        .unwrap_or(item.trim())
+        .map_or(item.trim(), |(name, _value)| name.trim())
         .to_string()
 }
 
@@ -1426,8 +1423,7 @@ fn java_rewrite_import_for_move(
         let trimmed = line.trim();
         trimmed
             .strip_prefix("import ")
-            .map(|rest| rest.trim_end_matches(';').trim() == old_import)
-            .unwrap_or(false)
+            .is_some_and(|rest| rest.trim_end_matches(';').trim() == old_import)
     });
 
     if reference_in_destination_package {
@@ -1709,8 +1705,7 @@ fn kotlin_rewrite_import_for_move(
             let trimmed = line.trim();
             trimmed
                 .strip_prefix("import ")
-                .map(|rest| rest.trim_end_matches(';').trim() == old)
-                .unwrap_or(false)
+                .is_some_and(|rest| rest.trim_end_matches(';').trim() == old)
         })
     });
 
@@ -2333,9 +2328,7 @@ fn find_rust_use_keyword(line: &str) -> Option<usize> {
     line.match_indices("use").find_map(|(index, _)| {
         let before = line[..index].chars().next_back();
         let after = line[index + "use".len()..].chars().next();
-        if before.is_none_or(|char| char.is_whitespace())
-            && after.is_some_and(|char| char.is_whitespace())
-        {
+        if before.is_none_or(char::is_whitespace) && after.is_some_and(char::is_whitespace) {
             Some(index)
         } else {
             None
@@ -2558,8 +2551,7 @@ fn rust_use_item_imports_symbol(item: &str, symbol_name: &str) -> bool {
 
 fn rust_use_item_name(item: &str) -> String {
     item.split_once(" as ")
-        .map(|(name, _alias)| name.trim())
-        .unwrap_or_else(|| item.trim())
+        .map_or_else(|| item.trim(), |(name, _alias)| name.trim())
         .to_string()
 }
 
@@ -3019,17 +3011,16 @@ fn python_from_item_new_name(from_module: &str, new_module: &str, new_module_lea
     if from_module.starts_with('.') {
         new_module_leaf.to_string()
     } else {
-        new_module
-            .rsplit_once('.')
-            .map(|(_parent, leaf)| leaf.to_string())
-            .unwrap_or_else(|| new_module_leaf.to_string())
+        new_module.rsplit_once('.').map_or_else(
+            || new_module_leaf.to_string(),
+            |(_parent, leaf)| leaf.to_string(),
+        )
     }
 }
 
 fn python_import_item_name(item: &str) -> String {
     item.split_once(" as ")
-        .map(|(name, _alias)| name.trim())
-        .unwrap_or_else(|| item.trim())
+        .map_or_else(|| item.trim(), |(name, _alias)| name.trim())
         .to_string()
 }
 
@@ -3782,18 +3773,15 @@ fn javascript_import_line_is_unsupported(line: &str) -> bool {
 fn javascript_import_item_name(item: &str) -> String {
     let item = item
         .strip_prefix("type ")
-        .map(str::trim_start)
-        .unwrap_or(item.trim());
+        .map_or(item.trim(), str::trim_start);
     item.split_once(" as ")
-        .map(|(name, _alias)| name.trim())
-        .unwrap_or(item)
+        .map_or(item, |(name, _alias)| name.trim())
         .to_string()
 }
 
 fn javascript_commonjs_item_name(item: &str) -> String {
     item.split_once(':')
-        .map(|(name, _alias)| name.trim())
-        .unwrap_or(item.trim())
+        .map_or(item.trim(), |(name, _alias)| name.trim())
         .to_string()
 }
 
@@ -4355,8 +4343,7 @@ fn replace_identifier_on_lines(
         let (renamed, line_replacements) = replace_identifier_in_line(line, old_name, new_name);
         if line_replacements == 0 {
             return Err(format!(
-                "rename-symbol found no '{}' identifier on {path}:{line_number}; rerun hugr index",
-                old_name
+                "rename-symbol found no '{old_name}' identifier on {path}:{line_number}; rerun hugr index"
             ));
         }
         *line = renamed;
@@ -4470,8 +4457,7 @@ impl SymbolReplacement {
             json_string(&self.path),
             self.language
                 .as_deref()
-                .map(json_string)
-                .unwrap_or_else(|| "null".to_string()),
+                .map_or_else(|| "null".to_string(), json_string),
             json_string(&self.name),
             json_string(&self.kind),
             self.old_line_start,
@@ -4537,8 +4523,7 @@ impl SymbolRename {
             json_string(&self.target_path),
             self.language
                 .as_deref()
-                .map(json_string)
-                .unwrap_or_else(|| "null".to_string()),
+                .map_or_else(|| "null".to_string(), json_string),
             json_string(&self.old_name),
             json_string(&self.new_name),
             json_string(&self.kind),
@@ -4600,8 +4585,7 @@ impl SymbolMove {
             json_string(&self.destination_path),
             self.language
                 .as_deref()
-                .map(json_string)
-                .unwrap_or_else(|| "null".to_string()),
+                .map_or_else(|| "null".to_string(), json_string),
             json_string(&self.name),
             json_string(&self.kind),
             self.old_line_start,

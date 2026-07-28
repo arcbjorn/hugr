@@ -57,9 +57,7 @@ impl CommitScore {
     }
 
     fn mrr(&self) -> f64 {
-        self.first_hit_rank
-            .map(|rank| 1.0 / rank as f64)
-            .unwrap_or(0.0)
+        self.first_hit_rank.map_or(0.0, |rank| 1.0 / rank as f64)
     }
 }
 
@@ -334,8 +332,7 @@ fn render_text(report: &EvalReport) -> String {
         let hash = score.hash.get(..7).unwrap_or(&score.hash);
         let rank = score
             .first_hit_rank
-            .map(|rank| rank.to_string())
-            .unwrap_or_else(|| "-".to_string());
+            .map_or_else(|| "-".to_string(), |rank| rank.to_string());
         rendered.push_str(&format!(
             "  - {hash} recall {:.2} rank {rank}: {}\n",
             score.recall, score.task
@@ -417,7 +414,7 @@ mod tests {
         CommitCase {
             hash: "abc1234".to_string(),
             subject: subject.to_string(),
-            files: files.iter().map(|file| file.to_string()).collect(),
+            files: files.iter().map(std::string::ToString::to_string).collect(),
         }
     }
 

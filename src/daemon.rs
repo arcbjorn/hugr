@@ -1140,8 +1140,7 @@ fn render_error_json(message: &str) -> String {
 fn render_status_json(peer_addr: SocketAddr, state: &DaemonState) -> String {
     let store = Store::open_current();
     let current_dir = std::env::current_dir()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
+        .map_or_else(|_| "unknown".to_string(), |path| path.display().to_string());
 
     format!(
         "{{\"status\":\"running\",\"service\":\"hugr-daemon\",\"peer_addr\":{},\"current_dir\":{},\"store_exists\":{},\"store_root\":{},\"storage\":{},\"watcher_enabled\":{},\"indexing\":{},\"last_index_status\":{},\"memory_job_running\":{},\"last_memory_job_status\":{},\"session_observation_running\":{},\"last_session_observation_status\":{},\"session_promotion_running\":{},\"last_session_promotion_status\":{}}}",
@@ -1218,8 +1217,7 @@ impl DaemonState {
     fn last_index_status(&self) -> String {
         self.last_index_status
             .lock()
-            .map(|status| status.clone())
-            .unwrap_or_else(|_| "unavailable".to_string())
+            .map_or_else(|_| "unavailable".to_string(), |status| status.clone())
     }
 
     fn set_last_memory_job_status(&self, status: &str) {
@@ -1231,8 +1229,7 @@ impl DaemonState {
     fn last_memory_job_status(&self) -> String {
         self.last_memory_job_status
             .lock()
-            .map(|status| status.clone())
-            .unwrap_or_else(|_| "unavailable".to_string())
+            .map_or_else(|_| "unavailable".to_string(), |status| status.clone())
     }
 
     fn set_last_session_observation_status(&self, status: &str) {
@@ -1244,8 +1241,7 @@ impl DaemonState {
     fn last_session_observation_status(&self) -> String {
         self.last_session_observation_status
             .lock()
-            .map(|status| status.clone())
-            .unwrap_or_else(|_| "unavailable".to_string())
+            .map_or_else(|_| "unavailable".to_string(), |status| status.clone())
     }
 
     fn set_last_session_promotion_status(&self, status: &str) {
@@ -1257,8 +1253,7 @@ impl DaemonState {
     fn last_session_promotion_status(&self) -> String {
         self.last_session_promotion_status
             .lock()
-            .map(|status| status.clone())
-            .unwrap_or_else(|_| "unavailable".to_string())
+            .map_or_else(|_| "unavailable".to_string(), |status| status.clone())
     }
 }
 

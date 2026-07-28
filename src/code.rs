@@ -286,11 +286,9 @@ fn extract_symbols_from_lines(
         let extracted = match language {
             Some("rust") => extract_rust_symbol(trimmed),
             Some("python") => extract_python_symbol(trimmed),
-            Some("javascript") | Some("typescript") => extract_javascript_symbol(trimmed),
+            Some("javascript" | "typescript") => extract_javascript_symbol(trimmed),
             Some("go") => extract_go_symbol(trimmed),
-            Some("swift") | Some("kotlin") | Some("java") | Some("c") | Some("cpp") => {
-                extract_c_family_symbol(trimmed)
-            }
+            Some("swift" | "kotlin" | "java" | "c" | "cpp") => extract_c_family_symbol(trimmed),
             _ => None,
         };
 
@@ -402,8 +400,7 @@ fn rust_signature(node: Node<'_>, contents: &str) -> String {
     let start = node.start_byte();
     let end = contents[node.start_byte()..node.end_byte()]
         .find('{')
-        .map(|offset| start + offset)
-        .unwrap_or_else(|| node.end_byte());
+        .map_or_else(|| node.end_byte(), |offset| start + offset);
     clean_signature(&contents[start..end])
 }
 
@@ -489,11 +486,10 @@ fn python_symbol_from_node(
 }
 
 fn python_signature(node: Node<'_>, contents: &str) -> String {
-    contents
-        .lines()
-        .nth(node.start_position().row)
-        .map(|line| clean_signature(line.trim_end_matches(':')))
-        .unwrap_or_else(|| clean_signature(&contents[node.start_byte()..node.end_byte()]))
+    contents.lines().nth(node.start_position().row).map_or_else(
+        || clean_signature(&contents[node.start_byte()..node.end_byte()]),
+        |line| clean_signature(line.trim_end_matches(':')),
+    )
 }
 
 fn extract_typescript_symbols_with_tree_sitter(
@@ -599,11 +595,10 @@ fn typescript_function_variable(node: Node<'_>) -> (&'static str, Option<Node<'_
 }
 
 fn line_signature(node: Node<'_>, contents: &str) -> String {
-    contents
-        .lines()
-        .nth(node.start_position().row)
-        .map(clean_signature)
-        .unwrap_or_else(|| clean_signature(&contents[node.start_byte()..node.end_byte()]))
+    contents.lines().nth(node.start_position().row).map_or_else(
+        || clean_signature(&contents[node.start_byte()..node.end_byte()]),
+        clean_signature,
+    )
 }
 
 fn extract_javascript_symbols_with_tree_sitter(
@@ -719,8 +714,7 @@ fn commonjs_object_export_names(line: &str) -> Vec<String> {
             }
             let name = item
                 .split_once(':')
-                .map(|(property, _value)| property.trim())
-                .unwrap_or(item);
+                .map_or(item, |(property, _value)| property.trim());
             first_identifier(name)
         })
         .collect()
@@ -859,10 +853,11 @@ fn java_symbol_from_node(
     let (kind, name_node) = match node.kind() {
         "annotation_type_declaration" => ("annotation", node.child_by_field_name("name")),
         "class_declaration" => ("class", node.child_by_field_name("name")),
-        "constructor_declaration" => ("function", node.child_by_field_name("name")),
         "enum_declaration" => ("enum", node.child_by_field_name("name")),
         "interface_declaration" => ("interface", node.child_by_field_name("name")),
-        "method_declaration" => ("function", node.child_by_field_name("name")),
+        "constructor_declaration" | "method_declaration" => {
+            ("function", node.child_by_field_name("name"))
+        }
         "record_declaration" => ("record", node.child_by_field_name("name")),
         _ => return Ok(None),
     };
@@ -1416,8 +1411,7 @@ fn assign_symbol_ranges(symbols: &mut [CodeSymbol], line_count: i64) {
     for index in 0..symbols.len() {
         let next_start = symbols.get(index + 1).map(|symbol| symbol.line_start);
         let line_end = next_start
-            .map(|line| line.saturating_sub(1))
-            .unwrap_or(line_count)
+            .map_or(line_count, |line| line.saturating_sub(1))
             .max(symbols[index].line_start);
         symbols[index].line_end = Some(line_end);
     }
@@ -1862,7 +1856,7 @@ fn flush_identifier_token(tokens: &mut Vec<String>, current: &mut String) {
 /// Deterministic light stemming: a lowercase task term matches a lowercase
 /// identifier word when they are equal, or when one is a prefix of the other
 /// with at most a short suffix left over (rank/ranking, test/tests). The
-/// suffix cap keeps compound terms like provider_symbol from matching the
+/// suffix cap keeps compound terms like `provider_symbol` from matching the
 /// unrelated word provider.
 pub(crate) fn term_matches_identifier_word(word: &str, term: &str) -> bool {
     if word == term {
@@ -1916,14 +1910,14 @@ mod tests {
         let symbols = extract_symbols(
             "src/plugin_hooks.rs",
             Some("rust"),
-            r#"
+            r"
 pub struct PluginHooks {
 }
 
 impl PluginHooks {
     pub async fn run_after_config(&self) {}
 }
-"#,
+",
         )
         .unwrap();
 
@@ -1944,12 +1938,12 @@ impl PluginHooks {
         let symbols = extract_symbols(
             "src/plugin_hooks.rs",
             Some("rust"),
-            r#"
+            r"
 pub fn run_after_config() -> bool {
     let loaded = true;
     loaded
 }
-"#,
+",
         )
         .unwrap();
 
@@ -1969,12 +1963,12 @@ pub fn run_after_config() -> bool {
         let symbols = extract_symbols(
             "app/plugin_hooks.py",
             Some("python"),
-            r#"
+            r"
 class PluginHooks:
     def run_after_config(self):
         loaded = True
         return loaded
-"#,
+",
         )
         .unwrap();
 
@@ -2001,11 +1995,11 @@ class PluginHooks:
         let symbols = extract_symbols(
             "src/pluginHooks.ts",
             Some("typescript"),
-            r#"
+            r"
 export interface PluginHook {}
 export const runPluginHooks = () => true;
 export class PluginRegistry {}
-"#,
+",
         )
         .unwrap();
 
@@ -2019,7 +2013,7 @@ export class PluginRegistry {}
         let symbols = extract_symbols(
             "src/pluginHooks.ts",
             Some("typescript"),
-            r#"
+            r"
 export interface PluginHook {
     enabled: boolean;
 }
@@ -2037,7 +2031,7 @@ export class PluginRegistry {
 export const createRegistry = () => {
     return new PluginRegistry();
 };
-"#,
+",
         )
         .unwrap();
 
@@ -2089,7 +2083,7 @@ export const createRegistry = () => {
         let symbols = extract_symbols(
             "src/pluginHooks.jsx",
             Some("javascript"),
-            r#"
+            r"
 export class PluginRegistry {
     register(hook) {
         return hook;
@@ -2103,7 +2097,7 @@ export function createRegistry() {
 const renderRegistry = () => (
     <PluginRegistry />
 );
-"#,
+",
         )
         .unwrap();
 
@@ -2144,7 +2138,7 @@ const renderRegistry = () => (
         let symbols = extract_symbols(
             "src/pluginHooks.js",
             Some("javascript"),
-            r#"
+            r"
 function localHelper() {
     return true;
 }
@@ -2154,7 +2148,7 @@ exports.runHook = function runHook() {
 };
 module.exports.Helper = class Helper {};
 module.exports = { localHelper, renamed: runHook };
-"#,
+",
         )
         .unwrap();
 
@@ -2169,7 +2163,7 @@ module.exports = { localHelper, renamed: runHook };
         let symbols = extract_symbols(
             "plugin/hooks.go",
             Some("go"),
-            r#"
+            r"
 package plugin
 
 type PluginRegistry struct {
@@ -2187,7 +2181,7 @@ func NewPluginRegistry() *PluginRegistry {
 func (r *PluginRegistry) RunPluginHooks() bool {
     return r.enabled
 }
-"#,
+",
         )
         .unwrap();
 
@@ -2228,7 +2222,7 @@ func (r *PluginRegistry) RunPluginHooks() bool {
         let symbols = extract_symbols(
             "src/main/java/plugin/PluginRegistry.java",
             Some("java"),
-            r#"
+            r"
 package plugin;
 
 public interface PluginHook {
@@ -2251,7 +2245,7 @@ public class PluginRegistry implements PluginHook {
         return true;
     }
 }
-"#,
+",
         )
         .unwrap();
 
@@ -2305,7 +2299,7 @@ public class PluginRegistry implements PluginHook {
         let symbols = extract_symbols(
             "src/main/kotlin/plugin/PluginRegistry.kt",
             Some("kotlin"),
-            r#"
+            r"
 package plugin
 
 interface PluginHook {
@@ -2334,7 +2328,7 @@ data class PluginRegistry(private val hooks: List<PluginHook>) {
         fun empty(): PluginRegistry = PluginRegistry()
     }
 }
-"#,
+",
         )
         .unwrap();
 
@@ -2419,7 +2413,7 @@ data class PluginRegistry(private val hooks: List<PluginHook>) {
         let symbols = extract_symbols(
             "Sources/Plugin/PluginRegistry.swift",
             Some("swift"),
-            r#"
+            r"
 public protocol PluginHook {
     func runPluginHooks() -> Bool
 }
@@ -2448,7 +2442,7 @@ extension PluginRegistry {
 }
 
 public typealias HookCallback = () -> Bool
-"#,
+",
         )
         .unwrap();
 
@@ -2544,22 +2538,22 @@ public typealias HookCallback = () -> Bool
         let project = TempProject::new("references");
         project.write(
             "src/plugin_hooks.rs",
-            r#"
+            r"
 pub struct PluginHooks {}
 
 pub fn run_after_config() {}
-"#,
+",
         );
         project.write(
             "src/main.rs",
-            r#"
+            r"
 use crate::plugin_hooks::PluginHooks;
 
 fn main() {
     let _hooks = PluginHooks {};
     run_after_config();
 }
-"#,
+",
         );
         let files = vec![candidate("src/main.rs"), candidate("src/plugin_hooks.rs")];
         let symbols = extract_symbols(
@@ -2732,7 +2726,7 @@ fn main() {
         let project = TempProject::new("richer_edges");
         project.write(
             "src/plugin.rs",
-            r#"
+            r"
 pub trait PluginHook {
     fn run_plugin_hooks(&self);
 }
@@ -2750,7 +2744,7 @@ pub fn build_registry() -> PluginRegistry {
 pub fn execute(registry: &PluginRegistry) {
     registry.run_plugin_hooks();
 }
-"#,
+",
         );
 
         let files = vec![candidate("src/plugin.rs")];
