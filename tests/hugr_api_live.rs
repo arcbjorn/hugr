@@ -1,3 +1,9 @@
+//! Contract tests for the hosted `/v1` API the daemon serves.
+//!
+//! These run a real daemon process over a real socket rather than calling the
+//! handlers directly, so the wire format, the bearer-token check, and the
+//! contract version are all exercised end to end.
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
