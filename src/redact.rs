@@ -43,7 +43,7 @@ static AUTHORIZATION_HEADER: LazyLock<Regex> = LazyLock::new(|| {
 /// KEY=value / key: value assignments where the key names a credential.
 static SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)\b([A-Z0-9_.-]*(?:api_?key|apikey|secret|token|passwd|password|credential)[A-Z0-9_.-]*\s*[=:]\s*)("[^"]{4,}"|'[^']{4,}'|[^\s"']{4,})"#,
+        r#"(?i)\b([A-Z0-9_.-]*(?:api[_.-]?key|secret|token|passwd|password|credential)[A-Z0-9_.-]*\s*[=:]\s*)("[^"]{4,}"|'[^']{4,}'|[^\s"']{4,})"#,
     )
     .expect("assignment pattern should compile")
 });
@@ -51,7 +51,7 @@ static SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
 /// --token/--api-key style flags followed by a space-separated value.
 static SECRET_FLAG: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(--?[A-Za-z0-9-]*(?:api-?key|secret|token|password)[A-Za-z0-9-]*\s+)[^\s-][^\s]{3,}",
+        r"(?i)(--?[A-Za-z0-9_-]*(?:api[_-]?key|secret|token|password)[A-Za-z0-9_-]*\s+)[^\s-][^\s]{3,}",
     )
     .expect("flag pattern should compile")
 });
@@ -132,6 +132,21 @@ mod tests {
         assert!(redacted.contains("--api-key [REDACTED]"));
         assert!(redacted.contains("--token [REDACTED]"));
         assert!(!redacted.contains("12345678"));
+    }
+
+    #[test]
+    fn redacts_every_api_key_spelling() {
+        let text = "X-Api-Key: hunter2222 api_key=hunter3333 apikey:hunter4444 \
+                    --api-key hunter5555 --api_key hunter6666";
+
+        let redacted = redact_secrets(text);
+
+        assert!(redacted.contains("X-Api-Key: [REDACTED]"));
+        assert!(redacted.contains("api_key=[REDACTED]"));
+        assert!(redacted.contains("apikey:[REDACTED]"));
+        assert!(redacted.contains("--api-key [REDACTED]"));
+        assert!(redacted.contains("--api_key [REDACTED]"));
+        assert!(!redacted.contains("hunter"));
     }
 
     #[test]
