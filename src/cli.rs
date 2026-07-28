@@ -88,7 +88,7 @@ pub enum Command {
     Run {
         command: Vec<String>,
     },
-    ObserveCommand {
+    Observe {
         status: i32,
         command: Vec<String>,
     },
@@ -372,7 +372,7 @@ fn parse_observe_shell_command(args: &[String]) -> Result<Command, String> {
     if command.is_empty() {
         Err("hugr observe command requires a command".to_string())
     } else {
-        Ok(Command::ObserveCommand { status, command })
+        Ok(Command::Observe { status, command })
     }
 }
 
@@ -1487,7 +1487,7 @@ mod tests {
                 "cargo".into(),
                 "test".into()
             ]),
-            Ok(Command::ObserveCommand {
+            Ok(Command::Observe {
                 status: 0,
                 command: vec!["cargo".into(), "test".into()]
             })
@@ -1501,7 +1501,7 @@ mod tests {
                 "cargo".into(),
                 "test".into()
             ]),
-            Ok(Command::ObserveCommand {
+            Ok(Command::Observe {
                 status: 1,
                 command: vec!["cargo".into(), "test".into()]
             })

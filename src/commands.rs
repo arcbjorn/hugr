@@ -89,9 +89,7 @@ pub async fn execute(command: Command) -> Result<(), String> {
         Command::Mcp => mcp::serve_stdio().await,
         Command::Daemon { addr } => daemon::serve(daemon::DaemonConfig { addr }).await,
         Command::Run { command } => run_observed_command(&command).await,
-        Command::ObserveCommand { status, command } => {
-            observe_shell_command(status, &command).await
-        }
+        Command::Observe { status, command } => observe_shell_command(status, &command).await,
         Command::ShellHook { shell } => shell_hook(&shell),
         Command::Improve {
             execute,
