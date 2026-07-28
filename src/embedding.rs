@@ -329,7 +329,7 @@ impl std::fmt::Debug for LocalEmbeddingProvider {
 
 #[cfg(feature = "local-embeddings")]
 impl LocalEmbeddingProvider {
-    pub fn new(model_name: &str) -> Result<Self> {
+    pub(crate) fn new(model_name: &str) -> Result<Self> {
         let (_, dimensions) = local_embedding_model(model_name)?;
         Ok(Self {
             model_name: model_name.to_string(),
@@ -358,15 +358,13 @@ impl EmbeddingProvider for LocalEmbeddingProvider {
             .map_err(|error| Error::msg(error.to_string()))?;
         let mut engine = engine
             .lock()
-            .map_err(|_| Error::msg("local embedding engine mutex poisoned".to_string()))?;
+            .map_err(|_| Error::msg("local embedding engine mutex poisoned"))?;
         let mut vectors = engine
             .embed(vec![text.to_string()], None)
-            .map_err(|error| {
-                Error::with_source(format!("local embedding failed: {error}"), error)
-            })?;
+            .map_err(|error| Error::msg(format!("local embedding failed: {error}")))?;
         let vector = vectors
             .pop()
-            .ok_or_else(|| Error::msg("local embedding returned no vector".to_string()))?;
+            .ok_or_else(|| Error::msg("local embedding returned no vector"))?;
 
         Ok(Embedding {
             model: self.model_name.clone(),
@@ -401,10 +399,9 @@ fn build_local_embedding_engine(model_name: &str) -> Result<fastembed::TextEmbed
         options = options.with_cache_dir(cache_dir);
     }
     fastembed::TextEmbedding::try_new(options).map_err(|error| {
-        Error::with_source(
-            format!("failed to load local embedding model '{model_name}': {error}"),
-            error,
-        )
+        Error::msg(format!(
+            "failed to load local embedding model '{model_name}': {error}"
+        ))
     })
 }
 
@@ -487,7 +484,7 @@ fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String>
         let stdin = child
             .stdin
             .as_mut()
-            .ok_or_else(|| Error::msg("failed to open curl stdin".to_string()))?;
+            .ok_or_else(|| Error::msg("failed to open curl stdin"))?;
         stdin
             .write_all(body.to_string().as_bytes())
             .map_err(|error| {
@@ -532,15 +529,14 @@ fn parse_openai_embedding_response(
         .and_then(|data| data.first())
         .and_then(|item| item.get("embedding"))
         .and_then(Value::as_array)
-        .ok_or_else(|| {
-            Error::msg("embedding response did not include data[0].embedding".to_string())
-        })?;
+        .ok_or_else(|| Error::msg("embedding response did not include data[0].embedding"))?;
     let vector = embedding
         .iter()
         .map(|value| {
-            value.as_f64().map(|value| value as f32).ok_or_else(|| {
-                Error::msg("embedding response included a non-numeric value".to_string())
-            })
+            value
+                .as_f64()
+                .map(|value| value as f32)
+                .ok_or_else(|| Error::msg("embedding response included a non-numeric value"))
         })
         .collect::<Result<Vec<_>, _>>()?;
 

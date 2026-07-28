@@ -519,7 +519,7 @@ impl Store {
     pub(crate) async fn forget(&self, query: &str, limit: usize) -> Result<ForgetResult> {
         let query = query.trim();
         if query.is_empty() {
-            return Err(Error::msg("hugr forget requires a query".to_string()));
+            return Err(Error::msg("hugr forget requires a query"));
         }
         let terms = query_terms(query);
         if terms.is_empty() {
@@ -735,7 +735,7 @@ impl Store {
         self.init().await?;
         self.project()
             .await?
-            .ok_or_else(|| Error::msg("project registry is empty after initialization".to_string()))
+            .ok_or_else(|| Error::msg("project registry is empty after initialization"))
     }
 
     pub(crate) async fn project(&self) -> Result<Option<Project>> {
@@ -1655,7 +1655,7 @@ impl Store {
 
         session_by_id(&conn, &session_id)
             .await?
-            .ok_or_else(|| Error::msg("ended session was not found".to_string()))
+            .ok_or_else(|| Error::msg("ended session was not found"))
     }
 
     pub(crate) async fn promote_latest_session(&self) -> Result<SessionPromotionResult> {
@@ -1676,14 +1676,14 @@ impl Store {
         }
 
         if !self.exists() {
-            return Err(Error::msg("no session available to promote".to_string()));
+            return Err(Error::msg("no session available to promote"));
         }
 
         let conn = self.connect().await?;
         migrations::migrate(&conn).await?;
         let session = latest_session(&conn)
             .await?
-            .ok_or_else(|| Error::msg("no session available to promote".to_string()))?;
+            .ok_or_else(|| Error::msg("no session available to promote"))?;
         self.promote_session(&conn, session, synthesizer).await
     }
 
@@ -2446,11 +2446,11 @@ impl Store {
             let remote_url = config
                 .remote_url
                 .as_ref()
-                .ok_or_else(|| Error::msg("remote database URL is not configured".to_string()))?;
+                .ok_or_else(|| Error::msg("remote database URL is not configured"))?;
             let remote_auth_token = config
                 .remote_auth_token
                 .as_ref()
-                .ok_or_else(|| Error::msg("remote auth token is not configured".to_string()))?;
+                .ok_or_else(|| Error::msg("remote auth token is not configured"))?;
             let remote_db = Builder::new_remote(remote_url.clone(), remote_auth_token.clone())
                 .build()
                 .await?;
@@ -2511,11 +2511,11 @@ impl Store {
             let remote_url = config
                 .remote_url
                 .as_ref()
-                .ok_or_else(|| Error::msg("remote database URL is not configured".to_string()))?;
+                .ok_or_else(|| Error::msg("remote database URL is not configured"))?;
             let remote_auth_token = config
                 .remote_auth_token
                 .as_ref()
-                .ok_or_else(|| Error::msg("remote auth token is not configured".to_string()))?;
+                .ok_or_else(|| Error::msg("remote auth token is not configured"))?;
             let remote_db = Builder::new_remote(remote_url.clone(), remote_auth_token.clone())
                 .build()
                 .await?;
@@ -2562,11 +2562,11 @@ impl Store {
             let remote_url = storage_config
                 .remote_url
                 .as_ref()
-                .ok_or_else(|| Error::msg("remote database URL is not configured".to_string()))?;
+                .ok_or_else(|| Error::msg("remote database URL is not configured"))?;
             let remote_auth_token = storage_config
                 .remote_auth_token
                 .as_ref()
-                .ok_or_else(|| Error::msg("remote auth token is not configured".to_string()))?;
+                .ok_or_else(|| Error::msg("remote auth token is not configured"))?;
             let db = Builder::new_remote(remote_url.clone(), remote_auth_token.clone())
                 .build()
                 .await?;
@@ -4892,9 +4892,8 @@ fn record_session_event_via_hugr_api(
     kind: &str,
     detail: &str,
 ) -> Result<SessionEvent> {
-    record_session_event_if_active_via_hugr_api(config, kind, detail)?.ok_or_else(|| {
-        Error::msg("no active session; run `hugr session start <task>` first".to_string())
-    })
+    record_session_event_if_active_via_hugr_api(config, kind, detail)?
+        .ok_or_else(|| Error::msg("no active session; run `hugr session start <task>` first"))
 }
 
 fn record_session_event_if_active_via_hugr_api(
@@ -4938,9 +4937,7 @@ fn end_session_via_hugr_api(config: &StorageConfig, summary: Option<&str>) -> Re
         .into_iter()
         .filter(|session| session.ended_at_ms.is_none())
         .max_by(|left, right| left.started_at_ms.cmp(&right.started_at_ms))
-        .ok_or_else(|| {
-            Error::msg("no active session; run `hugr session start <task>` first".to_string())
-        })?;
+        .ok_or_else(|| Error::msg("no active session; run `hugr session start <task>` first"))?;
     session.ended_at_ms = Some(now_ms()?);
     session.final_summary = summary
         .map(str::trim)
@@ -4969,7 +4966,7 @@ fn promote_latest_session_via_hugr_api(
     let snapshot = fetch_hugr_api_storage_snapshot(config)?;
     let sessions = storage_sessions(&snapshot)?;
     let session = latest_session_from_sessions(&sessions)
-        .ok_or_else(|| Error::msg("no session available to promote".to_string()))?;
+        .ok_or_else(|| Error::msg("no session available to promote"))?;
     let facts = session_promotion_facts_from_records(&session, &snapshot.session_events);
     if facts.is_empty() {
         return Err(Error::msg(
@@ -5892,14 +5889,16 @@ fn request_hugr_api_json(
     body: Option<&serde_json::Value>,
 ) -> Result<String> {
     let url = hugr_api_route_url(
-        config.remote_url.as_ref().ok_or_else(|| {
-            Error::msg("HUGR_SYNC_BACKEND=hugr_api requires HUGR_API_URL".to_string())
-        })?,
+        config
+            .remote_url
+            .as_ref()
+            .ok_or_else(|| Error::msg("HUGR_SYNC_BACKEND=hugr_api requires HUGR_API_URL"))?,
         path,
     );
-    let token = config.remote_auth_token.as_ref().ok_or_else(|| {
-        Error::msg("HUGR_SYNC_BACKEND=hugr_api requires HUGR_API_TOKEN".to_string())
-    })?;
+    let token = config
+        .remote_auth_token
+        .as_ref()
+        .ok_or_else(|| Error::msg("HUGR_SYNC_BACKEND=hugr_api requires HUGR_API_TOKEN"))?;
     let mut args = vec![
         "-fsS".to_string(),
         "-X".to_string(),
@@ -5938,7 +5937,7 @@ fn request_hugr_api_json(
         let stdin = child
             .stdin
             .as_mut()
-            .ok_or_else(|| Error::msg("failed to open Hugr API request stdin".to_string()))?;
+            .ok_or_else(|| Error::msg("failed to open Hugr API request stdin"))?;
         stdin
             .write_all(body.to_string().as_bytes())
             .map_err(|error| {
@@ -11027,10 +11026,10 @@ fn normalize_memory_source(source: MemorySource) -> Result<MemorySource> {
     let kind = source.kind.trim();
     let locator = source.locator.trim();
     if kind.is_empty() {
-        return Err(Error::msg("memory source kind is required".to_string()));
+        return Err(Error::msg("memory source kind is required"));
     }
     if locator.is_empty() {
-        return Err(Error::msg("memory source locator is required".to_string()));
+        return Err(Error::msg("memory source locator is required"));
     }
 
     Ok(MemorySource {
@@ -11042,7 +11041,7 @@ fn normalize_memory_source(source: MemorySource) -> Result<MemorySource> {
 fn normalize_memory_label(value: String) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
-        return Err(Error::msg("memory sensitivity is required".to_string()));
+        return Err(Error::msg("memory sensitivity is required"));
     }
     if !value
         .chars()
@@ -11059,7 +11058,7 @@ fn normalize_memory_label(value: String) -> Result<String> {
 fn normalize_memory_value(value: String) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
-        Err(Error::msg("memory validity value is required".to_string()))
+        Err(Error::msg("memory validity value is required"))
     } else {
         Ok(value.to_string())
     }
@@ -11259,7 +11258,7 @@ fn global_root(lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf> {
     lookup("HOME")
         .filter(|value| !value.trim().is_empty())
         .map(|home| PathBuf::from(home).join(HUGR_DIR))
-        .ok_or_else(|| Error::msg("global memory requires HOME or HUGR_GLOBAL_DIR".to_string()))
+        .ok_or_else(|| Error::msg("global memory requires HOME or HUGR_GLOBAL_DIR"))
 }
 
 fn now_ms() -> Result<i64> {
@@ -14625,7 +14624,7 @@ mod tests {
             .unwrap();
 
         let synthesize = |_: &str, _: &[super::SessionFact]| -> Result<super::SessionSynthesis> {
-            Err(Error::msg("model unreachable".to_string()))
+            Err(Error::msg("model unreachable"))
         };
         let promoted = test
             .store

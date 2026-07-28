@@ -140,7 +140,7 @@ fn optional_budget(arguments: &Value) -> Result<Option<usize>> {
         .map(|budget| budget as usize)
         .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
         .map(Some)
-        .ok_or_else(|| Error::msg("budget must be a positive integer".to_string()))
+        .ok_or_else(|| Error::msg("budget must be a positive integer"))
 }
 
 async fn tool_remember(arguments: &Value) -> Result<Value> {
@@ -763,7 +763,7 @@ fn optional_memory_source(arguments: &Value) -> Result<Option<MemorySource>> {
             kind: required_string(source, "kind")?,
             locator: required_string(source, "locator")?,
         })),
-        Some(_) => Err(Error::msg("source must be an object".to_string())),
+        Some(_) => Err(Error::msg("source must be an object")),
         None => Ok(None),
     }
 }

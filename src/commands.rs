@@ -218,7 +218,7 @@ fn parse_min_hit_rate(value: &str) -> Result<f64> {
 fn parse_memory_confidence(value: &str) -> Result<f64> {
     value
         .parse::<f64>()
-        .map_err(|_| Error::msg("memory confidence must be a number".to_string()))
+        .map_err(|_| Error::msg("memory confidence must be a number"))
 }
 
 async fn recall(query: &str, format: OutputFormat, global: bool) -> Result<()> {
@@ -784,7 +784,7 @@ async fn session_promote(format: OutputFormat, llm: bool) -> Result<()> {
 
 async fn run_observed_command(command: &[String]) -> Result<()> {
     let Some(program) = command.first() else {
-        return Err(Error::msg("hugr run requires a command".to_string()));
+        return Err(Error::msg("hugr run requires a command"));
     };
 
     let output = ProcessCommand::new(program)

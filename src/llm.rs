@@ -138,9 +138,7 @@ fn parse_chat_response(response: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|content| !content.is_empty())
-        .ok_or_else(|| {
-            Error::msg("llm response did not include choices[0].message.content".to_string())
-        })?;
+        .ok_or_else(|| Error::msg("llm response did not include choices[0].message.content"))?;
 
     if content.chars().count() > MAX_SYNTHESIS_CHARS {
         let mut truncated = content
@@ -186,7 +184,7 @@ fn post_json_with_curl(url: &str, api_key: &str, body: &Value) -> Result<String>
         let stdin = child
             .stdin
             .as_mut()
-            .ok_or_else(|| Error::msg("failed to open curl stdin".to_string()))?;
+            .ok_or_else(|| Error::msg("failed to open curl stdin"))?;
         stdin
             .write_all(body.to_string().as_bytes())
             .map_err(|error| {

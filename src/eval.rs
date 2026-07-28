@@ -100,7 +100,7 @@ impl EvalReport {
 pub(crate) async fn run(options: EvalOptions) -> Result<()> {
     let store = Store::open_current();
     if store.is_remote_only()? {
-        return Err(Error::msg("hugr eval requires local storage".to_string()));
+        return Err(Error::msg("hugr eval requires local storage"));
     }
     ensure_git_repository()?;
 

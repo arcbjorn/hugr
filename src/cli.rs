@@ -294,7 +294,7 @@ fn parse_remember_command(args: &[String]) -> Result<Command> {
 
     let text = words.join(" ");
     if text.trim().is_empty() {
-        Err(Error::msg("hugr remember requires text".to_string()))
+        Err(Error::msg("hugr remember requires text"))
     } else {
         Ok(Command::Remember {
             text,
@@ -334,7 +334,7 @@ fn parse_observe_command(args: &[String]) -> Result<Command> {
     match args.get(2).map(String::as_str) {
         Some("command") => parse_observe_shell_command(args),
         Some(unknown) => Err(Error::msg(format!("unknown observe command '{unknown}'"))),
-        None => Err(Error::msg("hugr observe requires a subcommand".to_string())),
+        None => Err(Error::msg("hugr observe requires a subcommand")),
     }
 }
 
@@ -369,8 +369,7 @@ fn parse_observe_shell_command(args: &[String]) -> Result<Command> {
         index += 1;
     }
 
-    let status =
-        status.ok_or_else(|| Error::msg("hugr observe command requires --status".to_string()))?;
+    let status = status.ok_or_else(|| Error::msg("hugr observe command requires --status"))?;
     if command.is_empty() {
         Err(Error::msg(
             "hugr observe command requires a command".to_string(),
@@ -393,7 +392,7 @@ fn parse_shell_hook_command(args: &[String]) -> Result<Command> {
         .get(2)
         .filter(|value| !value.trim().is_empty())
         .cloned()
-        .ok_or_else(|| Error::msg("hugr shell-hook requires a shell".to_string()))?;
+        .ok_or_else(|| Error::msg("hugr shell-hook requires a shell"))?;
 
     if args.len() > 3 {
         return Err(Error::msg(format!("unknown option '{}'", args[3])));
@@ -419,7 +418,7 @@ fn parse_daemon_command(args: &[String]) -> Result<Command> {
                 .get(index)
                 .filter(|value| !value.trim().is_empty())
                 .cloned()
-                .ok_or_else(|| Error::msg("hugr daemon --addr requires a value".to_string()))?;
+                .ok_or_else(|| Error::msg("hugr daemon --addr requires a value"))?;
         } else if let Some(value) = arg.strip_prefix("--addr=") {
             if value.trim().is_empty() {
                 return Err(Error::msg(
@@ -445,7 +444,7 @@ fn parse_run_command(args: &[String]) -> Result<Command> {
 
     let command = command.cloned().collect::<Vec<_>>();
     if command.is_empty() {
-        Err(Error::msg("hugr run requires a command".to_string()))
+        Err(Error::msg("hugr run requires a command"))
     } else {
         Ok(Command::Run { command })
     }
@@ -600,9 +599,11 @@ fn parse_replace_symbol_command(args: &[String]) -> Result<Command> {
             )?);
         } else if arg == "--body" {
             index += 1;
-            body = Some(args.get(index).cloned().ok_or_else(|| {
-                Error::msg("hugr replace-symbol --body requires a value".to_string())
-            })?);
+            body = Some(
+                args.get(index)
+                    .cloned()
+                    .ok_or_else(|| Error::msg("hugr replace-symbol --body requires a value"))?,
+            );
         } else if let Some(value) = arg.strip_prefix("--body=") {
             body = Some(value.to_string());
         } else if arg == "--body-file" {
@@ -667,7 +668,7 @@ fn parse_project_command(args: &[String]) -> Result<Command> {
     match args.get(2).map(String::as_str) {
         Some("status") => Ok(Command::ProjectStatus),
         Some(unknown) => Err(Error::msg(format!("unknown project command '{unknown}'"))),
-        None => Err(Error::msg("hugr project requires a subcommand".to_string())),
+        None => Err(Error::msg("hugr project requires a subcommand")),
     }
 }
 
@@ -681,7 +682,7 @@ fn parse_session_command(args: &[String]) -> Result<Command> {
                 .get(3)
                 .filter(|kind| !kind.trim().is_empty())
                 .cloned()
-                .ok_or_else(|| Error::msg("hugr session event requires kind".to_string()))?;
+                .ok_or_else(|| Error::msg("hugr session event requires kind"))?;
             Ok(Command::SessionEvent {
                 kind,
                 detail: required_text_from(args, 4, "session event")?,
@@ -703,7 +704,7 @@ fn parse_session_command(args: &[String]) -> Result<Command> {
             Ok(Command::SessionPromote { format, llm })
         }
         Some(unknown) => Err(Error::msg(format!("unknown session command '{unknown}'"))),
-        None => Err(Error::msg("hugr session requires a subcommand".to_string())),
+        None => Err(Error::msg("hugr session requires a subcommand")),
     }
 }
 
@@ -730,7 +731,7 @@ fn parse_sync_command(args: &[String]) -> Result<Command> {
             format: output_format_from(args, 3)?,
         }),
         Some(unknown) => Err(Error::msg(format!("unknown sync command '{unknown}'"))),
-        None => Err(Error::msg("hugr sync requires a subcommand".to_string())),
+        None => Err(Error::msg("hugr sync requires a subcommand")),
     }
 }
 
@@ -870,7 +871,7 @@ fn parse_context_command(args: &[String]) -> Result<Command> {
 
     let task = words.join(" ");
     if task.trim().is_empty() {
-        return Err(Error::msg("hugr context requires text".to_string()));
+        return Err(Error::msg("hugr context requires text"));
     }
     Ok(Command::Context {
         task,

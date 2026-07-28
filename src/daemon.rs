@@ -131,7 +131,7 @@ async fn handle_client(
 ) -> Result<()> {
     let request = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, read_http_request(&mut stream))
         .await
-        .map_err(|_| Error::msg("timed out reading HTTP request".to_string()))??;
+        .map_err(|_| Error::msg("timed out reading HTTP request"))??;
     if request.is_empty() {
         return Ok(());
     }
@@ -152,7 +152,7 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<String> {
         }
         buffer.extend_from_slice(&chunk[..bytes_read]);
         if buffer.len() > MAX_HTTP_REQUEST_BYTES {
-            return Err(Error::msg("HTTP request exceeded maximum size".to_string()));
+            return Err(Error::msg("HTTP request exceeded maximum size"));
         }
         if let Some(expected_len) = expected_http_request_len(&buffer)?
             && buffer.len() >= expected_len
