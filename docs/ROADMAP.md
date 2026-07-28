@@ -11,7 +11,6 @@ All planned product systems have a first shipped implementation. This roadmap tr
 
 - Replace the curl subprocess with a proper HTTP client (`ureq` or async `reqwest`) in the embedding, LLM, and API sync transports.
 - Move the daemon's hand-parsed HTTP handling onto `axum`.
-- Replace hand-escaped JSON rendering in context packs with serde derive.
 - Add a Codex `hugr install` target and an install-time `hugr index` kick-off.
 - Decide whether `local` (in-process ONNX) replaces `deterministic` as the default embedding provider once first-run download UX (progress reporting, offline behavior) is settled.
 
