@@ -1,5 +1,5 @@
 use crate::code::CodeSymbol;
-use crate::discovery::{self, FileCandidate};
+use crate::discovery::FileCandidate;
 use crate::store::{
     Diagnostic, FreshnessSignal, GraphNeighbor, Memory, SessionFact, StaleMemoryCandidate,
 };
@@ -224,9 +224,7 @@ impl ContextPackBuilder {
             .into_iter()
             .map(|path| FileCandidate {
                 path,
-                score: 0,
-                language: None,
-                size_bytes: None,
+                ..FileCandidate::default()
             })
             .collect();
         self
@@ -923,28 +921,35 @@ fn graph_neighbor_citation_id(neighbor: &GraphNeighbor) -> String {
     )
 }
 
+/// Base every file evidence score sits on, so a file that matched nothing in
+/// particular still outscores an empty section.
+const FILE_EVIDENCE_BASE: usize = 400;
+/// Awarded when the task names the file's language directly.
+const FILE_LANGUAGE_BONUS: usize = 30;
+
+/// Scores a file for the pack and explains why it is there.
+///
+/// The score is [`FileCandidate::relevance`] — the same value candidate
+/// selection ranks by — so the order the pack renders matches the order the
+/// candidates were chosen in. Only the language bonus is added here, because
+/// it depends on the task's terms rather than on the candidate alone.
 fn file_evidence(candidate: &FileCandidate, terms: &[String]) -> (usize, String) {
     let language_bonus = candidate
         .language
         .as_ref()
         .filter(|language| terms.iter().any(|term| term == &language.to_lowercase()))
-        .map_or(0, |_| 30);
-    let size_bonus = candidate
-        .size_bytes
-        .map_or(0, |bytes| if bytes <= 128_000 { 10 } else { 0 });
-    if let Some(rank) = discovery::source_embedding_rank(candidate.score) {
-        let rank_bonus = 25usize.saturating_sub(rank.min(25)) * 8;
-        return (
-            640 + rank_bonus + language_bonus + size_bonus,
-            format!("source embedding rank {rank}"),
-        );
-    }
-    let score = 400 + candidate.score * 20 + language_bonus + size_bonus;
-    let reason = if candidate.score > 0 {
-        format!("file discovery score {}", candidate.score)
-    } else {
-        "provided file candidate".to_string()
+        .map_or(0, |_| FILE_LANGUAGE_BONUS);
+    let score = FILE_EVIDENCE_BASE + candidate.relevance() + language_bonus;
+
+    let reason = match (candidate.lexical_score, candidate.embedding_rank) {
+        (0, Some(rank)) => format!("source embedding rank {rank}"),
+        (lexical, Some(rank)) => {
+            format!("file discovery score {lexical} and source embedding rank {rank}")
+        }
+        (0, None) => "provided file candidate".to_string(),
+        (lexical, None) => format!("file discovery score {lexical}"),
     };
+
     (score, reason)
 }
 
@@ -2626,7 +2631,7 @@ mod tests {
         context_query_terms, count_signature_parameters, symbol_evidence,
     };
     use crate::code::CodeSymbol;
-    use crate::discovery::{FileCandidate, source_embedding_score};
+    use crate::discovery::FileCandidate;
     use crate::store::{
         Diagnostic, FreshnessSignal, GraphNeighbor, Memory, SessionFact, StaleMemoryCandidate,
     };
@@ -2642,7 +2647,8 @@ mod tests {
                 "add plugin hooks",
                 vec![FileCandidate {
                     path: "src/plugin.rs".to_string(),
-                    score: 3,
+                    lexical_score: 3,
+                    embedding_rank: None,
                     language: Some("rust".to_string()),
                     size_bytes: Some(1000),
                 }],
@@ -2778,7 +2784,8 @@ mod tests {
         let pack = ContextPack::builder("add plugin hooks")
             .file_candidates(vec![FileCandidate {
                 path: "src/plugin_hooks.rs".to_string(),
-                score: 5,
+                lexical_score: 5,
+                embedding_rank: None,
                 language: Some("rust".to_string()),
                 size_bytes: Some(100),
             }])
@@ -3031,7 +3038,8 @@ mod tests {
         let pack = ContextPack::builder("add plugin hooks")
             .file_candidates(vec![FileCandidate {
                 path: "src/plugin_hooks.rs".to_string(),
-                score: 5,
+                lexical_score: 5,
+                embedding_rank: None,
                 language: Some("rust".to_string()),
                 size_bytes: Some(100),
             }])
@@ -3063,7 +3071,8 @@ mod tests {
         let pack = ContextPack::builder("refresh plugin hooks")
             .file_candidates(vec![FileCandidate {
                 path: "src/plugin_hooks.rs".to_string(),
-                score: 5,
+                lexical_score: 5,
+                embedding_rank: None,
                 language: Some("rust".to_string()),
                 size_bytes: Some(100),
             }])
@@ -3094,7 +3103,8 @@ mod tests {
         let pack = ContextPack::builder("refresh plugin hooks")
             .file_candidates(vec![FileCandidate {
                 path: "src/plugin_hooks.rs".to_string(),
-                score: 5,
+                lexical_score: 5,
+                embedding_rank: None,
                 language: Some("rust".to_string()),
                 size_bytes: Some(100),
             }])
@@ -3328,7 +3338,8 @@ pub fn small(input: i32) -> i32 {
         let pack = ContextPack::builder("fix plugin hooks")
             .file_candidates(vec![FileCandidate {
                 path: "src/plugin_hooks.rs".to_string(),
-                score: 5,
+                lexical_score: 5,
+                embedding_rank: None,
                 language: Some("rust".to_string()),
                 size_bytes: Some(100),
             }])
@@ -3380,13 +3391,15 @@ pub fn small(input: i32) -> i32 {
             .file_candidates(vec![
                 FileCandidate {
                     path: "docs/hooks.md".to_string(),
-                    score: 1,
+                    lexical_score: 1,
+                    embedding_rank: None,
                     language: Some("markdown".to_string()),
                     size_bytes: Some(10),
                 },
                 FileCandidate {
                     path: "src/plugin_hooks.rs".to_string(),
-                    score: 8,
+                    lexical_score: 8,
+                    embedding_rank: None,
                     language: Some("rust".to_string()),
                     size_bytes: Some(10),
                 },
@@ -3409,7 +3422,8 @@ pub fn small(input: i32) -> i32 {
         let pack = ContextPack::builder("invoice ledger")
             .file_candidates(vec![FileCandidate {
                 path: "src/payments.rs".to_string(),
-                score: source_embedding_score(2),
+                lexical_score: 0,
+                embedding_rank: Some(2),
                 language: Some("rust".to_string()),
                 size_bytes: Some(64),
             }])

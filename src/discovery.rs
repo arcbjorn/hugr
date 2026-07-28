@@ -3,28 +3,70 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A file the compiler is considering for the context pack, along with the
+/// evidence that put it there.
+///
+/// The two signals are kept apart on purpose. They used to share one `score`
+/// field, with embedding hits encoded as `10_000 + window - rank` and lexical
+/// hits scored 0..~30. Merging took the larger of the two, so every embedding
+/// hit outranked every filename match by three orders of magnitude, filled
+/// the candidate limit, and left the filename signal discarded before ranking
+/// ever ran — a task naming a file exactly would not rank that file first.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct FileCandidate {
     pub path: String,
-    pub score: usize,
+    /// Term overlap between the task and this file's name and path.
+    pub lexical_score: usize,
+    /// Position in the source-embedding similarity results, best rank first.
+    /// `None` when the embedding search did not return this file.
+    pub embedding_rank: Option<usize>,
     pub language: Option<String>,
     pub size_bytes: Option<u64>,
 }
 
-const SOURCE_EMBEDDING_SCORE_OFFSET: usize = 10_000;
-const SOURCE_EMBEDDING_RANK_WINDOW: usize = 1_000;
+/// Points per unit of lexical overlap. `candidate_for` awards 4 for a term
+/// found in the file name and 2 for one found elsewhere in the path.
+const LEXICAL_WEIGHT: usize = 20;
+/// Embedding ranks beyond this contribute nothing; past a couple of dozen
+/// results the ordering carries little signal.
+const EMBEDDING_RANK_WINDOW: usize = 25;
+/// Points per place gained within [`EMBEDDING_RANK_WINDOW`].
+///
+/// Deliberately scaled so the best possible embedding rank (24 * 3 = 72) sits
+/// just below a single file-name match (4 * 20 = 80). A name match is precise
+/// evidence — the task used a word that is in this file's name — whereas the
+/// default embedding is a hashed bag of words with no inverse-document
+/// weighting, so leading its similarity list says much less. The weight only
+/// affects comparisons *between* the two signals: when nothing matches by
+/// name every candidate scores zero lexically and the embedding still decides
+/// the order on its own.
+const EMBEDDING_WEIGHT: usize = 3;
+/// Awarded to files small enough to read in full within a token budget.
+const SMALL_FILE_BONUS: usize = 10;
+const SMALL_FILE_BYTES: u64 = 128_000;
 
-pub(crate) fn source_embedding_score(rank: usize) -> usize {
-    let rank = rank.clamp(1, SOURCE_EMBEDDING_RANK_WINDOW);
-    SOURCE_EMBEDDING_SCORE_OFFSET + SOURCE_EMBEDDING_RANK_WINDOW - rank
-}
-
-pub(crate) fn source_embedding_rank(score: usize) -> Option<usize> {
-    if score < SOURCE_EMBEDDING_SCORE_OFFSET {
-        return None;
+impl FileCandidate {
+    /// How strongly this candidate matches the task.
+    ///
+    /// Both signals add, rather than one overriding the other: a file that
+    /// matches by name *and* appears in the embedding results outranks one
+    /// that only appears in the embedding results, and a strong name match
+    /// can outrank a mediocre embedding rank.
+    pub(crate) fn relevance(&self) -> usize {
+        self.lexical_score * LEXICAL_WEIGHT + self.embedding_bonus() + self.size_bonus()
     }
-    let rank_score = (score - SOURCE_EMBEDDING_SCORE_OFFSET).min(SOURCE_EMBEDDING_RANK_WINDOW - 1);
-    Some(SOURCE_EMBEDDING_RANK_WINDOW - rank_score)
+
+    fn embedding_bonus(&self) -> usize {
+        self.embedding_rank.map_or(0, |rank| {
+            EMBEDDING_RANK_WINDOW.saturating_sub(rank.min(EMBEDDING_RANK_WINDOW)) * EMBEDDING_WEIGHT
+        })
+    }
+
+    fn size_bonus(&self) -> usize {
+        self.size_bytes.map_or(0, |bytes| {
+            usize::from(bytes <= SMALL_FILE_BYTES) * SMALL_FILE_BONUS
+        })
+    }
 }
 
 pub(crate) trait FileFinder {
@@ -120,9 +162,13 @@ pub(crate) fn merge_file_candidates(
             .find(|existing| existing.path == candidate.path)
         {
             Some(existing) => {
-                if candidate.score > existing.score {
-                    existing.score = candidate.score;
-                }
+                existing.lexical_score = existing.lexical_score.max(candidate.lexical_score);
+                existing.embedding_rank = match (existing.embedding_rank, candidate.embedding_rank)
+                {
+                    (Some(existing_rank), Some(new_rank)) => Some(existing_rank.min(new_rank)),
+                    (Some(rank), None) | (None, Some(rank)) => Some(rank),
+                    (None, None) => None,
+                };
                 if existing.language.is_none() {
                     existing.language = candidate.language;
                 }
@@ -135,8 +181,8 @@ pub(crate) fn merge_file_candidates(
     }
     merged.sort_by(|left, right| {
         right
-            .score
-            .cmp(&left.score)
+            .relevance()
+            .cmp(&left.relevance())
             .then_with(|| left.path.cmp(&right.path))
     });
     merged.truncate(limit);
@@ -156,8 +202,8 @@ fn rank_files(root: &Path, task: &str, files: Vec<PathBuf>, limit: usize) -> Vec
 
     scored.sort_by(|left, right| {
         right
-            .score
-            .cmp(&left.score)
+            .relevance()
+            .cmp(&left.relevance())
             .then_with(|| left.path.cmp(&right.path))
     });
     scored.truncate(limit);
@@ -198,7 +244,7 @@ fn candidate_for(root: &Path, path: &Path, terms: &[String]) -> Option<FileCandi
     file_candidate(root, path, score)
 }
 
-fn file_candidate(root: &Path, path: &Path, score: usize) -> Option<FileCandidate> {
+fn file_candidate(root: &Path, path: &Path, lexical_score: usize) -> Option<FileCandidate> {
     let display = normalized_relative_path(path);
     let language = language_for(path).map(str::to_string);
     let size_bytes = fs::metadata(root.join(path))
@@ -206,7 +252,8 @@ fn file_candidate(root: &Path, path: &Path, score: usize) -> Option<FileCandidat
         .map(|metadata| metadata.len());
     Some(FileCandidate {
         path: display,
-        score,
+        lexical_score,
+        embedding_rank: None,
         language,
         size_bytes,
     })
@@ -406,7 +453,9 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{WalkingFileFinder, discover_candidate_files};
+    use super::{
+        FileCandidate, WalkingFileFinder, discover_candidate_files, merge_file_candidates,
+    };
     use crate::discovery::FileFinder;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -477,5 +526,75 @@ mod tests {
             candidates.first().unwrap().language.as_deref(),
             Some("rust")
         );
+    }
+
+    fn candidate(path: &str, lexical_score: usize, embedding_rank: Option<usize>) -> FileCandidate {
+        FileCandidate {
+            path: path.to_string(),
+            lexical_score,
+            embedding_rank,
+            language: Some("rust".to_string()),
+            size_bytes: Some(1_000),
+        }
+    }
+
+    /// The regression this split exists for: the embedding signal used to be
+    /// encoded as `10_000 + window - rank` in the same field the lexical
+    /// score used, and merging kept the larger number. Every embedding hit
+    /// therefore outranked every filename match and filled the limit, so a
+    /// task naming a file exactly did not rank that file first.
+    #[test]
+    fn a_named_file_outranks_an_embedding_only_hit() {
+        let merged = merge_file_candidates(
+            vec![candidate("src/redact.rs", 4, None)],
+            vec![
+                candidate("src/main.rs", 0, Some(1)),
+                candidate("src/lib.rs", 0, Some(2)),
+            ],
+            3,
+        );
+
+        assert_eq!(merged[0].path, "src/redact.rs");
+    }
+
+    #[test]
+    fn both_signals_add_rather_than_one_winning() {
+        let named_and_embedded = candidate("src/redact.rs", 4, Some(4));
+        let named_only = candidate("src/redact.rs", 4, None);
+        let embedded_only = candidate("src/main.rs", 0, Some(4));
+
+        assert!(named_and_embedded.relevance() > named_only.relevance());
+        assert!(named_and_embedded.relevance() > embedded_only.relevance());
+    }
+
+    /// Merging the same path from both sources keeps the best of each signal.
+    #[test]
+    fn merging_a_path_from_both_sources_keeps_both_signals() {
+        let merged = merge_file_candidates(
+            vec![candidate("src/redact.rs", 6, None)],
+            vec![candidate("src/redact.rs", 0, Some(3))],
+            5,
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].lexical_score, 6);
+        assert_eq!(merged[0].embedding_rank, Some(3));
+    }
+
+    /// Embedding hits must still fill the pack when nothing matches by name,
+    /// which is the case the old ordering got right.
+    #[test]
+    fn embedding_hits_still_rank_when_no_name_matches() {
+        let merged = merge_file_candidates(
+            Vec::new(),
+            vec![
+                candidate("src/second.rs", 0, Some(2)),
+                candidate("src/first.rs", 0, Some(1)),
+            ],
+            2,
+        );
+
+        assert_eq!(merged[0].path, "src/first.rs");
+        assert_eq!(merged[1].path, "src/second.rs");
     }
 }

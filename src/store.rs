@@ -4825,7 +4825,8 @@ fn source_embedding_file_candidates_via_hugr_api(
         .map(
             |(index, (_score, path, language, size_bytes))| FileCandidate {
                 path,
-                score: crate::discovery::source_embedding_score(index + 1),
+                embedding_rank: Some(index + 1),
+                lexical_score: 0,
                 language,
                 size_bytes,
             },
@@ -11561,7 +11562,8 @@ async fn local_source_embedding_file_candidates(
             path: row.get::<String>(0)?,
             language: row.get::<Option<String>>(1)?,
             size_bytes,
-            score: crate::discovery::source_embedding_score(rank),
+            embedding_rank: Some(rank),
+            lexical_score: 0,
         });
     }
 
@@ -11828,7 +11830,7 @@ mod tests {
         sync_table_result_value, table_row_count,
     };
     use crate::code::{CodeReference, CodeSymbol};
-    use crate::discovery::{self, FileCandidate};
+    use crate::discovery::FileCandidate;
     use crate::embedding::{
         DEFAULT_EMBEDDING_DIMENSIONS, DETERMINISTIC_MODEL, SelectedEmbeddingProvider,
     };
@@ -12858,7 +12860,8 @@ mod tests {
             .store
             .record_discovered_files(&[FileCandidate {
                 path: "src/plugin_hooks.rs".to_string(),
-                score: 1,
+                lexical_score: 1,
+                embedding_rank: None,
                 language: Some("rust".to_string()),
                 size_bytes: Some(128),
             }])
@@ -12888,7 +12891,8 @@ mod tests {
             .record_code_index(
                 &[FileCandidate {
                     path: "src/plugin_hooks.rs".to_string(),
-                    score: 1,
+                    lexical_score: 1,
+                    embedding_rank: None,
                     language: Some("rust".to_string()),
                     size_bytes: Some(128),
                 }],
@@ -13002,7 +13006,8 @@ mod tests {
         };
         let file = FileCandidate {
             path: "src/plugin_hooks.rs".to_string(),
-            score: 1,
+            lexical_score: 1,
+            embedding_rank: None,
             language: Some("rust".to_string()),
             size_bytes: Some(128),
         };
@@ -13135,7 +13140,8 @@ mod tests {
         test.store
             .record_discovered_files(&[FileCandidate {
                 path: "src/plugin_hooks.rs".to_string(),
-                score: 1,
+                lexical_score: 1,
+                embedding_rank: None,
                 language: Some("rust".to_string()),
                 size_bytes: Some(128),
             }])
@@ -13173,7 +13179,8 @@ mod tests {
             .store
             .record_discovered_files(&[FileCandidate {
                 path: "src/plugin_hooks.rs".to_string(),
-                score: 1,
+                lexical_score: 1,
+                embedding_rank: None,
                 language: Some("rust".to_string()),
                 size_bytes: Some(128),
             }])
@@ -13817,7 +13824,8 @@ mod tests {
         let test = TestStore::new("discovered_files");
         let file = FileCandidate {
             path: "src/plugin_hooks.rs".to_string(),
-            score: 12,
+            lexical_score: 12,
+            embedding_rank: None,
             language: Some("rust".to_string()),
             size_bytes: Some(42),
         };
@@ -13853,7 +13861,8 @@ mod tests {
         let test = TestStore::new("code_symbols");
         let file = FileCandidate {
             path: "src/plugin_hooks.rs".to_string(),
-            score: 0,
+            lexical_score: 0,
+            embedding_rank: None,
             language: Some("rust".to_string()),
             size_bytes: Some(120),
         };
@@ -13897,7 +13906,8 @@ mod tests {
         let test = TestStore::new("symbol_prefilter");
         let target_file = FileCandidate {
             path: "src/zz_special.rs".to_string(),
-            score: 0,
+            lexical_score: 0,
+            embedding_rank: None,
             language: Some("rust".to_string()),
             size_bytes: Some(120),
         };
@@ -13923,7 +13933,8 @@ mod tests {
         // recency-ordered scan without a prefilter would never see the target.
         let filler_file = FileCandidate {
             path: "src/aa_filler.rs".to_string(),
-            score: 0,
+            lexical_score: 0,
+            embedding_rank: None,
             language: Some("rust".to_string()),
             size_bytes: Some(120),
         };
@@ -13968,13 +13979,15 @@ mod tests {
         let test = TestStore::new("code_index_metadata");
         let source_file = FileCandidate {
             path: "src/plugin_hooks.rs".to_string(),
-            score: 0,
+            lexical_score: 0,
+            embedding_rank: None,
             language: Some("rust".to_string()),
             size_bytes: Some(120),
         };
         let test_file = FileCandidate {
             path: "tests/plugin_hooks.rs".to_string(),
-            score: 0,
+            lexical_score: 0,
+            embedding_rank: None,
             language: Some("rust".to_string()),
             size_bytes: Some(90),
         };
@@ -14056,7 +14069,8 @@ mod tests {
         let test = TestStore::new("source_embedding_candidates");
         let file = FileCandidate {
             path: "src/payments.rs".to_string(),
-            score: 0,
+            lexical_score: 0,
+            embedding_rank: None,
             language: Some("rust".to_string()),
             size_bytes: Some(160),
         };
@@ -14091,7 +14105,7 @@ mod tests {
 
         assert_eq!(candidates[0].path, "src/payments.rs");
         assert_eq!(candidates[0].language.as_deref(), Some("rust"));
-        assert!(discovery::source_embedding_rank(candidates[0].score).is_some());
+        assert!(candidates[0].embedding_rank.is_some());
     }
 
     #[tokio::test]
@@ -14099,13 +14113,15 @@ mod tests {
         let test = TestStore::new("code_references");
         let source = FileCandidate {
             path: "src/main.rs".to_string(),
-            score: 0,
+            lexical_score: 0,
+            embedding_rank: None,
             language: Some("rust".to_string()),
             size_bytes: Some(80),
         };
         let target = FileCandidate {
             path: "src/plugin_hooks.rs".to_string(),
-            score: 0,
+            lexical_score: 0,
+            embedding_rank: None,
             language: Some("rust".to_string()),
             size_bytes: Some(120),
         };
@@ -14174,13 +14190,15 @@ mod tests {
 
         let kept = FileCandidate {
             path: "src/main.rs".to_string(),
-            score: 0,
+            lexical_score: 0,
+            embedding_rank: None,
             language: Some("rust".to_string()),
             size_bytes: Some(80),
         };
         let deleted = FileCandidate {
             path: "src/deleted.rs".to_string(),
-            score: 0,
+            lexical_score: 0,
+            embedding_rank: None,
             language: Some("rust".to_string()),
             size_bytes: Some(120),
         };
@@ -14272,13 +14290,15 @@ mod tests {
         let test = TestStore::new("context_graph_neighbors");
         let source = FileCandidate {
             path: "src/main.rs".to_string(),
-            score: 0,
+            lexical_score: 0,
+            embedding_rank: None,
             language: Some("rust".to_string()),
             size_bytes: Some(80),
         };
         let target = FileCandidate {
             path: "src/plugin_hooks.rs".to_string(),
-            score: 0,
+            lexical_score: 0,
+            embedding_rank: None,
             language: Some("rust".to_string()),
             size_bytes: Some(120),
         };
@@ -14465,13 +14485,15 @@ mod tests {
         let files = vec![
             FileCandidate {
                 path: "src/plugin_hooks.rs".to_string(),
-                score: 0,
+                lexical_score: 0,
+                embedding_rank: None,
                 language: Some("rust".to_string()),
                 size_bytes: Some(120),
             },
             FileCandidate {
                 path: "tests/plugin_hooks.rs".to_string(),
-                score: 0,
+                lexical_score: 0,
+                embedding_rank: None,
                 language: Some("rust".to_string()),
                 size_bytes: Some(90),
             },

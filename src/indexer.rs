@@ -324,7 +324,8 @@ mod tests {
     fn file(path: &str, language: Option<&str>) -> FileCandidate {
         FileCandidate {
             path: path.to_string(),
-            score: 0,
+            lexical_score: 0,
+            embedding_rank: None,
             language: language.map(str::to_string),
             size_bytes: None,
         }

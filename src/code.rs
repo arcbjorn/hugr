@@ -2593,7 +2593,8 @@ fn main() {
             .iter()
             .map(|path| FileCandidate {
                 path: (*path).to_string(),
-                score: 0,
+                lexical_score: 0,
+                embedding_rank: None,
                 language: Some("typescript".to_string()),
                 size_bytes: None,
             })
@@ -2731,7 +2732,8 @@ pub fn execute(registry: &PluginRegistry) {
     fn candidate(path: &str) -> FileCandidate {
         FileCandidate {
             path: path.to_string(),
-            score: 0,
+            lexical_score: 0,
+            embedding_rank: None,
             language: Some("rust".to_string()),
             size_bytes: None,
         }
