@@ -10,6 +10,15 @@ readme = "README.md"
 keywords = ["agent", "memory", "mcp", "code-intelligence", "context"]
 categories = ["command-line-utilities", "development-tools"]
 
+[lints.rust]
+# Nothing in the crate needs raw memory access; make that a compile error
+# rather than a convention, so it stays true.
+unsafe_code = "forbid"
+# Every module behind `lib.rs` is private, so a bare `pub` overstates the
+# surface. Keeping this on means the real public API stays legible.
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
 [lints.clippy]
 # A handful of internal helpers (reference rewriting, risk scoring, sync run
 # recording) thread a wide but flat set of inputs through a single call site.
