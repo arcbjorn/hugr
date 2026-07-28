@@ -717,7 +717,7 @@ fn sync_api_auth_failure_response(
         ));
     };
     let authorization = request_header(request, "authorization").unwrap_or_default();
-    if authorization != format!("Bearer {api_token}") {
+    if !constant_time_eq(&authorization, &format!("Bearer {api_token}")) {
         return Some(http_response(
             401,
             "application/json",
@@ -725,6 +725,21 @@ fn sync_api_auth_failure_response(
         ));
     }
     None
+}
+
+/// Compares two secrets without short-circuiting on the first differing byte.
+/// The daemon is reachable over TCP, so a length-independent early exit would
+/// let a caller recover the token one byte at a time from response timing.
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let mut difference = u8::from(left.len() != right.len());
+    for index in 0..left.len().max(right.len()) {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        difference |= left_byte ^ right_byte;
+    }
+    difference == 0
 }
 
 fn request_header(request: &HttpRequest, name: &str) -> Option<String> {
@@ -1234,7 +1249,7 @@ impl DaemonState {
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonState, HUGR_API_CONTRACT_VERSION, is_ignored_watch_path,
+        DaemonState, HUGR_API_CONTRACT_VERSION, constant_time_eq, is_ignored_watch_path,
         parse_memory_api_apply_request, parse_storage_api_apply_request,
         render_refresh_capture_detail, render_session_observation_detail, request_line_parts,
         response_for_request_with_api_token,
@@ -1251,6 +1266,16 @@ mod tests {
         let request = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
 
         assert_eq!(request_line_parts(request), Some(("GET", "/health")));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_string_equality() {
+        assert!(constant_time_eq("Bearer secret", "Bearer secret"));
+        assert!(constant_time_eq("", ""));
+        assert!(!constant_time_eq("Bearer secret", "Bearer secreT"));
+        assert!(!constant_time_eq("Bearer secret", "Bearer secret "));
+        assert!(!constant_time_eq("Bearer secret", ""));
+        assert!(!constant_time_eq("", "Bearer secret"));
     }
 
     #[tokio::test]
