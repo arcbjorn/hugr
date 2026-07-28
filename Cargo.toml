@@ -77,3 +77,16 @@ tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
 tree-sitter-swift = "0.7.3"
 tree-sitter-typescript = "0.23.2"
+
+# `cargo install --path .` is the documented way to get Hugr, so the release
+# profile is tuned for the shipped binary rather than for build time: whole
+# program optimisation across crate boundaries, no parallel-codegen penalty,
+# and no debug symbols in what users install.
+#
+# `panic = "abort"` is deliberately absent: the daemon serves each connection
+# and each background job on its own task, and unwinding is what lets tokio
+# contain a panic in one of them instead of taking the whole daemon down.
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
