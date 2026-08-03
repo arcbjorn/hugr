@@ -56,6 +56,27 @@ static SECRET_FLAG: LazyLock<Regex> = LazyLock::new(|| {
     .expect("flag pattern should compile")
 });
 
+/// `-p` used as a password flag, which [`SECRET_FLAG`] cannot catch because
+/// the flag name carries no hint of what it holds.
+///
+/// `-p` is badly overloaded — it is the port flag for `ssh` and the project
+/// flag elsewhere — so only the two unambiguous spellings are redacted:
+///
+/// - the value attached to the flag (`mysql -pHunter2`), which no tool uses
+///   for a port, and
+/// - `-p <value>` immediately after a `login` subcommand (`docker login -p x`).
+///
+/// `ssh -p 2222 host` therefore keeps its port, which matters because these
+/// command lines feed the diagnostics and session history an agent reads back.
+static ATTACHED_PASSWORD_FLAG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(\s-p)([^\s-][^\s]{2,})").expect("attached password pattern should compile")
+});
+
+static LOGIN_PASSWORD_FLAG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(\blogin\b[^\n]*?\s-p\s+)([^\s][^\s]*)")
+        .expect("login password pattern should compile")
+});
+
 /// user:password@ credentials embedded in URLs.
 static URL_USERINFO: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(://[^/\s:@]+):([^@/\s]+)@").expect("url pattern should compile")
@@ -72,6 +93,12 @@ pub(crate) fn redact_secrets(text: &str) -> String {
         .replace_all(&redacted, format!("${{1}}{REPLACEMENT}"))
         .into_owned();
     redacted = SECRET_FLAG
+        .replace_all(&redacted, format!("${{1}}{REPLACEMENT}"))
+        .into_owned();
+    redacted = LOGIN_PASSWORD_FLAG
+        .replace_all(&redacted, format!("${{1}}{REPLACEMENT}"))
+        .into_owned();
+    redacted = ATTACHED_PASSWORD_FLAG
         .replace_all(&redacted, format!("${{1}}{REPLACEMENT}"))
         .into_owned();
     redacted = URL_USERINFO
@@ -159,6 +186,35 @@ mod tests {
         assert!(!redacted.contains("MIIEow"));
         assert!(redacted.contains("postgres://hugr:[REDACTED]@db.host/prod"));
         assert!(!redacted.contains("supersecret"));
+    }
+
+    /// `-p` carries no hint of its contents, so the named-flag pattern misses
+    /// it and `docker login -p hunter2` was stored in the clear.
+    #[test]
+    fn redacts_the_password_spellings_of_the_p_flag() {
+        let redacted = redact_secrets("mysql -u root -pP@ssw0rd123 mydb");
+        assert!(redacted.contains("-p[REDACTED]"), "{redacted}");
+        assert!(!redacted.contains("P@ssw0rd123"));
+        // The unrelated `-u root` is untouched.
+        assert!(redacted.contains("-u root"));
+
+        let redacted = redact_secrets("docker login -u me -p SuperSecret123");
+        assert!(!redacted.contains("SuperSecret123"), "{redacted}");
+    }
+
+    /// `-p` is the port flag for ssh and the project flag elsewhere. These
+    /// command lines feed diagnostics and session history an agent reads back,
+    /// so over-redacting costs real context.
+    #[test]
+    fn leaves_non_password_p_flags_alone() {
+        assert_eq!(
+            redact_secrets("ssh -p 2222 deploy@host"),
+            "ssh -p 2222 deploy@host"
+        );
+        assert_eq!(
+            redact_secrets("docker compose -p myproject up"),
+            "docker compose -p myproject up"
+        );
     }
 
     #[test]
