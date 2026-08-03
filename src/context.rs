@@ -2251,6 +2251,26 @@ fn build_citations(pack: &ContextPack) -> Vec<Citation> {
     citations
 }
 
+/// Items each evidence section keeps before cross-section eviction may touch
+/// it.
+///
+/// Evidence scores are only comparable *within* a section: every section adds
+/// its own base constant (files 400, symbols 600, memories 700, stale risks
+/// 900), so the numbers rank items against their peers but say nothing across
+/// sections. Eviction pops the globally lowest score, which turned those bases
+/// into a fixed section priority — and `FILE_EVIDENCE_BASE` is the lowest of
+/// them all. A tight budget therefore emptied `relevant_files` completely
+/// while symbols and memories survived on nothing but a bigger base: `hugr
+/// context "discovery blend lexical and embedding signals"` reported
+/// `truncated relevant_files: 12` and then printed "No file candidates found
+/// yet", discarding `src/discovery.rs` for a task about that very file.
+///
+/// The floor keeps the strongest few items of each section reachable, so a
+/// squeezed pack degrades to a thinner version of every section instead of
+/// losing whole kinds of evidence. Sections are still trimmed below the floor
+/// once everything else is at its floor, so the budget is always met.
+const SECTION_RETENTION_FLOOR: usize = 3;
+
 fn remove_lowest_priority_context_item(
     pack: &mut ContextPack,
     truncated_sections: &mut Vec<ContextBudgetTruncation>,
@@ -2266,36 +2286,13 @@ fn remove_lowest_priority_context_item(
         return true;
     }
 
-    let mut weakest = None;
-    if let Some(fact) = pack.recent_sessions.last() {
-        consider_weakest_evidence(&mut weakest, "recent_sessions", fact.evidence_score, 0);
-    }
-    if let Some(test) = pack.affected_tests.last() {
-        consider_weakest_evidence(&mut weakest, "affected_tests", test.evidence_score, 1);
-    }
-    if let Some(neighbor) = pack.graph_neighbors.last() {
-        consider_weakest_evidence(&mut weakest, "graph_neighbors", neighbor.evidence_score, 2);
-    }
-    if let Some(file) = pack.relevant_files.last() {
-        consider_weakest_evidence(&mut weakest, "relevant_files", file.evidence_score, 3);
-    }
-    if let Some(symbol) = pack.important_symbols.last() {
-        consider_weakest_evidence(&mut weakest, "important_symbols", symbol.evidence_score, 4);
-    }
-    if let Some(risk) = pack.stale_memory_risks.last() {
-        consider_weakest_evidence(&mut weakest, "stale_memory_risks", risk.evidence_score, 5);
-    }
-    if let Some(diagnostic) = pack.diagnostics.last() {
-        consider_weakest_evidence(&mut weakest, "diagnostics", diagnostic.evidence_score, 6);
-    }
-    if let Some(risk) = pack.risk_signals.last() {
-        consider_weakest_evidence(&mut weakest, "risk_signals", risk.evidence_score, 7);
-    }
-    if let Some(memory) = pack.relevant_memories.last() {
-        consider_weakest_evidence(&mut weakest, "relevant_memories", memory.evidence_score, 8);
-    }
+    // Trim only what sits above each section's floor; if every section is
+    // already at its floor there is nothing protected left to save, so run
+    // again with the floor lifted rather than leaving the budget unmet.
+    let weakest = weakest_evidence_section(pack, SECTION_RETENTION_FLOOR)
+        .or_else(|| weakest_evidence_section(pack, 0));
 
-    match weakest.map(|(_, _, section)| section) {
+    match weakest {
         Some("recent_sessions") => {
             pack.recent_sessions.pop();
             record_truncation(truncated_sections, "recent_sessions");
@@ -2343,6 +2340,49 @@ fn remove_lowest_priority_context_item(
         }
         _ => false,
     }
+}
+
+/// Picks the weakest trailing item across the evidence sections, ignoring any
+/// section already down to `floor` items.
+///
+/// Returns `None` when every section is at or below `floor`, which is the
+/// caller's signal to retry with a lower floor.
+fn weakest_evidence_section(pack: &ContextPack, floor: usize) -> Option<&'static str> {
+    let mut weakest = None;
+    if let Some(fact) = trailing_above_floor(&pack.recent_sessions, floor) {
+        consider_weakest_evidence(&mut weakest, "recent_sessions", fact.evidence_score, 0);
+    }
+    if let Some(test) = trailing_above_floor(&pack.affected_tests, floor) {
+        consider_weakest_evidence(&mut weakest, "affected_tests", test.evidence_score, 1);
+    }
+    if let Some(neighbor) = trailing_above_floor(&pack.graph_neighbors, floor) {
+        consider_weakest_evidence(&mut weakest, "graph_neighbors", neighbor.evidence_score, 2);
+    }
+    if let Some(file) = trailing_above_floor(&pack.relevant_files, floor) {
+        consider_weakest_evidence(&mut weakest, "relevant_files", file.evidence_score, 3);
+    }
+    if let Some(symbol) = trailing_above_floor(&pack.important_symbols, floor) {
+        consider_weakest_evidence(&mut weakest, "important_symbols", symbol.evidence_score, 4);
+    }
+    if let Some(risk) = trailing_above_floor(&pack.stale_memory_risks, floor) {
+        consider_weakest_evidence(&mut weakest, "stale_memory_risks", risk.evidence_score, 5);
+    }
+    if let Some(diagnostic) = trailing_above_floor(&pack.diagnostics, floor) {
+        consider_weakest_evidence(&mut weakest, "diagnostics", diagnostic.evidence_score, 6);
+    }
+    if let Some(risk) = trailing_above_floor(&pack.risk_signals, floor) {
+        consider_weakest_evidence(&mut weakest, "risk_signals", risk.evidence_score, 7);
+    }
+    if let Some(memory) = trailing_above_floor(&pack.relevant_memories, floor) {
+        consider_weakest_evidence(&mut weakest, "relevant_memories", memory.evidence_score, 8);
+    }
+    weakest.map(|(_, _, section)| section)
+}
+
+/// The last item of `items`, or `None` when removing it would drop the section
+/// to `floor`. Sections are ranked best-first, so the last item is the weakest.
+fn trailing_above_floor<T>(items: &[T], floor: usize) -> Option<&T> {
+    (items.len() > floor).then(|| items.last()).flatten()
 }
 
 fn consider_weakest_evidence(
@@ -3577,6 +3617,79 @@ pub fn small(input: i32) -> i32 {
         assert!(markdown.contains("- truncated relevant_files: 2 item(s)"));
         assert!(json.contains("\"budget\""));
         assert!(json.contains("\"section\":\"relevant_files\""));
+    }
+
+    /// A discovered file with a lexical score, as `discover_candidate_files`
+    /// would return it.
+    fn candidate_named(path: &str, lexical_score: usize) -> FileCandidate {
+        FileCandidate {
+            path: path.to_string(),
+            lexical_score,
+            embedding_rank: None,
+            language: Some("rust".to_string()),
+            size_bytes: Some(2_000),
+        }
+    }
+
+    /// The regression the retention floor exists for. Evidence scores carry a
+    /// per-section base (files 400, symbols 600, memories 700), so comparing
+    /// them across sections ranked whole *sections*, not items: files scored
+    /// lowest by construction and a squeezed budget emptied `relevant_files`
+    /// outright while weaker symbols and memories survived. `hugr context`
+    /// then printed "No file candidates found yet" for a task whose files it
+    /// had ranked first.
+    #[test]
+    fn budget_pressure_keeps_files_rather_than_emptying_the_section() {
+        let memories = (0..8)
+            .map(|index| Memory {
+                id: format!("mem_{index}"),
+                created_at_ms: index,
+                kind: "fact".to_string(),
+                text: format!("plugin hooks note number {index} with padding text"),
+                structured_payload: None,
+            })
+            .collect::<Vec<_>>();
+        let mut pack = ContextPack::builder("plugin hooks")
+            .file_candidates(vec![
+                candidate_named("src/plugin_hooks.rs", 4),
+                candidate_named("src/plugin_registry.rs", 2),
+                candidate_named("src/config.rs", 0),
+                candidate_named("src/unrelated.rs", 0),
+            ])
+            .memories(memories)
+            .build();
+
+        // Tight enough to force eviction, loose enough that the pack can
+        // still hold each section's floor.
+        pack.apply_token_budget(500);
+
+        assert!(
+            !pack.relevant_files.is_empty(),
+            "files must survive while other sections still have items above the floor"
+        );
+        assert!(
+            pack.budget
+                .truncated_sections
+                .iter()
+                .any(|truncation| truncation.section == "relevant_memories"),
+            "the larger, higher-based section should absorb the truncation"
+        );
+    }
+
+    /// The floor is a preference between sections, not a budget escape hatch:
+    /// once every section sits at the floor, eviction keeps going.
+    #[test]
+    fn the_retention_floor_still_yields_to_a_hard_budget() {
+        let mut pack = ContextPack::builder("plugin hooks")
+            .files(vec![
+                "src/plugin_hooks.rs".to_string(),
+                "src/plugin_registry.rs".to_string(),
+            ])
+            .build();
+
+        pack.apply_token_budget(1);
+
+        assert!(pack.relevant_files.is_empty());
     }
 
     #[test]
