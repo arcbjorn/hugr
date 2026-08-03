@@ -970,9 +970,12 @@ if [[ -z "${HUGR_SHELL_HOOK_LOADED:-}" ]]; then
     HUGR_LAST_COMMAND="$1"
   }
   _hugr_precmd() {
-    local status=$?
+    # `status` is a read-only alias for `$?` in zsh, so `local status=$?`
+    # aborts the function with "read-only variable: status" on every prompt
+    # and the observe call below never runs.
+    local hugr_status=$?
     if [[ -n "${HUGR_LAST_COMMAND:-}" ]]; then
-      command "${HUGR_BIN:-hugr}" observe command --status "$status" -- "$HUGR_LAST_COMMAND" >/dev/null 2>&1 || true
+      command "${HUGR_BIN:-hugr}" observe command --status "$hugr_status" -- "$HUGR_LAST_COMMAND" >/dev/null 2>&1 || true
       unset HUGR_LAST_COMMAND
     fi
   }
@@ -993,9 +996,11 @@ if [[ -z "${HUGR_SHELL_HOOK_LOADED:-}" ]]; then
     HUGR_LAST_COMMAND="$command_line"
   }
   _hugr_prompt_command() {
-    local status=$?
+    # `status` is not special in bash, but the zsh hook cannot use that name
+    # and keeping both the same avoids reintroducing the difference.
+    local hugr_status=$?
     if [[ -n "${HUGR_LAST_COMMAND:-}" ]]; then
-      command "${HUGR_BIN:-hugr}" observe command --status "$status" -- "$HUGR_LAST_COMMAND" >/dev/null 2>&1 || true
+      command "${HUGR_BIN:-hugr}" observe command --status "$hugr_status" -- "$HUGR_LAST_COMMAND" >/dev/null 2>&1 || true
       unset HUGR_LAST_COMMAND
     fi
   }
@@ -1851,6 +1856,70 @@ mod tests {
         assert!(bash.contains("trap _hugr_debug_trap DEBUG"));
         assert!(bash.contains("observe command --status"));
         assert!(shell_hook_text("fish").is_err());
+    }
+
+    /// The hooks are shell source, so substring assertions cannot tell whether
+    /// they actually run. `local status=$?` passes every text check and still
+    /// aborts `_hugr_precmd` on each prompt, because `status` is a read-only
+    /// alias for `$?` in zsh — the observe call never fired and every prompt
+    /// printed "read-only variable: status".
+    ///
+    /// Skipped when the shell is unavailable rather than failing, so the suite
+    /// still runs on machines without zsh.
+    #[test]
+    fn the_zsh_hook_runs_without_shell_errors() {
+        let Some(output) = run_hook_in_shell(
+            "zsh",
+            &["-f", "-c"],
+            shell_hook_text("zsh").unwrap(),
+            "HUGR_BIN=/bin/echo; HUGR_LAST_COMMAND='ls -la'; _hugr_precmd",
+        ) else {
+            return;
+        };
+
+        assert!(
+            !output.contains("read-only"),
+            "zsh hook reported a shell error: {output}"
+        );
+        assert!(
+            output.contains("observe command"),
+            "zsh hook did not reach the observe call: {output}"
+        );
+    }
+
+    #[test]
+    fn the_bash_hook_runs_without_shell_errors() {
+        let Some(output) = run_hook_in_shell(
+            "bash",
+            &["--noprofile", "--norc", "-c"],
+            shell_hook_text("bash").unwrap(),
+            "HUGR_BIN=/bin/echo; HUGR_LAST_COMMAND='ls -la'; _hugr_prompt_command",
+        ) else {
+            return;
+        };
+
+        assert!(
+            output.contains("observe command"),
+            "bash hook did not reach the observe call: {output}"
+        );
+    }
+
+    /// Sources `hook` in `shell` and runs `script`, returning the combined
+    /// output. `None` means the shell is not installed.
+    ///
+    /// The hook silences the observe call with `>/dev/null 2>&1`, so the
+    /// redirect is stripped to make the call observable.
+    fn run_hook_in_shell(shell: &str, args: &[&str], hook: &str, script: &str) -> Option<String> {
+        let hook = hook.replace(">/dev/null 2>&1", "");
+        let output = std::process::Command::new(shell)
+            .args(args)
+            .arg(format!("{hook}\n{script}\n"))
+            .output()
+            .ok()?;
+
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        Some(combined)
     }
 
     #[test]
