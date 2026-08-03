@@ -34,16 +34,31 @@ pub(crate) async fn serve_stdio() -> Result<()> {
 }
 
 async fn handle_line(line: &str) -> Option<String> {
-    let request = match serde_json::from_str::<Value>(line) {
-        Ok(request) => handle_request(request).await,
-        Err(error) => Err(json_error(
-            Value::Null,
-            -32700,
-            &format!("parse error: {error}"),
-        )),
+    let (request, is_notification) = match serde_json::from_str::<Value>(line) {
+        // A request without `id` is a notification: JSON-RPC 2.0 forbids
+        // replying to one, including with an error. Deciding that here keeps
+        // it true for every method, rather than relying on each arm of
+        // `handle_request` to remember. Clients send `notifications/cancelled`
+        // and `notifications/progress` routinely, and an unsolicited reply to
+        // those is an unmatched id the client has to discard.
+        Ok(request) => {
+            let is_notification = request.get("id").is_none();
+            (handle_request(request).await, is_notification)
+        }
+        // A parse error has no recoverable id, so this cannot be attributed to
+        // a notification; the spec's own example replies with a null id.
+        Err(error) => (
+            Err(json_error(
+                Value::Null,
+                -32700,
+                &format!("parse error: {error}"),
+            )),
+            false,
+        ),
     };
 
     match request {
+        _ if is_notification => None,
         Ok(Some(response)) => Some(response.to_string()),
         Ok(None) => None,
         Err(error) => Some(error.to_string()),
@@ -921,6 +936,47 @@ mod tests {
 
         assert_eq!(value["id"], 1);
         assert_eq!(value["result"]["serverInfo"]["name"], "hugr");
+    }
+
+    /// JSON-RPC 2.0: "The Server MUST NOT reply to a Notification." A
+    /// notification is a request with no `id`, whatever its method — so an
+    /// unknown or failing one stays silent too. `notifications/cancelled` used
+    /// to draw an `unknown method` error carrying `"id":null`, which is an
+    /// unmatched response the client can only discard.
+    #[tokio::test]
+    async fn notifications_never_get_a_response() {
+        for line in [
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"an/unknown/notification"}"#,
+        ] {
+            assert_eq!(handle_line(line).await, None, "replied to {line}");
+        }
+    }
+
+    /// The mirror of the rule: an explicit `id` is a request, so it is still
+    /// answered — including when the method is unknown.
+    #[tokio::test]
+    async fn requests_with_an_id_still_get_errors() {
+        let response = handle_line(r#"{"jsonrpc":"2.0","id":7,"method":"nope"}"#)
+            .await
+            .expect("a request carrying an id must be answered");
+        let value = serde_json::from_str::<Value>(&response).unwrap();
+
+        assert_eq!(value["id"], 7);
+        assert_eq!(value["error"]["code"], -32601);
+    }
+
+    /// Malformed JSON has no id to read, so it cannot be attributed to a
+    /// notification and is still reported with a null id.
+    #[tokio::test]
+    async fn parse_errors_are_still_reported() {
+        let response = handle_line("{not json").await.expect("parse error replies");
+        let value = serde_json::from_str::<Value>(&response).unwrap();
+
+        assert_eq!(value["error"]["code"], -32700);
+        assert_eq!(value["id"], Value::Null);
     }
 
     #[test]
