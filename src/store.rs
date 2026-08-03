@@ -34,6 +34,7 @@ pub(crate) const HUGR_API_ROUTES: &[&str] = &[
 ];
 static SESSION_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static DIAGNOSTIC_COUNTER: AtomicU64 = AtomicU64::new(0);
+static MEMORY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StorageMode {
@@ -2941,7 +2942,7 @@ fn hugr_api_remember_payloads(
     let project = project_from_input(current_project_input()?, now);
     let structured_payload = memory_write_payload(&options, Some(&project), false);
     let memory = Memory {
-        id: format!("mem_{now}"),
+        id: memory_id(now),
         created_at_ms: now,
         kind: "fact".to_string(),
         text: text.trim().to_string(),
@@ -2999,7 +3000,7 @@ fn hugr_api_session_promotion_payloads(
         session, facts, project, synthesis,
     ));
     let memory = Memory {
-        id: format!("mem_{now}"),
+        id: memory_id(now),
         created_at_ms: now,
         kind: "fact".to_string(),
         text: synthesis.map_or_else(
@@ -4742,6 +4743,23 @@ fn diagnostic_from_sync_record(record: DiagnosticSyncRecord) -> Diagnostic {
 fn diagnostic_id(created_at_ms: i64) -> String {
     let sequence = DIAGNOSTIC_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("diag_{created_at_ms}_{sequence}")
+}
+
+/// Builds a memory id that stays unique when several are minted in the same
+/// millisecond.
+///
+/// `memories.id` is the primary key and the target of `superseded_by` and the
+/// embedding table's foreign key, so a duplicate is a failed write rather than
+/// a cosmetic clash. The id used to be `mem_{created_at_ms}` alone, and
+/// `now_ms` has millisecond resolution: in a tight loop 99.99% of consecutive
+/// calls return the same value. Only the latency of the intervening database
+/// write kept ids apart — a real but incidental guarantee, and not one that
+/// holds for the payload builders, which mint an id with no write in between.
+/// The counter mirrors [`diagnostic_id`] and the session-event id, which
+/// already carry one for the same reason.
+fn memory_id(created_at_ms: i64) -> String {
+    let sequence = MEMORY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("mem_{created_at_ms}_{sequence}")
 }
 
 fn likely_tests_for_files_via_hugr_api(
@@ -8532,7 +8550,7 @@ async fn insert_memory(
 ) -> Result<Memory> {
     let created_at_ms = now_ms()?;
     let memory = Memory {
-        id: format!("mem_{created_at_ms}"),
+        id: memory_id(created_at_ms),
         created_at_ms,
         kind: "fact".to_string(),
         text: text.trim().to_string(),
@@ -11821,7 +11839,7 @@ mod tests {
         SyncTableResult, apply_api_pull_payloads, code_symbol_score, fts_query,
         hugr_api_memory_apply_request, hugr_api_remember_payloads, hugr_api_route_url,
         hugr_api_session_promotion_payloads, hugr_api_storage_apply_request, hugr_api_sync_request,
-        memory_record_promotes_session, parse_hugr_api_history_response,
+        memory_id, memory_record_promotes_session, parse_hugr_api_history_response,
         parse_hugr_api_memory_apply_response, parse_hugr_api_memory_records_response,
         parse_hugr_api_storage_apply_response, parse_hugr_api_storage_snapshot_response,
         parse_hugr_api_sync_response, planned_storage_table_result, planned_sync_table_result,
@@ -11838,6 +11856,29 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    /// `memories.id` is the primary key and the target of `superseded_by` and
+    /// the embedding table's foreign key, so a duplicate is a failed write.
+    /// The id was `mem_{created_at_ms}` with nothing else in it, and `now_ms`
+    /// only has millisecond resolution — a fixed timestamp is exactly the case
+    /// that used to produce the same id twice.
+    #[test]
+    fn memory_ids_are_unique_within_one_millisecond() {
+        let ids = (0..1000)
+            .map(|_| memory_id(1_700_000_000_000))
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(ids.len(), 1000, "ids minted in one millisecond collided");
+    }
+
+    /// The timestamp still leads, so ids stay sortable by creation time and
+    /// keep the `mem_` prefix every stored row and sync payload already uses.
+    #[test]
+    fn memory_ids_keep_their_prefix_and_timestamp() {
+        let id = memory_id(1_700_000_000_000);
+
+        assert!(id.starts_with("mem_1700000000000"), "unexpected id {id}");
+    }
 
     struct TestStore {
         store: Store,
