@@ -129,9 +129,34 @@ async fn handle_client(
     peer_addr: SocketAddr,
     state: Arc<DaemonState>,
 ) -> Result<()> {
-    let request = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, read_http_request(&mut stream))
-        .await
-        .map_err(|_| Error::msg("timed out reading HTTP request"))??;
+    // A request the reader rejects still deserves an HTTP answer. Returning
+    // early here used to close the connection without writing anything, so a
+    // client sending a bad `Content-Length`, an oversized body, or invalid
+    // UTF-8 could not tell a rejected request apart from a crashed daemon or a
+    // dropped network.
+    let request =
+        match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, read_http_request(&mut stream)).await {
+            Ok(Ok(request)) => request,
+            Ok(Err(error)) => {
+                let status = error_status_code(&error);
+                let response = http_response(
+                    status,
+                    "application/json",
+                    &render_error_json(&error.to_string()),
+                );
+                stream.write_all(response.as_bytes()).await?;
+                return stream.shutdown().await.map_err(Error::from);
+            }
+            Err(_) => {
+                let response = http_response(
+                    408,
+                    "application/json",
+                    &render_error_json("timed out reading HTTP request"),
+                );
+                stream.write_all(response.as_bytes()).await?;
+                return stream.shutdown().await.map_err(Error::from);
+            }
+        };
     if request.is_empty() {
         return Ok(());
     }
@@ -139,6 +164,18 @@ async fn handle_client(
     let response = response_for_request(&request, peer_addr, &state).await;
     stream.write_all(response.as_bytes()).await?;
     stream.shutdown().await.map_err(Error::from)
+}
+
+/// Maps a request-reading failure to the status a client should see.
+///
+/// Only the size cap is a distinct condition worth its own code; a malformed
+/// `Content-Length` and a body that is not UTF-8 are both bad requests.
+fn error_status_code(error: &Error) -> u16 {
+    if error.to_string().contains("exceeded maximum size") {
+        413
+    } else {
+        400
+    }
 }
 
 async fn read_http_request(stream: &mut TcpStream) -> Result<String> {
@@ -174,7 +211,15 @@ fn expected_http_request_len(buffer: &[u8]) -> Result<Option<usize>> {
         .find_map(|line| {
             let (name, value) = line.split_once(':')?;
             name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>())
+                .then(|| value.trim().to_string())
+        })
+        .map(|value| {
+            // `usize` rejects a negative or non-numeric length, but its parse
+            // error ("invalid digit found in string") says nothing about which
+            // header was wrong.
+            value
+                .parse::<usize>()
+                .map_err(|_| Error::msg(format!("invalid Content-Length header '{value}'")))
         })
         .transpose()?
         .unwrap_or(0);
@@ -1242,6 +1287,8 @@ fn http_response(status_code: u16, content_type: &str, body: &str) -> String {
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        413 => "Payload Too Large",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
@@ -1334,7 +1381,8 @@ impl DaemonState {
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonState, HUGR_API_CONTRACT_VERSION, constant_time_eq, is_ignored_watch_path,
+        DaemonState, HUGR_API_CONTRACT_VERSION, constant_time_eq, error_status_code,
+        expected_http_request_len, http_response, is_ignored_watch_path,
         parse_memory_api_apply_request, parse_storage_api_apply_request,
         render_refresh_capture_detail, render_session_observation_detail, request_line_parts,
         response_for_request_with_api_token,
@@ -1672,6 +1720,72 @@ mod tests {
         // Staged files exist only between a multi-file edit's write and its
         // rename; reindexing one would index a duplicate of a source file.
         assert!(is_ignored_watch_path(Path::new("src/.lib.rs.hugr-tmp")));
+    }
+
+    /// A rejected request still gets an HTTP answer. These failures used to
+    /// return early from `handle_client` before anything was written, so the
+    /// client saw a closed connection and could not tell a bad request apart
+    /// from a crashed daemon.
+    #[test]
+    fn read_failures_map_to_client_visible_statuses() {
+        assert_eq!(
+            error_status_code(&crate::error::Error::msg(
+                "HTTP request exceeded maximum size"
+            )),
+            413
+        );
+        assert_eq!(
+            error_status_code(&crate::error::Error::msg(
+                "invalid Content-Length header '-5'"
+            )),
+            400
+        );
+        assert_eq!(
+            error_status_code(&crate::error::Error::msg("invalid utf-8 sequence")),
+            400
+        );
+    }
+
+    /// `usize` already rejects these, but the parse error named no header.
+    #[test]
+    fn a_malformed_content_length_is_rejected_by_name() {
+        let error = expected_http_request_len(b"POST / HTTP/1.1\r\nContent-Length: -5\r\n\r\n")
+            .expect_err("a negative Content-Length is not a length")
+            .to_string();
+
+        assert!(error.contains("Content-Length"), "{error}");
+        assert!(error.contains("-5"), "{error}");
+    }
+
+    /// A valid length still resolves, and a request with no body reads as
+    /// complete once its headers arrive.
+    #[test]
+    fn well_formed_requests_still_measure_correctly() {
+        let with_body = b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\nabcd";
+        assert_eq!(
+            expected_http_request_len(with_body).unwrap(),
+            Some(with_body.len())
+        );
+
+        let without_body = b"GET /health HTTP/1.1\r\n\r\n";
+        assert_eq!(
+            expected_http_request_len(without_body).unwrap(),
+            Some(without_body.len())
+        );
+    }
+
+    /// The two statuses added for these paths need reason phrases, or clients
+    /// see "Internal Server Error" on a 413.
+    #[test]
+    fn new_statuses_render_their_reason_phrases() {
+        assert!(
+            http_response(413, "application/json", "{}")
+                .starts_with("HTTP/1.1 413 Payload Too Large")
+        );
+        assert!(
+            http_response(408, "application/json", "{}")
+                .starts_with("HTTP/1.1 408 Request Timeout")
+        );
     }
 
     fn local_peer_addr() -> SocketAddr {
