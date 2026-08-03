@@ -762,12 +762,27 @@ fn required_text_output(args: &[String], command: &str) -> Result<TextOutput> {
     let mut format = OutputFormat::Markdown;
     let mut global = false;
     let mut words = Vec::new();
+    let mut literal = false;
 
     for arg in args.iter().skip(2) {
-        if arg == "--json" {
+        if literal {
+            words.push(arg.clone());
+        } else if arg == "--" {
+            // Everything after `--` is query text, so a query that genuinely
+            // starts with a dash stays expressible.
+            literal = true;
+        } else if arg == "--json" {
             format = OutputFormat::Json;
         } else if arg == "--global" {
             global = true;
+        } else if arg.starts_with("--") {
+            // Unknown options used to fall through into the query text, so
+            // `hugr recall plugin --jsonn` searched for "plugin --jsonn" and
+            // silently returned Markdown to a caller that asked for JSON.
+            // `hugr impact src/lib.rs --jsonn` was worse: the flag became part
+            // of the target path, so the report described a file that does not
+            // exist.
+            return Err(Error::msg(format!("unknown option '{arg}'")));
         } else {
             words.push(arg.clone());
         }
@@ -982,6 +997,71 @@ mod tests {
                 task: "add hooks".into(),
                 format: OutputFormat::Markdown,
                 budget: None
+            }
+        );
+    }
+
+    /// Unknown options used to be joined into the query text instead of
+    /// rejected, so a typo silently changed what the command did: `recall
+    /// plugin --jsonn` searched for "plugin --jsonn" and returned Markdown to
+    /// a caller that asked for JSON, and `impact src/lib.rs --jsonn` reported
+    /// on the path "src/lib.rs --jsonn", which does not exist.
+    #[test]
+    fn text_commands_reject_unknown_options() {
+        for command in ["recall", "symbols", "impact", "forget"] {
+            let args = vec![
+                "hugr".into(),
+                command.into(),
+                "plugin".into(),
+                "--jsonn".into(),
+            ];
+            let error = Command::parse(&args)
+                .expect_err(&format!("{command} accepted an unknown option"))
+                .to_string();
+            assert!(error.contains("--jsonn"), "{command}: {error}");
+        }
+    }
+
+    /// The known flags must keep working, in any position.
+    #[test]
+    fn text_commands_still_accept_their_own_flags() {
+        let args = vec![
+            "hugr".into(),
+            "recall".into(),
+            "--json".into(),
+            "plugin".into(),
+            "hooks".into(),
+            "--global".into(),
+        ];
+
+        assert_eq!(
+            Command::parse(&args).unwrap(),
+            Command::Recall {
+                query: "plugin hooks".into(),
+                format: OutputFormat::Json,
+                global: true
+            }
+        );
+    }
+
+    /// A query that genuinely begins with a dash stays expressible after `--`,
+    /// matching how `hugr observe command` already separates its argv.
+    #[test]
+    fn a_double_dash_makes_the_rest_query_text() {
+        let args = vec![
+            "hugr".into(),
+            "recall".into(),
+            "--".into(),
+            "--jsonn".into(),
+            "flag".into(),
+        ];
+
+        assert_eq!(
+            Command::parse(&args).unwrap(),
+            Command::Recall {
+                query: "--jsonn flag".into(),
+                format: OutputFormat::Markdown,
+                global: false
             }
         );
     }
