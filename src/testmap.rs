@@ -140,9 +140,21 @@ fn is_inline_test_module_symbol(symbol: &CodeSymbol) -> bool {
         && symbol.language.as_deref() == Some("rust")
 }
 
+/// Extensions whose ecosystems name tests `FooTest`/`FooTests` rather than
+/// with a `_test` suffix or a `test_` prefix.
+///
+/// Java, Kotlin, and Swift are three of the eight indexed languages, and
+/// `move-symbol` already understands their packages and modules — but their
+/// test convention matched none of the patterns below, so `PaymentServiceTest.java`
+/// beside `PaymentService.java` produced no mapping at all and `hugr impact`
+/// reported no affected tests. The Maven/Gradle `src/test/java` layout was
+/// caught by the directory check; anything outside it was not.
+const CAMEL_CASE_TEST_EXTENSIONS: [&str; 4] = [".java", ".kt", ".kts", ".swift"];
+
 pub(crate) fn is_test_path(path: &str) -> bool {
     let lower = path.to_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
+    let original_name = path.rsplit('/').next().unwrap_or(path);
 
     lower
         .split('/')
@@ -155,11 +167,50 @@ pub(crate) fn is_test_path(path: &str) -> bool {
         || name.contains(".spec.")
         || name.ends_with("_spec.rb")
         || name.ends_with("_test.py")
+        || is_camel_case_test_name(name, original_name)
 }
 
+/// Matches `FooTest.java`, `FooTests.kt`, `FooSpec.kt`, and the
+/// integration-test suffix `FooIT.java`.
+///
+/// The suffix has to begin a camel-case word in the *original* name, so
+/// `PaymentTest.swift` matches while `Protest.swift` and `Manifest.kt` do not
+/// — matching on the lowercased name alone turned any source ending in those
+/// letters into a test file.
+fn is_camel_case_test_name(name: &str, original: &str) -> bool {
+    let Some(extension) = CAMEL_CASE_TEST_EXTENSIONS
+        .iter()
+        .find(|extension| name.ends_with(*extension))
+    else {
+        return false;
+    };
+    let stem = &original[..original.len() - extension.len()];
+    ["Test", "Tests", "Spec", "IT"]
+        .iter()
+        .any(|suffix| starts_a_word(stem, suffix))
+}
+
+/// True when `stem` ends with `suffix` and something precedes it, so the
+/// suffix reads as its own camel-case word rather than the tail of a longer
+/// one.
+fn starts_a_word(stem: &str, suffix: &str) -> bool {
+    stem.strip_suffix(suffix)
+        .is_some_and(|prefix| prefix.chars().next_back().is_some_and(char::is_lowercase))
+}
+
+/// Reduces a file name to the stem its test and source forms share, so
+/// `PaymentServiceTest.java` and `PaymentService.java` compare equal.
 fn normalized_source_stem(path: &str) -> String {
     let name = path.rsplit('/').next().unwrap_or(path);
     let stem = name.split('.').next().unwrap_or(name);
+    // Strip a camel-case suffix from the original casing first, so
+    // `PaymentServiceTest` reduces to `paymentservice` while `Protest` keeps
+    // its stem intact.
+    let stem = ["Tests", "Test", "Spec", "IT"]
+        .iter()
+        .find_map(|suffix| starts_a_word(stem, suffix).then(|| &stem[..stem.len() - suffix.len()]))
+        .unwrap_or(stem);
+
     stem.trim_start_matches("test_")
         .trim_end_matches("_test")
         .trim_end_matches("_tests")
@@ -177,9 +228,56 @@ fn directory(path: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{inline_test_paths_from_symbols, likely_tests_for_files};
+    use super::{inline_test_paths_from_symbols, is_test_path, likely_tests_for_files};
     use crate::code::CodeSymbol;
     use std::collections::HashSet;
+
+    /// Java, Kotlin, and Swift are indexed languages whose tests are named
+    /// `FooTest`/`FooTests`, which matched none of the `_test`/`test_`
+    /// patterns. Outside the Maven `src/test/java` layout that left them
+    /// undetected, so `hugr impact` reported no affected tests for a Java
+    /// class sitting beside its own test.
+    #[test]
+    fn recognises_camel_case_test_files() {
+        assert!(is_test_path("app/PaymentServiceTest.java"));
+        assert!(is_test_path("app/PaymentServiceTests.kt"));
+        assert!(is_test_path("app/PaymentServiceSpec.kt"));
+        assert!(is_test_path("Sources/Pay/PaymentServiceTests.swift"));
+        // The integration-test suffix.
+        assert!(is_test_path("app/PaymentServiceIT.java"));
+    }
+
+    /// The suffix check must not swallow ordinary sources whose names merely
+    /// end in those letters.
+    #[test]
+    fn ordinary_sources_are_not_test_files() {
+        assert!(!is_test_path("app/PaymentService.java"));
+        assert!(!is_test_path("app/Manifest.kt"));
+        assert!(!is_test_path("src/latest.rs"));
+        assert!(!is_test_path("Sources/Pay/Protest.swift"));
+    }
+
+    /// The mapping half of the same gap: detecting the test file is only
+    /// useful if its stem still matches the source it covers.
+    #[test]
+    fn maps_camel_case_tests_back_to_their_source() {
+        let known = vec![
+            "app/PaymentService.java".to_string(),
+            "app/PaymentServiceTest.java".to_string(),
+        ];
+
+        let tests = likely_tests_for_files(
+            &["app/PaymentService.java".to_string()],
+            &known,
+            &HashSet::new(),
+            5,
+        );
+
+        assert_eq!(
+            tests.first().map(|test| test.path.as_str()),
+            Some("app/PaymentServiceTest.java")
+        );
+    }
 
     #[test]
     fn maps_sources_to_likely_tests() {
