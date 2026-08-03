@@ -437,6 +437,67 @@ async fn impact(target: &str, format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
+/// Writes every planned file, or leaves the working tree untouched.
+///
+/// `plan_rename` and `plan_move` already refuse to emit a refactor that does
+/// not parse, but writing the results in a plain loop reintroduced exactly the
+/// partial state those checks exist to prevent: a failure on the third file
+/// left the first two rewritten and the rest stale, so the tree no longer
+/// compiled even though the command reported an error and the user reasonably
+/// assumed nothing had changed.
+///
+/// Staging every file next to its destination first turns the common failures
+/// — an unwritable file, a full disk, a read-only checkout — into errors that
+/// happen before any destination is touched. The commit step is then a
+/// sequence of same-directory renames, which is atomic per file on POSIX and
+/// the closest thing to an all-or-nothing multi-file write without a journal.
+/// A failure during that final step is reported with the files already
+/// swapped, since there is no way to unwind it reliably.
+fn write_planned_files(action: &str, files: &[(&str, &str)]) -> Result<()> {
+    let mut staged = Vec::with_capacity(files.len());
+
+    // Stage first: this is where permission and space errors surface, while
+    // every destination still holds its original contents.
+    for (path, contents) in files {
+        let staged_path = staging_path(Path::new(path));
+        if let Err(error) = std::fs::write(&staged_path, contents) {
+            for (temporary, _) in &staged {
+                let _: std::io::Result<()> = std::fs::remove_file(temporary);
+            }
+            return Err(Error::with_source(
+                format!("hugr {action} cannot write {path}: {error}"),
+                error,
+            ));
+        }
+        staged.push((staged_path, *path));
+    }
+
+    for (staged_path, path) in &staged {
+        std::fs::rename(staged_path, path).map_err(|error| {
+            Error::with_source(
+                format!("hugr {action} cannot replace {path}: {error}"),
+                error,
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+/// A sibling of `path`, so the staged file lands on the same filesystem and
+/// the commit step is a rename rather than a cross-device copy.
+///
+/// The suffix is [`crate::discovery::STAGING_SUFFIX`], which the file walker
+/// and the daemon's watcher both skip: a crash between staging and committing
+/// would otherwise leave a file the next index run treats as real source.
+fn staging_path(path: &Path) -> std::path::PathBuf {
+    let file_name = path.file_name().map_or_else(
+        || String::from("hugr"),
+        |name| name.to_string_lossy().into(),
+    );
+    path.with_file_name(format!(".{file_name}{}", crate::discovery::STAGING_SUFFIX))
+}
+
 async fn replace_symbol(
     path: &str,
     name: &str,
@@ -539,14 +600,14 @@ async fn rename_symbol(
     }
 
     let planned = edit::plan_rename(&target, &references, files, new_name)?;
-    for file in &planned.files {
-        std::fs::write(&file.path, &file.contents).map_err(|error| {
-            Error::with_source(
-                format!("hugr rename-symbol cannot write {}: {error}", file.path),
-                error,
-            )
-        })?;
-    }
+    write_planned_files(
+        "rename-symbol",
+        &planned
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.contents.as_str()))
+            .collect::<Vec<_>>(),
+    )?;
 
     indexer::index_project(5000).await?;
 
@@ -627,14 +688,14 @@ async fn move_symbol(
         rewrite_references,
     )?;
 
-    for file in &planned.files {
-        std::fs::write(&file.path, &file.contents).map_err(|error| {
-            Error::with_source(
-                format!("hugr move-symbol cannot write {}: {error}", file.path),
-                error,
-            )
-        })?;
-    }
+    write_planned_files(
+        "move-symbol",
+        &planned
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.contents.as_str()))
+            .collect::<Vec<_>>(),
+    )?;
 
     indexer::index_project(5000).await?;
 
@@ -1640,6 +1701,7 @@ mod tests {
         render_sync_history_text, render_sync_pull_json, render_sync_pull_text,
         render_sync_push_json, render_sync_push_text, render_sync_status_json,
         render_sync_status_text, resolve_context_token_budget, shell_hook_text,
+        write_planned_files,
     };
     use crate::code::CodeSymbol;
     use crate::store::{
@@ -2329,4 +2391,94 @@ mod tests {
     const RETIREMENT_SNAPSHOT: &str = r#"{"action":"stale","executed_at":"2026-01-02T00:00:00Z","stale_candidates":[{"reason":"contradicted","signal":"before/after","shared_terms":["plugin","hooks \"quoted\""],"newer_memory":{"id":"mem_1","created_at_ms":10,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":{"source":{"type":"session"}}},"older_memory":{"id":"mem_2","created_at_ms":20,"kind":"note","text":"","structured_payload":null}}],"kept_memories":[],"retired_memories":[{"id":"mem_1","created_at_ms":10,"kind":"fact","text":"quote \" backslash \\ newline \n tab \t unicode ✓","structured_payload":{"source":{"type":"session"}}},{"id":"mem_2","created_at_ms":20,"kind":"note","text":"","structured_payload":null},{"id":"mem_3","created_at_ms":30,"kind":"fact","text":"plain","structured_payload":"not json at all"}]}"#;
 
     const STATUS_SNAPSHOT: &str = r#"{"storage_mode":"hybrid","backend":"hugr_api","status":"ready","local_writes_enabled":true,"remote_configured":true,"remote_auth_configured":false,"remote_reads_enabled":true,"remote_writes_enabled":false,"remote_endpoint":"https://api.example","api_contract_version":null,"api_routes":["GET /v1/sync/status"],"sync_classes":["memories","full_source"],"explicit_opt_in_classes":[]}"#;
+
+    fn edit_temp_dir(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("hugr_write_{name}_{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn planned_writes_apply_every_file() {
+        let root = edit_temp_dir("apply");
+        let first = root.join("first.rs");
+        let second = root.join("second.rs");
+        std::fs::write(&first, "old first\n").unwrap();
+        std::fs::write(&second, "old second\n").unwrap();
+
+        write_planned_files(
+            "rename-symbol",
+            &[
+                (first.to_str().unwrap(), "new first\n"),
+                (second.to_str().unwrap(), "new second\n"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "new first\n");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "new second\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The regression this staging exists for. A multi-file refactor used to
+    /// be written in a plain loop, so a failure partway through left earlier
+    /// files rewritten against a stale rest of the tree — a state that does
+    /// not compile, produced by a command that reported an error. Staging a
+    /// directory that cannot be created fails before any destination is
+    /// touched.
+    #[test]
+    fn a_failed_planned_write_leaves_every_file_untouched() {
+        let root = edit_temp_dir("atomic");
+        let first = root.join("first.rs");
+        std::fs::write(&first, "old first\n").unwrap();
+        // A path whose parent is a *file*, so staging beside it cannot work.
+        let blocked = first.join("nested").join("second.rs");
+
+        let error = write_planned_files(
+            "rename-symbol",
+            &[
+                (first.to_str().unwrap(), "new first\n"),
+                (blocked.to_str().unwrap(), "new second\n"),
+            ],
+        )
+        .expect_err("staging beneath a file must fail");
+
+        assert!(error.to_string().contains("rename-symbol"));
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "old first\n",
+            "the first file must keep its original contents"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Staging files must not survive a failure, or the next `hugr index`
+    /// would pick up `.name.hugr-tmp` siblings as real source files.
+    #[test]
+    fn a_failed_planned_write_cleans_up_staged_files() {
+        let root = edit_temp_dir("cleanup");
+        let first = root.join("first.rs");
+        std::fs::write(&first, "old first\n").unwrap();
+        let blocked = first.join("nested").join("second.rs");
+
+        let _ = write_planned_files(
+            "move-symbol",
+            &[
+                (first.to_str().unwrap(), "new first\n"),
+                (blocked.to_str().unwrap(), "new second\n"),
+            ],
+        );
+
+        let leftovers = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("hugr-tmp"))
+            .count();
+        assert_eq!(leftovers, 0, "staged files must be cleaned up on failure");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

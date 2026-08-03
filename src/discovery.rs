@@ -366,7 +366,23 @@ impl IgnorePattern {
     }
 }
 
+/// Marks a file `hugr` is staging on its way to replacing a real source file.
+/// Multi-file edits write here first so a failure cannot leave the tree half
+/// rewritten; a crash in that window leaves the staged file behind, so both
+/// the walker below and the daemon's watcher skip the suffix rather than
+/// indexing a half-written duplicate of a source file.
+pub(crate) const STAGING_SUFFIX: &str = ".hugr-tmp";
+
+pub(crate) fn is_staging_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(STAGING_SUFFIX))
+}
+
 fn has_skipped_component(path: &Path) -> bool {
+    if is_staging_path(path) {
+        return true;
+    }
     path.components().any(|component| {
         let name = component.as_os_str().to_string_lossy();
         matches!(
@@ -511,6 +527,25 @@ mod tests {
         files.sort();
 
         assert_eq!(files, vec![".gitignore", "src/plugin_hooks.rs"]);
+    }
+
+    /// A crash between a multi-file edit's staging write and its rename leaves
+    /// a `.hugr-tmp` sibling behind. Indexing it would add a near-duplicate of
+    /// a real source file to the graph.
+    #[test]
+    fn walking_finder_skips_staged_edit_files() {
+        let project = TempProject::new("staging");
+        project.write("src/plugin_hooks.rs", "");
+        project.write("src/.plugin_hooks.rs.hugr-tmp", "");
+
+        let files = WalkingFileFinder
+            .find_files(project.root())
+            .unwrap()
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(files, vec!["src/plugin_hooks.rs"]);
     }
 
     #[test]

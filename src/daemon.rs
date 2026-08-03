@@ -401,6 +401,9 @@ fn display_watch_path(path: &Path) -> String {
 }
 
 fn is_ignored_watch_path(path: &Path) -> bool {
+    if crate::discovery::is_staging_path(path) {
+        return true;
+    }
     path.components().any(|component| {
         let Component::Normal(name) = component else {
             return false;
@@ -1666,6 +1669,9 @@ mod tests {
         assert!(is_ignored_watch_path(Path::new("target/debug/hugr")));
         assert!(is_ignored_watch_path(Path::new(".git/index")));
         assert!(!is_ignored_watch_path(Path::new("src/lib.rs")));
+        // Staged files exist only between a multi-file edit's write and its
+        // rename; reindexing one would index a duplicate of a source file.
+        assert!(is_ignored_watch_path(Path::new("src/.lib.rs.hugr-tmp")));
     }
 
     fn local_peer_addr() -> SocketAddr {
