@@ -20,7 +20,7 @@ use crate::store::{
 };
 use crate::worktree;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::io::{self, Write as IoWrite};
 use std::path::Path;
@@ -511,20 +511,18 @@ async fn replace_symbol(
                 .to_string()));
     }
 
-    let contents = std::fs::read_to_string(path).map_err(|error| {
+    let raw = std::fs::read_to_string(path).map_err(|error| {
         Error::with_source(
             format!("hugr replace-symbol cannot read {path}: {error}"),
             error,
         )
     })?;
+    let line_ending = edit::LineEnding::detect(&raw);
+    let contents = edit::normalize_line_endings(&raw);
     let planned = edit::plan_replacement(path, &contents, name, kind, body)?;
 
-    std::fs::write(path, &planned.contents).map_err(|error| {
-        Error::with_source(
-            format!("hugr replace-symbol cannot write {path}: {error}"),
-            error,
-        )
-    })?;
+    let rendered = line_ending.apply(&planned.contents);
+    write_planned_files("replace-symbol", &[(path, rendered.as_str())])?;
 
     // Refresh the index so symbols, impact, and context reflect the edit immediately.
     indexer::index_project(5000).await?;
@@ -589,23 +587,35 @@ async fn rename_symbol(
     paths.sort();
 
     let mut files = Vec::new();
+    // Each file keeps its own ending: a repository can legitimately mix them,
+    // and a rename must not rewrite endings in files it only touches in one
+    // place.
+    let mut line_endings = HashMap::new();
     for path in paths {
-        let contents = std::fs::read_to_string(&path).map_err(|error| {
+        let raw = std::fs::read_to_string(&path).map_err(|error| {
             Error::with_source(
                 format!("hugr rename-symbol cannot read {path}: {error}"),
                 error,
             )
         })?;
-        files.push((path, contents));
+        line_endings.insert(path.clone(), edit::LineEnding::detect(&raw));
+        files.push((path, edit::normalize_line_endings(&raw)));
     }
 
     let planned = edit::plan_rename(&target, &references, files, new_name)?;
+    let rendered = planned
+        .files
+        .iter()
+        .map(|file| {
+            let ending = line_endings.get(&file.path).copied().unwrap_or_default();
+            (file.path.as_str(), ending.apply(&file.contents))
+        })
+        .collect::<Vec<_>>();
     write_planned_files(
         "rename-symbol",
-        &planned
-            .files
+        &rendered
             .iter()
-            .map(|file| (file.path.as_str(), file.contents.as_str()))
+            .map(|(path, contents)| (*path, contents.as_str()))
             .collect::<Vec<_>>(),
     )?;
 
@@ -657,13 +667,21 @@ async fn move_symbol(
 
     indexer::index_project(5000).await?;
 
-    let source_contents = std::fs::read_to_string(source_path).map_err(|error| {
+    let raw_source = std::fs::read_to_string(source_path).map_err(|error| {
         Error::with_source(
             format!("hugr move-symbol cannot read {source_path}: {error}"),
             error,
         )
     })?;
-    let destination_contents = read_optional_destination(destination_path, "hugr move-symbol")?;
+    let mut line_endings = HashMap::new();
+    line_endings.insert(
+        source_path.to_string(),
+        edit::LineEnding::detect(&raw_source),
+    );
+    let source_contents = edit::normalize_line_endings(&raw_source);
+    let (destination_contents, destination_ending) =
+        read_optional_destination(destination_path, "hugr move-symbol")?;
+    line_endings.insert(destination_path.to_string(), destination_ending);
     let target = edit::resolve_symbol_in_source(source_path, &source_contents, name, kind, "move")?;
     let references = store
         .references_to_symbols(std::slice::from_ref(&target), 2000)
@@ -675,6 +693,12 @@ async fn move_symbol(
             destination_path,
             "hugr move-symbol",
         )?
+        .into_iter()
+        .map(|(path, contents, ending)| {
+            line_endings.insert(path.clone(), ending);
+            (path, contents)
+        })
+        .collect()
     } else {
         Vec::new()
     };
@@ -688,12 +712,19 @@ async fn move_symbol(
         rewrite_references,
     )?;
 
+    let rendered = planned
+        .files
+        .iter()
+        .map(|file| {
+            let ending = line_endings.get(&file.path).copied().unwrap_or_default();
+            (file.path.as_str(), ending.apply(&file.contents))
+        })
+        .collect::<Vec<_>>();
     write_planned_files(
         "move-symbol",
-        &planned
-            .files
+        &rendered
             .iter()
-            .map(|file| (file.path.as_str(), file.contents.as_str()))
+            .map(|(path, contents)| (*path, contents.as_str()))
             .collect::<Vec<_>>(),
     )?;
 
@@ -722,10 +753,17 @@ async fn move_symbol(
     Ok(())
 }
 
-fn read_optional_destination(path: &str, command: &str) -> Result<String> {
+/// Reads a move destination, which may not exist yet. Line endings are
+/// normalised for the planner; a new file gets [`LineEnding::Lf`] by default.
+fn read_optional_destination(path: &str, command: &str) -> Result<(String, edit::LineEnding)> {
     match std::fs::read_to_string(path) {
-        Ok(contents) => Ok(contents),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Ok(contents) => Ok((
+            edit::normalize_line_endings(&contents),
+            edit::LineEnding::detect(&contents),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok((String::new(), edit::LineEnding::default()))
+        }
         Err(error) => Err(Error::msg(format!("{command} cannot read {path}: {error}"))),
     }
 }
@@ -735,7 +773,7 @@ fn read_reference_files(
     source_path: &str,
     destination_path: &str,
     command: &str,
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<(String, String, edit::LineEnding)>> {
     let mut paths = references
         .iter()
         .map(|reference| reference.path.clone())
@@ -749,7 +787,13 @@ fn read_reference_files(
         .into_iter()
         .map(|path| {
             std::fs::read_to_string(&path)
-                .map(|contents| (path.clone(), contents))
+                .map(|contents| {
+                    (
+                        path.clone(),
+                        edit::normalize_line_endings(&contents),
+                        edit::LineEnding::detect(&contents),
+                    )
+                })
                 .map_err(|error| {
                     Error::with_source(format!("{command} cannot read {path}: {error}"), error)
                 })

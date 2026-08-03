@@ -6,6 +6,49 @@ use std::fmt::Write;
 use std::fs;
 use std::path::Path;
 
+/// The line ending a source file uses, so an edit can restore it on write.
+///
+/// Every planner splits with [`str::lines`] and rejoins with `\n`, which is
+/// simple and correct for the edited region but silently rewrites the rest of
+/// the file: `lines` strips a trailing `\r`, so on a CRLF checkout replacing
+/// one function converted *every* line to LF and turned a three-line edit into
+/// a whole-file diff. Normalising on read and restoring on write keeps that
+/// convenience without touching lines the edit never looked at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LineEnding {
+    #[default]
+    Lf,
+    Crlf,
+}
+
+impl LineEnding {
+    /// Picks the ending to write back. A file is treated as CRLF when CRLF is
+    /// what it predominantly uses, so a stray bare `\n` in a CRLF file does not
+    /// flip the whole file to LF (and vice versa) on the next edit.
+    pub(crate) fn detect(contents: &str) -> Self {
+        let crlf = contents.matches("\r\n").count();
+        let lf = contents.matches('\n').count() - crlf;
+        if crlf > lf { Self::Crlf } else { Self::Lf }
+    }
+
+    /// Rewrites `contents` — which planners always produce with LF — into this
+    /// ending.
+    pub(crate) fn apply(self, contents: &str) -> String {
+        match self {
+            Self::Lf => contents.to_string(),
+            Self::Crlf => contents.replace('\n', "\r\n"),
+        }
+    }
+}
+
+/// Strips `\r\n` down to `\n` so the planners see a single line ending.
+///
+/// Pair every call with [`LineEnding::detect`] on the same text and re-apply
+/// the result before writing, or the file's original endings are lost.
+pub(crate) fn normalize_line_endings(contents: &str) -> String {
+    contents.replace("\r\n", "\n")
+}
+
 /// A structural symbol replacement that has been validated but not yet written.
 ///
 /// `contents` is the full rewritten file text. `summary` describes the change for
@@ -4529,10 +4572,57 @@ impl SymbolMove {
 #[cfg(test)]
 mod tests {
     use super::{
-        SymbolMove, SymbolMoveFile, SymbolRename, SymbolRenameFile, SymbolReplacement, plan_move,
-        plan_rename, plan_replacement, resolve_symbol_in_source,
+        LineEnding, SymbolMove, SymbolMoveFile, SymbolRename, SymbolRenameFile, SymbolReplacement,
+        normalize_line_endings, plan_move, plan_rename, plan_replacement, resolve_symbol_in_source,
     };
     use crate::code::CodeReference;
+
+    /// The planners split on [`str::lines`] and rejoin with `\n`, which drops
+    /// `\r` from every line — so without normalising on read and restoring on
+    /// write, editing one function rewrote every line of a CRLF file and
+    /// turned a one-line change into a whole-file diff.
+    #[test]
+    fn crlf_files_survive_a_round_trip() {
+        let crlf = "pub fn a() {}\r\n\r\npub fn b() {}\r\n";
+        let ending = LineEnding::detect(crlf);
+        let normalized = normalize_line_endings(crlf);
+
+        assert_eq!(ending, LineEnding::Crlf);
+        assert!(!normalized.contains('\r'));
+        assert_eq!(ending.apply(&normalized), crlf);
+    }
+
+    #[test]
+    fn lf_files_are_left_alone() {
+        let lf = "pub fn a() {}\n\npub fn b() {}\n";
+        let ending = LineEnding::detect(lf);
+
+        assert_eq!(ending, LineEnding::Lf);
+        assert_eq!(normalize_line_endings(lf), lf);
+        assert_eq!(ending.apply(lf), lf);
+    }
+
+    /// A file is classified by what it predominantly uses, so one stray bare
+    /// `\n` in a CRLF file does not flip the whole file to LF on the next edit.
+    #[test]
+    fn the_dominant_line_ending_wins() {
+        assert_eq!(
+            LineEnding::detect("a\r\nb\r\nc\r\nd\n"),
+            LineEnding::Crlf,
+            "mostly CRLF"
+        );
+        assert_eq!(
+            LineEnding::detect("a\nb\nc\nd\r\n"),
+            LineEnding::Lf,
+            "mostly LF"
+        );
+        assert_eq!(LineEnding::detect(""), LineEnding::Lf, "empty file");
+        assert_eq!(
+            LineEnding::detect("no trailing newline"),
+            LineEnding::Lf,
+            "single line"
+        );
+    }
 
     const RUST_SOURCE: &str =
         "pub struct Registry;\n\npub fn greet() -> u8 {\n    1\n}\n\npub fn other() {}\n";
