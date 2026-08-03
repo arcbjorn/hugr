@@ -159,8 +159,73 @@ fn status_code(code: char) -> Option<String> {
     }
 }
 
+/// Decodes the C-style quoting `git status` applies to unusual paths.
+///
+/// Git quotes a path whenever it contains a control character, a double quote,
+/// a backslash, or a byte above 0x7f, escaping those bytes as `\"`, `\\`, the
+/// usual `\n`/`\t`/… shorthands, or three-digit octal. Handling only `\"` left
+/// the rest raw, so a UTF-8 filename came back as the literal
+/// `caf\303\251.rs`. These paths reach agents inside context packs, and a path
+/// that does not exist is one the agent cannot open.
+///
+/// Octal escapes are collected as bytes before decoding, since one character
+/// spans several of them (`é` is `\303\251`). Anything that is not valid UTF-8
+/// once decoded falls back to lossy conversion rather than failing the parse:
+/// a slightly mangled path in a status listing beats dropping the entry.
 fn unquote_path(path: &str) -> String {
-    path.trim_matches('"').replace("\\\"", "\"")
+    let Some(inner) = path
+        .strip_prefix('"')
+        .and_then(|path| path.strip_suffix('"'))
+    else {
+        // Unquoted paths are already literal.
+        return path.to_string();
+    };
+
+    let mut decoded: Vec<u8> = Vec::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            let mut buffer = [0_u8; 4];
+            decoded.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+            continue;
+        }
+
+        match chars.next() {
+            Some('n') => decoded.push(b'\n'),
+            Some('t') => decoded.push(b'\t'),
+            Some('r') => decoded.push(b'\r'),
+            Some('a') => decoded.push(0x07),
+            Some('b') => decoded.push(0x08),
+            Some('f') => decoded.push(0x0c),
+            Some('v') => decoded.push(0x0b),
+            Some('"') => decoded.push(b'"'),
+            // `\\` is an escaped backslash; a trailing `\` with nothing after
+            // it is malformed, and echoing the backslash is the closest
+            // reading.
+            Some('\\') | None => decoded.push(b'\\'),
+            Some(first @ '0'..='7') => {
+                // Octal is always exactly three digits from git.
+                let mut value = first.to_digit(8).unwrap_or(0);
+                for _ in 0..2 {
+                    let Some(digit) = chars.clone().next().and_then(|next| next.to_digit(8)) else {
+                        break;
+                    };
+                    chars.next();
+                    value = value * 8 + digit;
+                }
+                decoded.push(u8::try_from(value).unwrap_or(b'?'));
+            }
+            // An escape git does not produce; keep it visible rather than
+            // silently dropping the backslash.
+            Some(other) => {
+                decoded.push(b'\\');
+                let mut buffer = [0_u8; 4];
+                decoded.extend_from_slice(other.encode_utf8(&mut buffer).as_bytes());
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Option<String> {
@@ -181,7 +246,37 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_branch_header, parse_change_line, parse_status};
+    use super::{parse_branch_header, parse_change_line, parse_status, unquote_path};
+
+    /// `git status` quotes any path with a control character, a quote, a
+    /// backslash, or a byte above 0x7f. Only `\"` used to be decoded, so a
+    /// UTF-8 filename reached the context pack as the literal
+    /// `caf\303\251.rs` — a path no agent can open.
+    #[test]
+    fn unquotes_the_escapes_git_actually_emits() {
+        assert_eq!(unquote_path(r#""caf\303\251.rs""#), "café.rs");
+        assert_eq!(unquote_path(r#""back\\slash.rs""#), r"back\slash.rs");
+        assert_eq!(unquote_path(r#""say \"hi\".rs""#), r#"say "hi".rs"#);
+        assert_eq!(unquote_path("\"tab\\there.rs\""), "tab\there.rs");
+        assert_eq!(unquote_path("\"line\\nbreak.rs\""), "line\nbreak.rs");
+    }
+
+    /// Most paths need no quoting at all and must survive untouched — notably
+    /// ones that merely contain a space, which git leaves unquoted.
+    #[test]
+    fn leaves_ordinary_paths_alone() {
+        assert_eq!(unquote_path("src/lib.rs"), "src/lib.rs");
+        assert_eq!(unquote_path("with space.rs"), "with space.rs");
+        assert_eq!(unquote_path(r#""with space.rs""#), "with space.rs");
+    }
+
+    #[test]
+    fn changed_paths_are_unquoted_including_renames() {
+        let change = parse_change_line(r#"R  "old\303\251.rs" -> "new\303\251.rs""#).unwrap();
+
+        assert_eq!(change.original_path.as_deref(), Some("oldé.rs"));
+        assert_eq!(change.path, "newé.rs");
+    }
 
     #[test]
     fn parses_branch_header_counts() {
