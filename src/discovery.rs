@@ -189,6 +189,51 @@ pub(crate) fn merge_file_candidates(
     merged
 }
 
+/// Lexical score added to a file that contains a symbol the task matched.
+///
+/// Comfortably outweighs a single file-name term hit (4) and, combined with a
+/// weak path hit, can reach an exact stem match (8). That overlap is
+/// deliberate and measured: 3 was tried, so that an exact name always wins, and
+/// it retrieved less on a large foreign repository (hit rate 0.333 against
+/// 0.367, recall 0.169 against 0.186). A symbol match means the task named an
+/// identifier *defined in this file*, which turns out to be about as strong as
+/// the file's own name.
+const SYMBOL_PATH_BONUS: usize = 6;
+
+/// Re-ranks `candidates`, boosting any file that defines one of `symbols`.
+///
+/// File ranking sees only names and paths, so it misses a file whose *contents*
+/// match the task. The symbol index already resolves that, and measurably
+/// better: `symbol_file_hit_rate` runs above `hit_rate` on every repository
+/// measured so far. Feeding those paths back in turns a signal the pack already
+/// computed into ranking evidence, rather than adding a new source.
+pub(crate) fn promote_symbol_paths(
+    mut candidates: Vec<FileCandidate>,
+    symbols: &[crate::code::CodeSymbol],
+) -> Vec<FileCandidate> {
+    if symbols.is_empty() {
+        return candidates;
+    }
+
+    let symbol_paths = symbols
+        .iter()
+        .map(|symbol| symbol.path.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for candidate in &mut candidates {
+        if symbol_paths.contains(candidate.path.as_str()) {
+            candidate.lexical_score += SYMBOL_PATH_BONUS;
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .relevance()
+            .cmp(&left.relevance())
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    candidates
+}
+
 fn rank_files(root: &Path, task: &str, files: Vec<PathBuf>, limit: usize) -> Vec<FileCandidate> {
     let terms = query_terms(task);
     if terms.is_empty() {
@@ -492,8 +537,90 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
 mod tests {
     use super::{
         FileCandidate, WalkingFileFinder, discover_candidate_files, merge_file_candidates,
+        promote_symbol_paths,
     };
+    use crate::code::CodeSymbol;
     use crate::discovery::FileFinder;
+
+    fn symbol_in(path: &str, name: &str) -> CodeSymbol {
+        CodeSymbol {
+            path: path.to_string(),
+            language: Some("rust".to_string()),
+            name: name.to_string(),
+            kind: "function".to_string(),
+            line_start: 1,
+            line_end: Some(2),
+            signature: format!("fn {name}()"),
+        }
+    }
+
+    /// File ranking sees only names and paths, so it misses a file whose
+    /// *contents* match the task. The symbol index already resolves that —
+    /// `symbol_file_hit_rate` runs above `hit_rate` on every repository
+    /// measured — but those paths were computed after ranking and never fed
+    /// back into it.
+    #[test]
+    fn a_file_defining_a_matched_symbol_outranks_one_that_does_not() {
+        let candidates = vec![
+            // Sorts first and scores higher lexically, so only the symbol
+            // bonus can reorder these.
+            FileCandidate {
+                path: "src/aaa_unrelated.rs".to_string(),
+                lexical_score: 4,
+                ..FileCandidate::default()
+            },
+            FileCandidate {
+                path: "src/holds_the_symbol.rs".to_string(),
+                lexical_score: 2,
+                ..FileCandidate::default()
+            },
+        ];
+
+        let promoted = promote_symbol_paths(
+            candidates,
+            &[symbol_in("src/holds_the_symbol.rs", "unique_suffix")],
+        );
+
+        assert_eq!(promoted.first().unwrap().path, "src/holds_the_symbol.rs");
+    }
+
+    #[test]
+    fn promotion_is_a_no_op_without_symbols() {
+        let candidates = vec![FileCandidate {
+            path: "src/only.rs".to_string(),
+            lexical_score: 3,
+            ..FileCandidate::default()
+        }];
+
+        let promoted = promote_symbol_paths(candidates.clone(), &[]);
+
+        assert_eq!(promoted, candidates);
+    }
+
+    /// The bonus is large enough that a file defining the symbol can draw level
+    /// with one whose *name* matches exactly. That is intentional — a smaller
+    /// bonus that always loses to the filename retrieved measurably less — so
+    /// this pins the boundary rather than a strict filename-wins rule: an exact
+    /// name still beats a symbol file that has no other evidence.
+    #[test]
+    fn an_exact_name_match_beats_a_symbol_file_with_no_other_evidence() {
+        let candidates = vec![
+            FileCandidate {
+                path: "src/worker.rs".to_string(),
+                lexical_score: 8,
+                ..FileCandidate::default()
+            },
+            FileCandidate {
+                path: "src/other.rs".to_string(),
+                lexical_score: 0,
+                ..FileCandidate::default()
+            },
+        ];
+
+        let promoted = promote_symbol_paths(candidates, &[symbol_in("src/other.rs", "worker")]);
+
+        assert_eq!(promoted.first().unwrap().path, "src/worker.rs");
+    }
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};

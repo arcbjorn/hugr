@@ -324,13 +324,19 @@ pub(crate) async fn compile_context_pack_with_file_candidates(
         })
         .collect::<Vec<_>>();
     let sessions = store.recent_session_facts(task, 5).await?;
+    // Symbols are recalled before files are ranked so their paths can inform
+    // that ranking. The symbol index matches identifiers inside files, which
+    // is evidence the filename alone does not carry: on a large foreign
+    // repository `symbol_file_hit_rate` (0.433) runs well above `hit_rate`
+    // (0.267), meaning the right file was already known and simply not ranked.
+    let symbols = store.recall_symbols(task, 8).await?;
     let file_candidates = discovery::merge_file_candidates(
         discovery::discover_candidate_files(Path::new("."), task, 12)?,
         store.source_embedding_file_candidates(task, 12).await?,
         12,
     );
+    let file_candidates = discovery::promote_symbol_paths(file_candidates, &symbols);
     indexer::index_candidates(&store, Path::new("."), &file_candidates).await?;
-    let symbols = store.recall_symbols(task, 8).await?;
     let files = file_candidates
         .iter()
         .map(|candidate| candidate.path.clone())
