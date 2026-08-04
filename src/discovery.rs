@@ -223,10 +223,22 @@ fn candidate_for(root: &Path, path: &Path, terms: &[String]) -> Option<FileCandi
         .as_deref()
         .map(str::to_lowercase)
         .unwrap_or_default();
+    // The name without its extension, so `worker.go` can be recognised as an
+    // exact match for the term `worker`.
+    let stem = file_name
+        .split_once('.')
+        .map_or(file_name.as_str(), |(stem, _)| stem);
     let mut score = 0;
 
     for term in terms {
-        if file_name.contains(term) {
+        if stem == term {
+            // An exact stem match is the strongest filename evidence there is:
+            // the task named this file. Substring matching alone scored
+            // `worker.go` and `worker_retry_test.go` identically, so a task
+            // about `worker` ranked several test files above the source they
+            // test and the real target was evicted by the token budget.
+            score += 8;
+        } else if file_name.contains(term) {
             score += 4;
         } else if normalized.contains(term) {
             score += 2;
@@ -235,6 +247,15 @@ fn candidate_for(root: &Path, path: &Path, terms: &[String]) -> Option<FileCandi
         if !language_score.is_empty() && language_score == *term {
             score += 3;
         }
+    }
+
+    // A test file is rarely what a task naming its subject is about, and it
+    // matches every term the subject does. Without this, `foo_test.go`,
+    // `foo_swap_test.go`, and friends crowd out `foo.go` on sheer count.
+    // Halving keeps them reachable — a task really about tests still surfaces
+    // them, and `affected_tests` covers them separately.
+    if crate::testmap::is_test_path(&normalized) {
+        score /= 2;
     }
 
     if score == 0 {
@@ -546,6 +567,50 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(files, vec!["src/plugin_hooks.rs"]);
+    }
+
+    /// The regression found by running `hugr eval` against a foreign Go
+    /// repository. Several files matched one term and every one scored the
+    /// same 4, because the name check was a plain substring test. The source
+    /// file the commit actually touched lost the tiebreak to its own test
+    /// files and was then evicted by the token budget.
+    #[test]
+    fn an_exact_name_match_outranks_a_substring_match() {
+        let project = TempProject::new("exact");
+        // `alpha_worker.go` sorts first and matches the term as a substring,
+        // so only the exact-stem bonus can put `worker.go` on top: the
+        // alphabetical tiebreak actively works against the right answer here.
+        project.write("internal/queue/alpha_worker.go", "");
+        project.write("internal/queue/worker.go", "");
+        project.write("internal/queue/worker_retry_test.go", "");
+
+        let candidates =
+            discover_candidate_files(project.root(), "worker rename enqueue dequeue", 5).unwrap();
+
+        assert_eq!(candidates.first().unwrap().path, "internal/queue/worker.go");
+    }
+
+    /// Tests match every term their subject does, so without a penalty they
+    /// crowd out the source on sheer count. They stay reachable, just below it.
+    #[test]
+    fn test_files_rank_below_the_source_they_cover() {
+        let project = TempProject::new("tests_below");
+        // The test sorts *before* the source alphabetically, so only the test
+        // penalty can order these correctly.
+        project.write("src/a_payments_test.rs", "");
+        project.write("src/payments.rs", "");
+
+        let candidates = discover_candidate_files(project.root(), "payments retry", 5).unwrap();
+        let paths = candidates
+            .iter()
+            .map(|candidate| candidate.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths.first(), Some(&"src/payments.rs"));
+        assert!(
+            paths.contains(&"src/a_payments_test.rs"),
+            "the test file must still be reachable: {paths:?}"
+        );
     }
 
     #[test]
