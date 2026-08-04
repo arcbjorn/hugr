@@ -11275,12 +11275,36 @@ fn fts_query(terms: &[String]) -> String {
         .join(" OR ")
 }
 
+/// Splits a query into search terms, dropping tokens too short to be
+/// selective.
+///
+/// The length filter keeps `a`, `of`, and `to` from matching everything when
+/// they appear alongside real terms. Applied unconditionally it also discarded
+/// whole queries: `hugr recall id`, `CI`, or `db` produced no terms at all, so
+/// recall returned early and printed "no memories matched" — the same output
+/// as a genuine miss — even with a memory containing the word.
+///
+/// So the filter is skipped when it would leave nothing behind. A short query
+/// is all the caller gave us, and searching for it beats silently searching
+/// for nothing.
 fn query_terms(query: &str) -> Vec<String> {
-    query
+    let tokens = query
         .split(|char: char| !char.is_alphanumeric() && char != '_' && char != '-')
-        .filter(|term| term.len() > 2)
+        .filter(|term| !term.is_empty())
         .map(str::to_lowercase)
-        .collect()
+        .collect::<Vec<_>>();
+
+    let selective = tokens
+        .iter()
+        .filter(|term| term.len() > 2)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if selective.is_empty() {
+        tokens
+    } else {
+        selective
+    }
 }
 
 fn global_root(lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf> {
@@ -11970,6 +11994,39 @@ mod tests {
         };
 
         assert_eq!(code_symbol_score(&symbol, &terms, query), 0);
+    }
+
+    /// The length filter used to apply unconditionally, so a query made
+    /// entirely of short tokens produced no terms and `recall` returned early
+    /// — printing "no memories matched" for `id`, `CI`, or `db` even when a
+    /// memory contained the word.
+    #[test]
+    fn short_queries_keep_their_only_terms() {
+        assert_eq!(query_terms("id"), vec!["id".to_string()]);
+        assert_eq!(query_terms("CI"), vec!["ci".to_string()]);
+        assert_eq!(
+            query_terms("db ci"),
+            vec!["db".to_string(), "ci".to_string()],
+            "every token survives when none of them is selective"
+        );
+    }
+
+    /// When the query has a selective term, short tokens are still dropped —
+    /// otherwise `of` and `to` would match nearly every memory.
+    #[test]
+    fn short_tokens_are_dropped_beside_longer_ones() {
+        assert_eq!(
+            query_terms("primary key of"),
+            vec!["primary".to_string(), "key".to_string()]
+        );
+        assert_eq!(query_terms("a plugin"), vec!["plugin".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_query_still_has_no_terms() {
+        assert!(query_terms("").is_empty());
+        assert!(query_terms("   ").is_empty());
+        assert!(query_terms("!!!").is_empty());
     }
 
     #[test]
