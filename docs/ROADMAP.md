@@ -22,7 +22,18 @@ All planned product systems have a first shipped implementation. This roadmap tr
 
   The obvious follow-up — treating the parent directory as the stem when the file name is generic (`index.ts`, `main.go`), so a `components/Thing/index.ts` entry point competes on its directory — was **implemented and measured, and it loses**: repo B 0.421 → 0.387 recall, repo D 0.151 → 0.147 recall and 0.267 → 0.233 hit rate. It was reverted. The plausible reading is that promoting a directory name to an exact match creates ties across every sibling file in that directory, which costs more than the occasional correct entry-point hit gains. Do not re-attempt without a different tie-break.
 
-  What the numbers do point at: repo D is 12.6k commits and 1.5k source files and scores worst on every metric, so the next experiment worth running is candidate-set size, not filename heuristics — `discover_candidate_files` is called with a limit of 12 regardless of repository size.
+  The candidate-set size this previously pointed at was **measured and ruled out**. Sweeping the `discover_candidate_files` limit from its hardcoded 12 up to 96 on repo D leaves file recall and hit rate completely flat (0.144 / 0.267 at 24, 48, and 96); the mid-size repo C gains only ~0.01 recall and ~0.03 hit rate going 12 → 24, then plateaus. Widening the candidate set is not where the loss is.
+
+- **Prose commit subjects, and the `retrievable_rate` reference line.** Measuring what repo D's subjects contain explains its low scores better than any ranking change: **12 of its 30 eval commits share no term at all with the paths they touch** — subjects like `fix`, `fix ci`, `events`, `change tabs`, `cancel query`. Filename ranking has nothing to work with there.
+
+  `hugr eval` now reports `retrievable_rate`: the share of cases whose subject shares a term with an expected path. It is a reference line rather than a hard cap — embedding and graph evidence can retrieve a file with no lexical overlap — but comparing it against `hit_rate` separates the two failure modes:
+
+  | repository | hit rate | retrievable rate | reading |
+  | --- | --- | --- | --- |
+  | hugr | 0.900 | 0.767 | ranking already exceeds the lexical signal; little headroom |
+  | repo D | 0.267 | 0.600 | ~0.33 of genuinely addressable gap, ~0.40 unretrievable |
+
+  So repo D's real target is ~0.60, not 1.0, and a `--min-hit-rate` gate must be calibrated against that or it encodes an impossible number. Closing the addressable third needs evidence file names do not carry — symbol bodies rather than paths, commit-message-to-diff history, or a real embedding model — not more filename heuristics.
 
 ## Next
 
