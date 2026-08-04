@@ -6,7 +6,23 @@ All planned product systems have a first shipped implementation. This roadmap tr
 
 - **Ranking quality.** The eval baseline on this repository (30 commits, from a freshly indexed database) is file recall ~0.80, hit rate ~0.95, MRR ~0.72. MRR was 0.274 before the lexical/embedding blend landed; ranking order is no longer the standout weakness, so the remaining headroom is in recall.
 - **Eval stability.** `hugr eval` is deterministic for a fixed database but mutates the one it scores — each case persists a context pack and refreshes candidate indexes, so consecutive runs drift. Across clean-database runs the metrics move by ~0.02 recall and ~0.03 hit rate (one commit flipping is worth 0.033), which is wider than most single ranking changes. Score a change against a rebuilt database, and treat differences below that band as noise.
-- **Eval portability.** Run `hugr eval` on two or three foreign repositories before turning the CI job into a `--min-hit-rate` gate, so thresholds are not overfitted to this repository's commit style. The gate needs a threshold below the noise band above, or it will fail on unchanged code.
+- **Eval portability.** Measured on four foreign repositories. The metrics are heavily overfitted to this one, and they degrade with repository size:
+
+  | repository | commits | file recall | hit rate | MRR |
+  | --- | --- | --- | --- | --- |
+  | hugr | 0.1k | ~0.75 | ~0.90 | ~0.72 |
+  | repo A (TypeScript + Go app) | 0.9k | 0.505 | 0.567 | 0.444 |
+  | repo B (Go + Python services) | 1.0k | 0.421 | 0.500 | 0.383 |
+  | repo C (Go service) | 1.8k | 0.368 | 0.533 | 0.378 |
+  | repo D (large TypeScript app) | 12.6k | 0.151 | 0.267 | 0.183 |
+
+  A `--min-hit-rate` gate must be set from foreign-repository numbers, not this one, and below the noise band above. Retrieval quality on other people's repositories — not this one — is the real remaining headroom, and the largest repository is where it is worst by a wide margin.
+
+- **Ranking on foreign layouts.** The exact-name and test-file work in `discovery::candidate_for` came out of the measurement above and moved the Go repository a long way (recall 0.260 → 0.368, hit rate 0.333 → 0.533), at a cost of ~0.03 recall on the TypeScript app.
+
+  The obvious follow-up — treating the parent directory as the stem when the file name is generic (`index.ts`, `main.go`), so a `components/Thing/index.ts` entry point competes on its directory — was **implemented and measured, and it loses**: repo B 0.421 → 0.387 recall, repo D 0.151 → 0.147 recall and 0.267 → 0.233 hit rate. It was reverted. The plausible reading is that promoting a directory name to an exact match creates ties across every sibling file in that directory, which costs more than the occasional correct entry-point hit gains. Do not re-attempt without a different tie-break.
+
+  What the numbers do point at: repo D is 12.6k commits and 1.5k source files and scores worst on every metric, so the next experiment worth running is candidate-set size, not filename heuristics — `discover_candidate_files` is called with a limit of 12 regardless of repository size.
 
 ## Next
 
