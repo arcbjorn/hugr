@@ -282,18 +282,29 @@ mod tests {
     use serde_json::{Value, json};
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempRoot {
         root: PathBuf,
     }
 
+    /// A suffix no other temp directory in this process can repeat.
+    ///
+    /// `SystemTime::now().as_nanos()` names the unit, not the resolution: on
+    /// macOS it advances in 1µs steps, and most back-to-back reads return the
+    /// same value. The counter makes uniqueness unconditional.
+    fn unique_suffix() -> String {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{nanos}_{sequence}")
+    }
+
     impl TempRoot {
         fn new(name: &str) -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time should be after unix epoch")
-                .as_nanos();
+            let unique = unique_suffix();
             let root = std::env::temp_dir().join(format!("hugr_install_{name}_{unique}"));
             fs::create_dir_all(&root).expect("temp root should be created");
             Self { root }

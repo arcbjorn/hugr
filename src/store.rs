@@ -11909,12 +11909,25 @@ mod tests {
         workspace: PathBuf,
     }
 
+    /// A suffix no other temp directory in this process can repeat.
+    ///
+    /// `SystemTime::now().as_nanos()` names the unit, not the resolution: on
+    /// macOS it advances in 1µs steps, and ~70% of back-to-back reads return
+    /// the same value. A timestamp alone therefore only separates temp paths
+    /// that also differ by name. The counter makes that unconditional.
+    fn unique_suffix() -> String {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{nanos}_{sequence}")
+    }
+
     impl TestStore {
         fn new(name: &str) -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time should be after unix epoch")
-                .as_nanos();
+            let unique = unique_suffix();
             let workspace = std::env::temp_dir().join(format!("hugr_{name}_{unique}"));
             let store = Store::open_at(workspace.join(".hugr"));
 
@@ -14643,11 +14656,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_store_tags_scope_and_skips_project_registration() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after unix epoch")
-            .as_nanos();
-        let workspace = std::env::temp_dir().join(format!("hugr_global_{unique}"));
+        let workspace = std::env::temp_dir().join(format!("hugr_global_{}", unique_suffix()));
         let store = Store::open_global_at(workspace.join(".hugr"));
 
         let memory = store

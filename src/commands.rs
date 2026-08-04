@@ -2505,11 +2505,23 @@ mod tests {
 
     const STATUS_SNAPSHOT: &str = r#"{"storage_mode":"hybrid","backend":"hugr_api","status":"ready","local_writes_enabled":true,"remote_configured":true,"remote_auth_configured":false,"remote_reads_enabled":true,"remote_writes_enabled":false,"remote_endpoint":"https://api.example","api_contract_version":null,"api_routes":["GET /v1/sync/status"],"sync_classes":["memories","full_source"],"explicit_opt_in_classes":[]}"#;
 
-    fn edit_temp_dir(name: &str) -> std::path::PathBuf {
-        let unique = std::time::SystemTime::now()
+    /// A suffix no other temp directory in this process can repeat.
+    ///
+    /// `SystemTime::now().as_nanos()` names the unit, not the resolution: on
+    /// macOS it advances in 1µs steps, and most back-to-back reads return the
+    /// same value. The counter makes uniqueness unconditional.
+    fn unique_suffix() -> String {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time should be after unix epoch")
             .as_nanos();
+        let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{nanos}_{sequence}")
+    }
+
+    fn edit_temp_dir(name: &str) -> std::path::PathBuf {
+        let unique = unique_suffix();
         let root = std::env::temp_dir().join(format!("hugr_write_{name}_{unique}"));
         std::fs::create_dir_all(&root).unwrap();
         root

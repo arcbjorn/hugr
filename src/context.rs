@@ -2678,7 +2678,6 @@ mod tests {
     use crate::testmap::TestCandidate;
     use crate::worktree::{ChangedFile, WorktreeState};
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn custom_budgets_reach_the_pack_and_control_trimming() {
@@ -3415,11 +3414,23 @@ pub fn small(input: i32) -> i32 {
         assert!(markdown.contains("diagnostic:diag_1 [diagnostic]"));
     }
 
-    fn write_temp_source(name: &str, contents: &str) -> String {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
+    /// A suffix no other temp directory in this process can repeat.
+    ///
+    /// `SystemTime::now().as_nanos()` names the unit, not the resolution: on
+    /// macOS it advances in 1µs steps, and most back-to-back reads return the
+    /// same value. The counter makes uniqueness unconditional.
+    fn unique_suffix() -> String {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
             .as_nanos();
+        let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{nanos}_{sequence}")
+    }
+
+    fn write_temp_source(name: &str, contents: &str) -> String {
+        let unique = unique_suffix();
         let path = std::env::temp_dir().join(format!("hugr_{unique}_{name}"));
         fs::write(&path, contents).unwrap();
         path.display().to_string()
