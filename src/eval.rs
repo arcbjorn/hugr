@@ -50,6 +50,14 @@ struct CommitScore {
     first_hit_rank: Option<usize>,
     symbol_hit: bool,
     candidate_hit: bool,
+    /// Whether any task term appears in an expected path at all.
+    ///
+    /// Ranking works on file names and paths, so a commit whose subject shares
+    /// no term with the files it touched — `fix ci`, `change tabs`, `events` —
+    /// cannot be retrieved by any amount of ranking work. Counting those
+    /// separates "ranking is weak" from "this case was unretrievable", which
+    /// is the difference between a fixable gap and the harness's own ceiling.
+    lexically_retrievable: bool,
 }
 
 impl CommitScore {
@@ -94,6 +102,19 @@ impl EvalReport {
 
     fn candidate_hit_rate(&self) -> f64 {
         self.mean(|score| if score.candidate_hit { 1.0 } else { 0.0 })
+    }
+
+    /// The share of cases that filename ranking could retrieve at all — the
+    /// harness's own ceiling. Comparing `hit_rate` against this says whether
+    /// the remaining gap is ranking work or unretrievable commit subjects.
+    fn retrievable_rate(&self) -> f64 {
+        self.mean(|score| {
+            if score.lexically_retrievable {
+                1.0
+            } else {
+                0.0
+            }
+        })
     }
 }
 
@@ -304,7 +325,23 @@ fn score_case(
         candidate_hit: candidates
             .iter()
             .any(|path| expected.contains(path.as_str())),
+        lexically_retrievable: task_terms_appear_in_paths(&case.task, &case.expected),
     }
+}
+
+/// Whether any term of `task` occurs in one of `paths`.
+///
+/// Deliberately generous: a substring hit anywhere in the path counts, so this
+/// is an upper bound on what filename ranking could find. A commit that fails
+/// this test cannot be retrieved by ranking at all.
+fn task_terms_appear_in_paths(task: &str, paths: &[String]) -> bool {
+    let paths = paths
+        .iter()
+        .map(|path| path.to_lowercase())
+        .collect::<Vec<_>>();
+    context::context_query_terms(task)
+        .iter()
+        .any(|term| paths.iter().any(|path| path.contains(term.as_str())))
 }
 
 fn render_text(report: &EvalReport) -> String {
@@ -329,6 +366,10 @@ fn render_text(report: &EvalReport) -> String {
     rendered.push_str(&format!(
         "  candidate_hit_rate: {:.3}\n",
         report.candidate_hit_rate()
+    ));
+    rendered.push_str(&format!(
+        "  retrievable_rate: {:.3} (ceiling: cases whose subject shares a term with a touched path)\n",
+        report.retrievable_rate()
     ));
     rendered.push_str("  commits:\n");
     for score in &report.scores {
@@ -377,6 +418,7 @@ fn render_json(report: &EvalReport) -> String {
         "mrr": report.mrr(),
         "symbol_file_hit_rate": report.symbol_file_hit_rate(),
         "candidate_hit_rate": report.candidate_hit_rate(),
+        "retrievable_rate": report.retrievable_rate(),
         "per_commit": per_commit,
     })
     .to_string()
@@ -384,7 +426,33 @@ fn render_json(report: &EvalReport) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommitCase, eval_task, parse_git_log, prepare_case, score_case};
+    use super::{
+        CommitCase, eval_task, parse_git_log, prepare_case, score_case, task_terms_appear_in_paths,
+    };
+
+    /// Separates the two failure modes the score alone conflates: a commit
+    /// whose subject names something in the path is ranking work, one that
+    /// says only `fix ci` is not retrievable by filename ranking at all.
+    #[test]
+    fn retrievability_follows_term_overlap_with_the_paths() {
+        assert!(task_terms_appear_in_paths(
+            "context rank symbols",
+            &["src/context.rs".to_string()]
+        ));
+        // Case-insensitive, and a substring anywhere in the path counts.
+        assert!(task_terms_appear_in_paths(
+            "fix invoices chart",
+            &["src/containers/InvoicesV2/Chart.tsx".to_string()]
+        ));
+        assert!(!task_terms_appear_in_paths(
+            "fix ci",
+            &["src/context.rs".to_string()]
+        ));
+        assert!(!task_terms_appear_in_paths(
+            "change tabs",
+            &["src/store.rs".to_string()]
+        ));
+    }
 
     #[test]
     fn parses_git_log_headers_and_files() {
