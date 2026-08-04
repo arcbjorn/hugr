@@ -33,7 +33,21 @@ All planned product systems have a first shipped implementation. This roadmap tr
   | hugr | 0.900 | 0.767 | ranking already exceeds the lexical signal; little headroom |
   | repo D | 0.267 | 0.600 | ~0.33 of genuinely addressable gap, ~0.40 unretrievable |
 
-  So repo D's real target is ~0.60, not 1.0, and a `--min-hit-rate` gate must be calibrated against that or it encodes an impossible number. Closing the addressable third needs evidence file names do not carry — symbol bodies rather than paths, commit-message-to-diff history, or a real embedding model — not more filename heuristics.
+  So repo D's real target is ~0.60, not 1.0, and a `--min-hit-rate` gate must be calibrated against that or it encodes an impossible number.
+
+- **Symbol matches now rank files, which closed a third of that gap.** `symbol_file_hit_rate` had been running above `hit_rate` on every repository measured — the symbol index resolved the right file while file ranking, which sees only names and paths, did not. Those symbol paths were computed *after* files were ranked and never fed back in.
+
+  Recalling symbols first and boosting any candidate that defines one (`discovery::promote_symbol_paths`) moved repo D substantially:
+
+  | | before | after |
+  | --- | --- | --- |
+  | file recall | 0.151 | 0.186 |
+  | hit rate | 0.267 | 0.367 |
+  | MRR | 0.183 | 0.267 |
+
+  hugr itself gains MRR (0.773 → 0.823) and holds recall and hit rate, so this is not a trade. `symbol_file_hit_rate` is unchanged, confirming the win comes from using an existing signal rather than changing symbol search.
+
+  The bonus is 6, deliberately large enough to draw level with an exact filename match. A value of 3 — which guarantees the filename always wins — was measured and retrieved less (hit rate 0.333, recall 0.169). Remaining headroom on repo D is now ~0.23 of addressable gap, and the next evidence worth trying is what neither names nor symbols carry: commit-message-to-diff history, or a real embedding model.
 
 ## Next
 
