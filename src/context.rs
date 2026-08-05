@@ -2347,34 +2347,105 @@ fn remove_lowest_priority_context_item(
 ///
 /// Returns `None` when every section is at or below `floor`, which is the
 /// caller's signal to retry with a lower floor.
+/// Scales an evidence score by what the item costs to keep.
+///
+/// Eviction used to compare raw scores, which ignores that pack items are not
+/// the same size: a file entry is ~35 tokens (a path and a short reason) while
+/// a symbol or graph neighbour is ~72–78 (a path *plus* name, kind, signature,
+/// and label). Files also carry the lowest base score, so they lost every
+/// comparison while being the cheapest evidence in the pack — on a large
+/// repository the budget kept 8 symbols and 7 graph neighbours and truncated
+/// 11 of 14 files down to the retention floor.
+///
+/// Dividing by cost turns the comparison into "value per token", so dropping
+/// one expensive item to fund two cheap ones becomes possible. The scale factor
+/// keeps the result in integers without collapsing distinct scores together.
+fn cost_adjusted_score(evidence_score: usize, tokens: usize) -> usize {
+    evidence_score.saturating_mul(64) / tokens.max(1)
+}
+
 fn weakest_evidence_section(pack: &ContextPack, floor: usize) -> Option<&'static str> {
     let mut weakest = None;
     if let Some(fact) = trailing_above_floor(&pack.recent_sessions, floor) {
-        consider_weakest_evidence(&mut weakest, "recent_sessions", fact.evidence_score, 0);
+        let cost = estimate_session_tokens(fact);
+        consider_weakest_evidence(
+            &mut weakest,
+            "recent_sessions",
+            cost_adjusted_score(fact.evidence_score, cost),
+            0,
+        );
     }
     if let Some(test) = trailing_above_floor(&pack.affected_tests, floor) {
-        consider_weakest_evidence(&mut weakest, "affected_tests", test.evidence_score, 1);
+        let cost = estimate_test_tokens(test);
+        consider_weakest_evidence(
+            &mut weakest,
+            "affected_tests",
+            cost_adjusted_score(test.evidence_score, cost),
+            1,
+        );
     }
     if let Some(neighbor) = trailing_above_floor(&pack.graph_neighbors, floor) {
-        consider_weakest_evidence(&mut weakest, "graph_neighbors", neighbor.evidence_score, 2);
+        let cost = estimate_graph_neighbor_tokens(neighbor);
+        consider_weakest_evidence(
+            &mut weakest,
+            "graph_neighbors",
+            cost_adjusted_score(neighbor.evidence_score, cost),
+            2,
+        );
     }
     if let Some(file) = trailing_above_floor(&pack.relevant_files, floor) {
-        consider_weakest_evidence(&mut weakest, "relevant_files", file.evidence_score, 3);
+        let cost = estimate_file_tokens(file);
+        consider_weakest_evidence(
+            &mut weakest,
+            "relevant_files",
+            cost_adjusted_score(file.evidence_score, cost),
+            3,
+        );
     }
     if let Some(symbol) = trailing_above_floor(&pack.important_symbols, floor) {
-        consider_weakest_evidence(&mut weakest, "important_symbols", symbol.evidence_score, 4);
+        let cost = estimate_symbol_tokens(symbol);
+        consider_weakest_evidence(
+            &mut weakest,
+            "important_symbols",
+            cost_adjusted_score(symbol.evidence_score, cost),
+            4,
+        );
     }
     if let Some(risk) = trailing_above_floor(&pack.stale_memory_risks, floor) {
-        consider_weakest_evidence(&mut weakest, "stale_memory_risks", risk.evidence_score, 5);
+        let cost = estimate_stale_risk_tokens(risk);
+        consider_weakest_evidence(
+            &mut weakest,
+            "stale_memory_risks",
+            cost_adjusted_score(risk.evidence_score, cost),
+            5,
+        );
     }
     if let Some(diagnostic) = trailing_above_floor(&pack.diagnostics, floor) {
-        consider_weakest_evidence(&mut weakest, "diagnostics", diagnostic.evidence_score, 6);
+        let cost = estimate_diagnostic_tokens(diagnostic);
+        consider_weakest_evidence(
+            &mut weakest,
+            "diagnostics",
+            cost_adjusted_score(diagnostic.evidence_score, cost),
+            6,
+        );
     }
     if let Some(risk) = trailing_above_floor(&pack.risk_signals, floor) {
-        consider_weakest_evidence(&mut weakest, "risk_signals", risk.evidence_score, 7);
+        let cost = estimate_risk_signal_tokens(risk);
+        consider_weakest_evidence(
+            &mut weakest,
+            "risk_signals",
+            cost_adjusted_score(risk.evidence_score, cost),
+            7,
+        );
     }
     if let Some(memory) = trailing_above_floor(&pack.relevant_memories, floor) {
-        consider_weakest_evidence(&mut weakest, "relevant_memories", memory.evidence_score, 8);
+        let cost = estimate_memory_tokens(memory);
+        consider_weakest_evidence(
+            &mut weakest,
+            "relevant_memories",
+            cost_adjusted_score(memory.evidence_score, cost),
+            8,
+        );
     }
     weakest.map(|(_, _, section)| section)
 }
@@ -2668,7 +2739,7 @@ mod tests {
         Citation, ContextBranchState, ContextBudget, ContextBudgetTruncation, ContextChangedFile,
         ContextDiagnostic, ContextFile, ContextGraphNeighbor, ContextMemory, ContextPack,
         ContextRiskSignal, ContextSessionFact, ContextStaleMemoryRisk, ContextSymbol, ContextTest,
-        context_query_terms, count_signature_parameters, symbol_evidence,
+        context_query_terms, cost_adjusted_score, count_signature_parameters, symbol_evidence,
     };
     use crate::code::CodeSymbol;
     use crate::discovery::FileCandidate;
@@ -3640,6 +3711,37 @@ pub fn small(input: i32) -> i32 {
             language: Some("rust".to_string()),
             size_bytes: Some(2_000),
         }
+    }
+
+    /// Eviction compares value per token, not raw score. A file entry is the
+    /// cheapest item in the pack (~35 tokens against ~72–78 for a symbol or
+    /// graph neighbour) *and* carries the lowest base score, so comparing raw
+    /// scores starved the section that costs least to keep: on a large
+    /// repository the budget kept 8 symbols and 7 graph neighbours while
+    /// truncating 11 of 14 files down to the retention floor.
+    #[test]
+    fn a_cheap_item_survives_against_a_pricier_one_of_similar_worth() {
+        // Same score, very different cost: the expensive one should go first.
+        let cheap = cost_adjusted_score(600, 35);
+        let pricey = cost_adjusted_score(600, 78);
+
+        assert!(
+            cheap > pricey,
+            "a cheaper item of equal score must rank higher: {cheap} vs {pricey}"
+        );
+    }
+
+    /// Cost adjustment must not let a worthless item survive purely by being
+    /// small — a much stronger score still wins at comparable cost.
+    #[test]
+    fn a_far_stronger_item_still_wins_at_similar_cost() {
+        assert!(cost_adjusted_score(900, 40) > cost_adjusted_score(400, 35));
+    }
+
+    /// Zero-token items must not divide by zero.
+    #[test]
+    fn cost_adjustment_tolerates_a_zero_cost_item() {
+        assert_eq!(cost_adjusted_score(600, 0), cost_adjusted_score(600, 1));
     }
 
     /// The regression the retention floor exists for. Evidence scores carry a
