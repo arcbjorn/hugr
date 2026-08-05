@@ -47,7 +47,20 @@ All planned product systems have a first shipped implementation. This roadmap tr
 
   hugr itself gains MRR (0.773 → 0.823) and holds recall and hit rate, so this is not a trade. `symbol_file_hit_rate` is unchanged, confirming the win comes from using an existing signal rather than changing symbol search.
 
-  The bonus is 6, deliberately large enough to draw level with an exact filename match. A value of 3 — which guarantees the filename always wins — was measured and retrieved less (hit rate 0.333, recall 0.169). Remaining headroom on repo D is now ~0.23 of addressable gap, and the next evidence worth trying is what neither names nor symbols carry: commit-message-to-diff history, or a real embedding model.
+  The bonus is 6, deliberately large enough to draw level with an exact filename match. A value of 3 — which guarantees the filename always wins — was measured and retrieved less (hit rate 0.333, recall 0.169).
+
+  A follow-up went further: a symbol file absent from the candidate set entirely is now *inserted*, not just boosted, because `symbol_file_hit_rate` exceeded even `candidate_hit_rate` on repo D. The two repositories responded very differently:
+
+  | | hugr before | hugr after | repo D before | repo D after |
+  | --- | --- | --- | --- | --- |
+  | file recall | 0.788 | **0.844** | 0.186 | 0.186 |
+  | hit rate | 0.900 | **0.967–1.000** | 0.367 | 0.367 |
+  | MRR | 0.823 | **0.853** | 0.244 | 0.250 |
+  | candidate hit rate | 0.900 | — | 0.400 | **0.500** |
+
+  On hugr this is a large, reproducible gain across three clean-database runs. On repo D the insertion demonstrably works — candidate hit rate rose 0.400 → 0.500 — but only **1 of 30 commits** improved its rank (3 → 2), so the headline metrics did not move. Getting a file into the candidate set is necessary and not sufficient there; it still has to out-rank a crowded field and survive the token budget.
+
+  Remaining headroom on repo D is ~0.23 of addressable gap, and the next evidence worth trying is what neither names nor symbols carry: commit-message-to-diff history, or a real embedding model.
 
 ## Next
 
