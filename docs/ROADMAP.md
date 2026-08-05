@@ -60,7 +60,21 @@ All planned product systems have a first shipped implementation. This roadmap tr
 
   On hugr this is a large, reproducible gain across three clean-database runs. On repo D the insertion demonstrably works — candidate hit rate rose 0.400 → 0.500 — but only **1 of 30 commits** improved its rank (3 → 2), so the headline metrics did not move. Getting a file into the candidate set is necessary and not sufficient there; it still has to out-rank a crowded field and survive the token budget.
 
-  Remaining headroom on repo D is ~0.23 of addressable gap, and the next evidence worth trying is what neither names nor symbols carry: commit-message-to-diff history, or a real embedding model.
+  That "necessary but not sufficient" turned out to be a budget problem, not a ranking one. Eviction compared raw evidence scores, ignoring that pack items differ in size: a file entry costs ~35 tokens (a path and a short reason) against ~72–78 for a symbol or graph neighbour, *and* files carry the lowest base score. So the cheapest, highest-value evidence lost every comparison — on repo D the budget kept 8 symbols and 7 graph neighbours while truncating 11 of 14 files down to the retention floor.
+
+- **Evicting by value per token.** `cost_adjusted_score` divides an item's evidence score by its estimated token cost, so the choice becomes "what is worth its space" rather than "what scores highest". Within an unchanged 4000-token budget the same pack went from 3 files to 14, trading away three graph neighbours.
+
+  | | hugr before | hugr after | repo D before | repo D after |
+  | --- | --- | --- | --- | --- |
+  | file recall | 0.844 | **0.880** | 0.186 | **0.283** |
+  | hit rate | 0.967 | 0.967 | 0.367 | **0.500** |
+  | MRR | 0.853 | 0.853 | 0.250 | **0.288** |
+
+  This is the largest single retrieval gain measured so far, and the first change that moved repo D substantially. `hit_rate` now equals `candidate_hit_rate` (0.500) there: every file that reaches the candidate set survives into the pack, so the budget is no longer the bottleneck and the remaining loss is candidate generation.
+
+  Caveat on confidence: the hugr numbers are two clean-database runs (recall 0.880 twice), but repo D is a **single** run — repeat attempts were cut short by the eval's runtime on a 12.6k-commit repository. The section-count change (3 files → 14 within an unchanged token total) is direct mechanism evidence and does not depend on that run, but the exact repo D figures should be re-measured before they are quoted as a baseline.
+
+  Remaining headroom on repo D is ~0.10 against its ~0.60 retrievability ceiling. The next evidence worth trying is what neither names nor symbols carry: commit-message-to-diff history, or a real embedding model.
 
 ## Next
 
