@@ -200,13 +200,20 @@ pub(crate) fn merge_file_candidates(
 /// the file's own name.
 const SYMBOL_PATH_BONUS: usize = 6;
 
-/// Re-ranks `candidates`, boosting any file that defines one of `symbols`.
+/// Re-ranks `candidates` by symbol evidence, adding files the ranking missed.
 ///
 /// File ranking sees only names and paths, so it misses a file whose *contents*
 /// match the task. The symbol index already resolves that, and measurably
 /// better: `symbol_file_hit_rate` runs above `hit_rate` on every repository
 /// measured so far. Feeding those paths back in turns a signal the pack already
 /// computed into ranking evidence, rather than adding a new source.
+///
+/// A symbol file that never reached the candidate set is *inserted* rather than
+/// only boosted. Ranking and the symbol index disagree about which files matter,
+/// and on a large repository `symbol_file_hit_rate` (0.433) exceeds even
+/// `candidate_hit_rate` (0.400) — so some files the symbol index identified
+/// correctly were absent from the candidate set entirely and no amount of
+/// re-ordering could recover them.
 pub(crate) fn promote_symbol_paths(
     mut candidates: Vec<FileCandidate>,
     symbols: &[crate::code::CodeSymbol],
@@ -218,10 +225,26 @@ pub(crate) fn promote_symbol_paths(
     let symbol_paths = symbols
         .iter()
         .map(|symbol| symbol.path.as_str())
-        .collect::<std::collections::HashSet<_>>();
+        .collect::<std::collections::BTreeSet<_>>();
     for candidate in &mut candidates {
         if symbol_paths.contains(candidate.path.as_str()) {
             candidate.lexical_score += SYMBOL_PATH_BONUS;
+        }
+    }
+
+    let known = candidates
+        .iter()
+        .map(|candidate| candidate.path.as_str().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    for path in symbol_paths {
+        if !known.contains(path) {
+            candidates.push(FileCandidate {
+                path: path.to_string(),
+                lexical_score: SYMBOL_PATH_BONUS,
+                embedding_rank: None,
+                language: language_for(Path::new(path)).map(str::to_string),
+                size_bytes: fs::metadata(path).ok().map(|metadata| metadata.len()),
+            });
         }
     }
 
@@ -582,6 +605,43 @@ mod tests {
         );
 
         assert_eq!(promoted.first().unwrap().path, "src/holds_the_symbol.rs");
+    }
+
+    /// Boosting alone cannot recover a file the ranking never produced, and on
+    /// a large repository the symbol index identified files the candidate set
+    /// did not contain at all (`symbol_file_hit_rate` above
+    /// `candidate_hit_rate`). Those are inserted rather than dropped.
+    #[test]
+    fn a_symbol_file_missing_from_the_candidates_is_inserted() {
+        let candidates = vec![FileCandidate {
+            path: "src/unrelated.rs".to_string(),
+            lexical_score: 2,
+            ..FileCandidate::default()
+        }];
+
+        let promoted = promote_symbol_paths(
+            candidates,
+            &[symbol_in("src/never_ranked.rs", "unique_suffix")],
+        );
+
+        assert_eq!(promoted.first().unwrap().path, "src/never_ranked.rs");
+        assert_eq!(promoted.len(), 2, "the original candidate is kept");
+    }
+
+    /// Inserting must not duplicate a path the candidate set already holds.
+    #[test]
+    fn an_existing_candidate_is_boosted_not_duplicated() {
+        let candidates = vec![FileCandidate {
+            path: "src/holds.rs".to_string(),
+            lexical_score: 2,
+            ..FileCandidate::default()
+        }];
+
+        let promoted =
+            promote_symbol_paths(candidates, &[symbol_in("src/holds.rs", "unique_suffix")]);
+
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].lexical_score, 2 + 6);
     }
 
     #[test]
